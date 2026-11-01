@@ -2314,6 +2314,9 @@ struct Ctx<'t> {
     /// until [`Ctx::settle_model_params`] keeps the ones no request sends
     /// changed.
     param_exports: Vec<(ModelParam, usize)>,
+    /// For each gap-worthy call by node id, the parameters it sends
+    /// unchanged as a model (see [`Ctx::param_source`]), listed or not.
+    direct: HashMap<usize, Vec<ParamKey>>,
     out: FileUsages,
 }
 
@@ -2435,6 +2438,7 @@ impl<'t> Ctx<'t> {
             model_reads: Vec::new(),
             sending: Vec::new(),
             param_exports: Vec::new(),
+            direct: HashMap::new(),
             out: FileUsages::new(file, "python"),
         }
     }
@@ -8593,20 +8597,23 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    /// Keeps the model parameters [`Ctx::note_model_params`] found that no
-    /// request of their function or class sends changed (see
+    /// Keeps the model parameters [`Ctx::note_model_params`] found that
+    /// reach their requests unchanged on every path this file shows (see
     /// [`Ctx::changed_elsewhere`]), each once.
     fn settle_model_params(&mut self) {
         let exports = std::mem::take(&mut self.param_exports);
-        let mut changed: HashMap<(usize, String, Option<String>), bool> = HashMap::new();
+        if exports.is_empty() {
+            return;
+        }
+        let cx = self.settle_context();
+        let mut changed: HashMap<ParamKey, bool> = HashMap::new();
         let mut kept = HashSet::new();
         for (param, func) in exports {
-            let key = (func, param.parameter.clone(), param.attribute.clone());
+            let key: ParamKey = (func, param.parameter.clone(), param.attribute.clone());
             let held = match changed.get(&key) {
                 Some(held) => *held,
                 None => {
-                    let held =
-                        self.changed_elsewhere(func, &param.parameter, param.attribute.as_deref());
+                    let held = self.changed_elsewhere(&key, &cx);
                     changed.insert(key, held);
                     held
                 }
@@ -8617,69 +8624,312 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    /// Whether the model parameter `param` of `func` (or, for a class, the
-    /// attribute `attr` its `__init__` stores it in) may reach a request
-    /// changed on some path, so that a call passing a value may send
-    /// another one: `RENAMED[model]` in one branch and `model` in the
-    /// other. The code that can see it is the function, or the class and
-    /// its same-file bases (their methods run on its instances). There, a
-    /// value computed from it, through any chain of assignments, that a
-    /// gap-worthy call or a wrapper call sends where a model may be (see
-    /// [`Ctx::note_model_read`]), or that is passed to a function, class or
-    /// method of this file that sends a request, holds it. What a request
-    /// returns is not counted as computed from its model.
-    fn changed_elsewhere(&self, func: usize, param: &str, attr: Option<&str>) -> bool {
+    /// What [`Ctx::changed_elsewhere`] reads about the whole file, computed
+    /// once: which calls send a request, the model reads in order, what
+    /// each call's callee is, and which functions, lambdas and classes may
+    /// send one (they hold a sending call, call a callee the scan cannot
+    /// see into, or call one of the file's own that may, or nest one).
+    fn settle_context(&self) -> Settle<'t> {
+        let sent: HashSet<usize> = self.sending.iter().map(|c| c.id()).collect();
+        let mut reads = self.model_reads.clone();
+        reads.sort_by_key(|n| n.start_byte());
+        let lambdas: HashMap<usize, usize> = self
+            .scopes
+            .iter()
+            .enumerate()
+            .filter(|(_, scope)| scope.lambda)
+            .map(|(i, scope)| (scope.start, i))
+            .collect();
+        let n = self.scopes.len();
+        let mut callees = HashMap::new();
+        let mut owned: Vec<Vec<Node<'t>>> = vec![Vec::new(); n];
+        for &(call, scope) in &self.calls {
+            callees.insert(call.id(), self.callee(call, scope, &lambdas));
+            owned[self.callable_owner(scope)].push(call);
+        }
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+        // Who runs a scope's code: its callers, and the scope it is nested in.
+        let mut runs: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut may_send = vec![false; n];
+        let mut queue = Vec::new();
+        for s in 0..n {
+            if let Some(parent) = self.scopes[s].parent {
+                children[parent].push(s);
+                runs[s].push(parent);
+            }
+            let mut sends = false;
+            for call in &owned[s] {
+                if sent.contains(&call.id()) {
+                    sends = true;
+                    continue;
+                }
+                match callees.get(&call.id()) {
+                    Some(Callee::Here(scopes)) => {
+                        for &callee in scopes {
+                            runs[callee].push(s);
+                        }
+                    }
+                    Some(Callee::Inert) => {}
+                    _ => sends = true,
+                }
+            }
+            if sends {
+                may_send[s] = true;
+                queue.push(s);
+            }
+        }
+        while let Some(s) = queue.pop() {
+            for &runner in &runs[s] {
+                if !may_send[runner] {
+                    may_send[runner] = true;
+                    queue.push(runner);
+                }
+            }
+        }
+        Settle {
+            sent,
+            reads,
+            callees,
+            owned,
+            children,
+            may_send,
+        }
+    }
+
+    /// The function, lambda or class whose code `scope` runs in: itself,
+    /// or the one a comprehension is in.
+    fn callable_owner(&self, scope: usize) -> usize {
+        let mut s = scope;
+        while self.scopes[s].comprehension {
+            match self.scopes[s].parent {
+                Some(parent) => s = parent,
+                None => break,
+            }
+        }
+        s
+    }
+
+    /// What `call` (in `scope`) calls (see [`Callee`]). A name is followed
+    /// to the file's own `def`, `class` or lambda when nothing else binds
+    /// it; `self.x(...)`, `cls.x(...)` and `super().x(...)` to the method of
+    /// the class (or its same-file bases) the receiver is.
+    fn callee(&self, call: Node<'t>, scope: usize, lambdas: &HashMap<usize, usize>) -> Callee {
+        if self.constructions.contains_key(&call.id()) {
+            return Callee::Inert;
+        }
+        let Some(function) = call.child_by_field_name("function") else {
+            return Callee::Unknown;
+        };
+        match function.kind() {
+            "identifier" => {
+                let name = self.text(function);
+                let (key, kinds) = self.defs_at(name, scope, function.start_byte());
+                let mut here: Vec<usize> = self.functions.get(&key).cloned().unwrap_or_default();
+                here.extend(
+                    self.classes_by_name
+                        .get(name)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .filter(|c| self.class_home(*c) == key.0),
+                );
+                let mut unknown = kinds.param || kinds.imported;
+                for assign in self.assigns.get(&key).into_iter().flatten() {
+                    let lambda = assign
+                        .value
+                        .filter(|v| v.kind() == "lambda")
+                        .and_then(|v| lambdas.get(&v.start_byte()));
+                    match lambda {
+                        Some(&lambda) => here.push(lambda),
+                        None => unknown = true,
+                    }
+                }
+                if unknown {
+                    Callee::Unknown
+                } else if !here.is_empty() {
+                    Callee::Here(here)
+                } else if INERT_BUILTINS.contains(&name) || is_exception_name(name) {
+                    Callee::Inert
+                } else {
+                    Callee::Unknown
+                }
+            }
+            "attribute" => {
+                let (Some(object), Some(attr)) = (
+                    function.child_by_field_name("object"),
+                    function.child_by_field_name("attribute"),
+                ) else {
+                    return Callee::Unknown;
+                };
+                let attr = self.text(attr);
+                let class = match object.kind() {
+                    "identifier" => match self.text(object) {
+                        "self" => self.scopes[scope]
+                            .self_recv
+                            .map(|(class, _)| (class, false)),
+                        "cls" => self.scopes[scope].cls_recv.map(|(class, _)| (class, false)),
+                        _ => None,
+                    },
+                    "call"
+                        if object
+                            .child_by_field_name("function")
+                            .is_some_and(|f| self.text(f) == "super") =>
+                    {
+                        self.scopes[scope]
+                            .self_recv
+                            .or(self.scopes[scope].cls_recv)
+                            .map(|(class, _)| (class, true))
+                    }
+                    _ => None,
+                };
+                if let Some((class, skip_own)) = class {
+                    return match self.method_in_chain(class, attr, skip_own) {
+                        Some(method) => Callee::Here(vec![method]),
+                        None => Callee::Unknown,
+                    };
+                }
+                if INERT_LITERALS.contains(&object.kind())
+                    || INERT_METHODS.contains(&attr)
+                    || is_exception_name(attr)
+                    || INERT_FUNCTIONS.contains(&self.render(function).as_str())
+                    || (LOG_METHODS.contains(&attr)
+                        && self.render(object).to_ascii_lowercase().contains("log"))
+                {
+                    Callee::Inert
+                } else {
+                    Callee::Unknown
+                }
+            }
+            _ => Callee::Unknown,
+        }
+    }
+
+    /// The method `name` instances of `class` run: its own, else its
+    /// same-file bases' (from the base on when `skip_own`, for `super()`).
+    /// `None` when a base outside the file may define it.
+    fn method_in_chain(&self, class: usize, name: &str, skip_own: bool) -> Option<usize> {
+        let mut seen = Vec::new();
+        let mut current = if skip_own {
+            self.class_shape(class).base
+        } else {
+            Some(class)
+        };
+        while let Some(c) = current.filter(|c| !seen.contains(c)) {
+            seen.push(c);
+            if let Some(method) = self
+                .functions
+                .get(&(c, name.to_string()))
+                .and_then(|defs| defs.last())
+            {
+                return Some(*method);
+            }
+            if self.scopes[c].external_bases {
+                return None;
+            }
+            current = self.class_shape(c).base;
+        }
+        None
+    }
+
+    /// Whether the model parameter `key` (or, for a class, the attribute
+    /// its `__init__` stores it in) may reach a request as something else
+    /// on some path, so that a call passing a value may send another one.
+    /// The code that can see it is the function, or the class and its
+    /// same-file bases (their methods run on its instances). There, any of
+    /// these holds it, failing closed:
+    ///
+    /// - a value computed from it, through any chain of assignments or
+    ///   container updates (`params.update(model=...)`), sent where a model
+    ///   may be (see [`Ctx::note_model_read`]), or written to a global, a
+    ///   `nonlocal` or another object's attribute;
+    /// - it, such a value, or (for a class) `self` handed to a call other
+    ///   than a request, unless the callee sends nothing: one of the file's
+    ///   own functions, lambdas or methods that sends no request and calls
+    ///   nothing that may ([`Settle::may_send`]), a builtin, logging, an
+    ///   exception, a container or string method, or a method of the value
+    ///   itself (`model.startswith(...)`);
+    /// - a call chosen by it (`HANDLERS[model](...)`);
+    /// - a condition that reads it (`if`, `elif`, `while`, `match`, a
+    ///   conditional expression, `and`/`or`, `assert`) guarding another
+    ///   request, a call to the file's own code that may send one, or a
+    ///   `return`, `raise`, `break` or `continue` in a branch without the
+    ///   request.
+    ///
+    /// What a request returns is not counted as computed from its model.
+    fn changed_elsewhere(&self, key: &ParamKey, cx: &Settle<'t>) -> bool {
         let Some(root) = self.root else {
             return true;
         };
+        let (func, param, attr) = (key.0, key.1.as_str(), key.2.as_deref());
+        let class = attr.is_some();
         let own = (self.scopes[func].start, self.scopes[func].end);
         let mut regions = Vec::new();
-        if attr.is_some() {
-            let mut class = self.scopes[func].parent;
-            while let Some(c) = class {
+        if class {
+            let mut current = self.scopes[func].parent;
+            while let Some(c) = current {
                 let range = (self.scopes[c].start, self.scopes[c].end);
                 if regions.contains(&range) || regions.len() > MAX_SCOPE_DEPTH as usize {
                     break;
                 }
                 regions.push(range);
-                class = self.class_shape(c).base;
+                current = self.class_shape(c).base;
             }
         } else {
             regions.push(own);
         }
-        let within = |node: Node<'t>, (start, end): (usize, usize)| {
-            start <= node.start_byte() && node.end_byte() <= end
+        let direct = |call: Node<'t>| {
+            self.direct.get(&call.id()).is_some_and(|sources| {
+                sources
+                    .iter()
+                    .any(|(f, p, a)| *f == func && p == param && a.as_deref() == attr)
+            })
         };
-        let seen = |node: Node<'t>| regions.iter().any(|r| within(node, *r));
-        let sent: HashSet<usize> = self.sending.iter().map(|c| c.id()).collect();
 
-        // The assignments (target, value) and the calls there.
+        // The assignments (target, value), the calls and the conditions there.
         let mut binds: Vec<(Node<'t>, Node<'t>)> = Vec::new();
         let mut calls: Vec<Node<'t>> = Vec::new();
+        let mut guards: Vec<Guard<'t>> = Vec::new();
         for &(start, end) in &regions {
             let Some(top) = root.descendant_for_byte_range(start, end) else {
                 continue;
             };
             let mut stack = vec![top];
             while let Some(node) = stack.pop() {
-                let bind = match node.kind() {
-                    "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => (
-                        node.child_by_field_name("left"),
-                        node.child_by_field_name("right"),
-                    ),
-                    "named_expression" => (
-                        node.child_by_field_name("name"),
-                        node.child_by_field_name("value"),
-                    ),
-                    "as_pattern" => (node.child_by_field_name("alias"), node.named_child(0)),
+                match node.kind() {
+                    "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
+                        if let (Some(target), Some(value)) = (
+                            node.child_by_field_name("left"),
+                            node.child_by_field_name("right"),
+                        ) {
+                            binds.push((target, value));
+                        }
+                    }
+                    "named_expression" => {
+                        if let (Some(target), Some(value)) = (
+                            node.child_by_field_name("name"),
+                            node.child_by_field_name("value"),
+                        ) {
+                            binds.push((target, value));
+                        }
+                    }
+                    "as_pattern" => {
+                        if let (Some(target), Some(value)) =
+                            (node.child_by_field_name("alias"), node.named_child(0))
+                        {
+                            binds.push((target, value));
+                        }
+                    }
                     "call" => {
                         calls.push(node);
-                        (None, None)
+                        if let Some(update) = self.container_update(node) {
+                            binds.push(update);
+                        }
                     }
-                    _ => (None, None),
-                };
-                if let (Some(target), Some(value)) = bind {
-                    binds.push((target, value));
+                    _ => {
+                        if let Some(guard) = self.guard(node) {
+                            guards.push(guard);
+                        }
+                    }
                 }
                 stack.extend(named_children(node));
             }
@@ -8694,8 +8944,11 @@ impl<'t> Ctx<'t> {
         loop {
             let mut grew = false;
             for &(target, value) in &binds {
-                if self.reads(value, &taint, &sent) {
-                    grew |= self.taint_target(target, &mut taint);
+                if self.reads(value, &taint, &cx.sent) {
+                    match self.taint_target(target, &mut taint, class, &regions) {
+                        Some(new) => grew |= new,
+                        None => return true,
+                    }
                 }
             }
             if !grew {
@@ -8703,48 +8956,268 @@ impl<'t> Ctx<'t> {
             }
         }
 
-        if self
-            .model_reads
-            .iter()
-            .any(|&node| seen(node) && self.reads(node, &taint, &sent))
-        {
-            return true;
+        // Sent where a model may be.
+        for &(start, end) in &regions {
+            let from = cx.reads.partition_point(|n| n.start_byte() < start);
+            let sent_there = cx.reads[from..]
+                .iter()
+                .take_while(|n| n.start_byte() < end)
+                .any(|&n| n.end_byte() <= end && self.reads(n, &taint, &cx.sent));
+            if sent_there {
+                return true;
+            }
         }
-        // Handed to code of this file that sends a request.
-        let sends = |name: &str| {
-            self.scopes.iter().any(|scope| {
-                matches!(scope.kind, ScopeKind::Function | ScopeKind::Class)
-                    && scope.name == name
-                    && self
-                        .sending
-                        .iter()
-                        .any(|call| within(*call, (scope.start, scope.end)))
-            })
-        };
-        calls.iter().any(|&call| {
+
+        let mut changing = HashMap::new();
+        // Handed to a call that may send it, or choosing the call.
+        for &call in &calls {
+            if cx.sent.contains(&call.id()) || self.container_update(call).is_some() {
+                continue;
+            }
             let Some(function) = call.child_by_field_name("function") else {
-                return false;
+                continue;
             };
-            let name = match function.kind() {
-                "identifier" => Some(self.text(function)),
-                "attribute" => function
+            let of_value = function.kind() == "attribute"
+                && function
                     .child_by_field_name("object")
-                    .filter(|object| match object.kind() {
-                        "identifier" => matches!(self.text(*object), "self" | "cls"),
-                        "call" => object
-                            .child_by_field_name("function")
-                            .is_some_and(|f| self.text(f) == "super"),
-                        _ => false,
-                    })
-                    .and_then(|_| function.child_by_field_name("attribute"))
-                    .map(|a| self.text(a)),
-                _ => None,
+                    .is_some_and(|o| self.reads(o, &taint, &cx.sent));
+            if !of_value && self.reads(function, &taint, &cx.sent) {
+                return true;
+            }
+            let handed = call.child_by_field_name("arguments").is_some_and(|args| {
+                self.reads(args, &taint, &cx.sent) || (class && self.passes_self(args))
+            });
+            // `self.helper()` hands it `self` too; a base class's
+            // constructor runs before the assignment (see
+            // [`Ctx::base_init_after`]).
+            let on_self = class
+                && is_receiver_call(function, |n| self.text(n))
+                && function
+                    .child_by_field_name("attribute")
+                    .is_some_and(|a| self.text(a) != "__init__");
+            let held = match cx.callees.get(&call.id()) {
+                Some(Callee::Inert) => false,
+                Some(Callee::Here(scopes)) => {
+                    handed
+                        && scopes
+                            .iter()
+                            .any(|&s| self.sends_changed(s, cx, &regions, &direct, &mut changing))
+                }
+                _ => (handed && !of_value) || on_self,
             };
-            name.is_some_and(sends)
-                && call
-                    .child_by_field_name("arguments")
-                    .is_some_and(|args| self.reads(args, &taint, &sent))
+            if held {
+                return true;
+            }
+        }
+
+        // A condition on it choosing another path.
+        for guard in &guards {
+            if !guard
+                .conditions
+                .iter()
+                .any(|c| self.reads(*c, &taint, &cx.sent))
+            {
+                continue;
+            }
+            if guard.branches.is_empty() {
+                return true;
+            }
+            for &branch in &guard.branches {
+                if self.branch_strays(branch, cx, &regions, &direct, &mut changing) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether code that runs in `branch` sends something other than the
+    /// parameter's requests (`direct`): another request, or a call to the
+    /// file's own code that may, or leaves without one of them (`return`,
+    /// `raise`, `break`, `continue`).
+    fn branch_strays(
+        &self,
+        branch: Node<'t>,
+        cx: &Settle<'t>,
+        regions: &[(usize, usize)],
+        direct: &dyn Fn(Node<'t>) -> bool,
+        changing: &mut HashMap<usize, bool>,
+    ) -> bool {
+        let mut leaves = false;
+        let mut sends_it = false;
+        let mut stack = vec![branch];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "return_statement" | "raise_statement" | "break_statement"
+                | "continue_statement" => leaves = true,
+                "call" if cx.sent.contains(&node.id()) => {
+                    if direct(node) {
+                        sends_it = true;
+                    } else {
+                        return true;
+                    }
+                }
+                "call" => {
+                    if let Some(Callee::Here(scopes)) = cx.callees.get(&node.id()) {
+                        if scopes
+                            .iter()
+                            .any(|&s| self.sends_changed(s, cx, regions, direct, changing))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            stack.extend(named_children(node));
+        }
+        leaves && !sends_it
+    }
+
+    /// Whether the code of `scope` may send something other than the
+    /// parameter's own requests (`direct`). Outside the code that sees the
+    /// parameter that is [`Settle::may_send`]; inside, a request that is not
+    /// one of them, a callee the scan cannot see into, or a call to the
+    /// file's own code that may.
+    fn sends_changed(
+        &self,
+        scope: usize,
+        cx: &Settle<'t>,
+        regions: &[(usize, usize)],
+        direct: &dyn Fn(Node<'t>) -> bool,
+        changing: &mut HashMap<usize, bool>,
+    ) -> bool {
+        let range = (self.scopes[scope].start, self.scopes[scope].end);
+        if !regions.iter().any(|r| r.0 <= range.0 && range.1 <= r.1) {
+            return cx.may_send[scope];
+        }
+        if let Some(known) = changing.get(&scope) {
+            return *known;
+        }
+        changing.insert(scope, false);
+        let mut found = false;
+        for &call in &cx.owned[scope] {
+            if cx.sent.contains(&call.id()) {
+                if direct(call) {
+                    continue;
+                }
+                found = true;
+            } else {
+                found = match cx.callees.get(&call.id()) {
+                    Some(Callee::Inert) => false,
+                    Some(Callee::Here(scopes)) => scopes
+                        .iter()
+                        .any(|&s| self.sends_changed(s, cx, regions, direct, changing)),
+                    _ => true,
+                };
+            }
+            if found {
+                break;
+            }
+        }
+        if !found {
+            found = cx.children[scope]
+                .iter()
+                .any(|&s| self.sends_changed(s, cx, regions, direct, changing));
+        }
+        changing.insert(scope, found);
+        found
+    }
+
+    /// `x.update(...)`, `x.setdefault(...)`, `x.append(...)`...: the
+    /// container and the arguments it takes in, read as an assignment.
+    fn container_update(&self, call: Node<'t>) -> Option<(Node<'t>, Node<'t>)> {
+        let function = call.child_by_field_name("function")?;
+        if function.kind() != "attribute" {
+            return None;
+        }
+        let attr = self.text(function.child_by_field_name("attribute")?);
+        if !CONTAINER_UPDATES.contains(&attr) {
+            return None;
+        }
+        Some((
+            function.child_by_field_name("object")?,
+            call.child_by_field_name("arguments")?,
+        ))
+    }
+
+    /// The conditions a node tests and the branches they choose between,
+    /// for a node that makes a choice; an `assert` has no branch.
+    fn guard(&self, node: Node<'t>) -> Option<Guard<'t>> {
+        let mut conditions = Vec::new();
+        let mut branches = Vec::new();
+        match node.kind() {
+            "if_statement" => {
+                conditions.extend(node.child_by_field_name("condition"));
+                branches.extend(node.child_by_field_name("consequence"));
+                let mut cursor = node.walk();
+                for alternative in node.children_by_field_name("alternative", &mut cursor) {
+                    conditions.extend(alternative.child_by_field_name("condition"));
+                    branches.extend(
+                        alternative
+                            .child_by_field_name("consequence")
+                            .or_else(|| alternative.child_by_field_name("body")),
+                    );
+                }
+            }
+            "while_statement" => {
+                conditions.extend(node.child_by_field_name("condition"));
+                branches.extend(node.child_by_field_name("body"));
+                branches.extend(node.child_by_field_name("alternative"));
+            }
+            "match_statement" => {
+                let mut cursor = node.walk();
+                conditions.extend(node.children_by_field_name("subject", &mut cursor));
+                let cases = node
+                    .child_by_field_name("body")
+                    .map(named_children)
+                    .unwrap_or_default();
+                for case in cases.into_iter().filter(|c| c.kind() == "case_clause") {
+                    conditions.extend(
+                        named_children(case)
+                            .into_iter()
+                            .filter(|c| c.kind() == "if_clause"),
+                    );
+                    branches.push(case);
+                }
+            }
+            "conditional_expression" => {
+                let parts = named_children(node);
+                let [consequence, condition, alternative] = parts.as_slice() else {
+                    return None;
+                };
+                conditions.push(*condition);
+                branches.extend([*consequence, *alternative]);
+            }
+            "boolean_operator" => {
+                conditions.extend(node.child_by_field_name("left"));
+                branches.extend(node.child_by_field_name("right"));
+            }
+            "assert_statement" => conditions.extend(node.named_child(0)),
+            _ => return None,
+        }
+        Some(Guard {
+            conditions,
+            branches,
         })
+    }
+
+    /// Whether `args` hands over `self` itself (`helper(self)`), not one of
+    /// its attributes.
+    fn passes_self(&self, args: Node<'t>) -> bool {
+        let mut stack = vec![args];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier" && self.text(node) == "self" {
+                let attribute_object = node.parent().is_some_and(|p| {
+                    p.kind() == "attribute" && p.child_by_field_name("object") == Some(node)
+                });
+                if !attribute_object {
+                    return true;
+                }
+            }
+            stack.extend(named_children(node));
+        }
+        false
     }
 
     /// Whether `node` reads a name or attribute `taint` holds: the
@@ -8785,8 +9258,17 @@ impl<'t> Ctx<'t> {
     }
 
     /// Adds the names and attributes an assignment `target` binds to
-    /// `taint`; `true` when one is new.
-    fn taint_target<'a>(&self, target: Node<'t>, taint: &mut Taint<'a>) -> bool
+    /// `taint`: `Some(true)` when one is new, `None` when the value leaves
+    /// the code that sees the parameter (a global or `nonlocal` name, an
+    /// attribute of anything but `self` in a class, a container that is not
+    /// local).
+    fn taint_target<'a>(
+        &self,
+        target: Node<'t>,
+        taint: &mut Taint<'a>,
+        class: bool,
+        regions: &[(usize, usize)],
+    ) -> Option<bool>
     where
         't: 'a,
     {
@@ -8794,17 +9276,46 @@ impl<'t> Ctx<'t> {
         let mut stack = vec![target];
         while let Some(node) = stack.pop() {
             match node.kind() {
-                "identifier" => grew |= taint.names.insert(self.text(node)),
-                "attribute" => {
-                    if let Some(attr) = node.child_by_field_name("attribute") {
-                        grew |= taint.attrs.insert(self.text(attr));
+                "identifier" => {
+                    let name = self.text(node);
+                    let home = self.binding_scope(name, self.scope_at(node.start_byte()));
+                    let scope = &self.scopes[home];
+                    let local = scope.kind == ScopeKind::Function
+                        && regions
+                            .iter()
+                            .any(|r| r.0 <= scope.start && scope.end <= r.1);
+                    if !local {
+                        return None;
                     }
+                    grew |= taint.names.insert(name);
+                }
+                "attribute" => {
+                    let on_self = class
+                        && node
+                            .child_by_field_name("object")
+                            .is_some_and(|o| o.kind() == "identifier" && self.text(o) == "self");
+                    let attr = node.child_by_field_name("attribute")?;
+                    if !on_self {
+                        return None;
+                    }
+                    grew |= taint.attrs.insert(self.text(attr));
                 }
                 "subscript" => stack.extend(node.child_by_field_name("value")),
                 _ => stack.extend(named_children(node)),
             }
         }
-        grew
+        Some(grew)
+    }
+
+    /// The innermost scope around byte `pos`.
+    fn scope_at(&self, pos: usize) -> usize {
+        let mut best = 0;
+        for (i, scope) in self.scopes.iter().enumerate() {
+            if scope.start <= pos && pos < scope.end && scope.start >= self.scopes[best].start {
+                best = i;
+            }
+        }
+        best
     }
 
     /// Asks `lookup` about every name this file imports with `from module
@@ -9745,6 +10256,11 @@ impl<'t> Ctx<'t> {
         let mut seen_values = HashSet::new();
         values.retain(|v| seen_values.insert((v.key.clone(), v.span.start_byte, v.value.clone())));
         if !from_params.is_empty() {
+            let sources = from_params
+                .iter()
+                .map(|(_, source, _)| (source.func, source.param.clone(), source.attribute.clone()))
+                .collect();
+            self.direct.insert(call.id(), sources);
             let request = ParamRequest {
                 sdk,
                 pkg: target.pkg,
@@ -11715,6 +12231,200 @@ struct ParamSource {
     param: String,
     /// The instance attribute it reaches the call through (`self.model`).
     attribute: Option<String>,
+}
+
+/// A model parameter: the function that takes it, its name, and the
+/// attribute a class keeps it in.
+type ParamKey = (usize, String, Option<String>);
+
+/// What a call calls, for [`Ctx::changed_elsewhere`].
+enum Callee {
+    /// Something that sends no request: a builtin ([`INERT_BUILTINS`]), an
+    /// exception, logging, a method of a literal, a container or string
+    /// method ([`INERT_METHODS`]), a few standard functions
+    /// ([`INERT_FUNCTIONS`]), a client construction.
+    Inert,
+    /// The file's own functions, lambdas, methods or classes it may be.
+    Here(Vec<usize>),
+    /// Anything else: an import, a parameter, another object's method.
+    Unknown,
+}
+
+/// The file-wide facts [`Ctx::changed_elsewhere`] reads, from
+/// [`Ctx::settle_context`].
+struct Settle<'t> {
+    /// The calls that send a request ([`Ctx::sending`]), by node id.
+    sent: HashSet<usize>,
+    /// [`Ctx::model_reads`], by start byte.
+    reads: Vec<Node<'t>>,
+    /// What each call calls, by node id.
+    callees: HashMap<usize, Callee>,
+    /// The calls whose code each scope runs (see [`Ctx::callable_owner`]),
+    /// and the scopes nested in each.
+    owned: Vec<Vec<Node<'t>>>,
+    children: Vec<Vec<usize>>,
+    /// Whether each scope may send a request: it holds a sending call or a
+    /// call to a callee the scan cannot see into, or runs one of the
+    /// file's own scopes that may (a call, or nesting).
+    may_send: Vec<bool>,
+}
+
+/// A choice: what it tests and the code each outcome runs.
+struct Guard<'t> {
+    conditions: Vec<Node<'t>>,
+    /// Empty for an `assert`, which raises.
+    branches: Vec<Node<'t>>,
+}
+
+/// Builtins that send nothing, whatever they are given. `getattr`, `map`,
+/// `filter`, `next` and `iter` may run other code and are not listed.
+const INERT_BUILTINS: &[&str] = &[
+    "print",
+    "len",
+    "str",
+    "repr",
+    "int",
+    "float",
+    "bool",
+    "bytes",
+    "isinstance",
+    "issubclass",
+    "type",
+    "hash",
+    "id",
+    "sorted",
+    "reversed",
+    "min",
+    "max",
+    "sum",
+    "any",
+    "all",
+    "format",
+    "abs",
+    "round",
+    "list",
+    "tuple",
+    "set",
+    "frozenset",
+    "dict",
+    "enumerate",
+    "zip",
+    "range",
+    "hasattr",
+    "callable",
+    "ord",
+    "chr",
+    "divmod",
+];
+
+/// Methods of containers and strings, which send nothing, on whatever
+/// object they are called.
+const INERT_METHODS: &[&str] = &[
+    "append",
+    "extend",
+    "insert",
+    "update",
+    "setdefault",
+    "add",
+    "pop",
+    "remove",
+    "discard",
+    "clear",
+    "copy",
+    "get",
+    "keys",
+    "values",
+    "items",
+    "index",
+    "count",
+    "join",
+    "split",
+    "rsplit",
+    "splitlines",
+    "strip",
+    "lstrip",
+    "rstrip",
+    "lower",
+    "upper",
+    "casefold",
+    "title",
+    "startswith",
+    "endswith",
+    "replace",
+    "format",
+    "encode",
+    "decode",
+    "partition",
+    "rpartition",
+    "removeprefix",
+    "removesuffix",
+];
+
+/// The container methods that put their arguments into the container
+/// (see [`Ctx::container_update`]).
+const CONTAINER_UPDATES: &[&str] = &["append", "extend", "insert", "update", "setdefault", "add"];
+
+/// Standard functions that send nothing.
+const INERT_FUNCTIONS: &[&str] = &[
+    "json.dumps",
+    "json.loads",
+    "copy.copy",
+    "copy.deepcopy",
+    "re.match",
+    "re.search",
+    "re.fullmatch",
+    "re.sub",
+    "re.split",
+    "re.compile",
+    "time.sleep",
+    "time.time",
+    "time.monotonic",
+    "time.perf_counter",
+    "warnings.warn",
+];
+
+/// Logging methods: on an object whose name mentions `log`.
+const LOG_METHODS: &[&str] = &[
+    "debug",
+    "info",
+    "warning",
+    "warn",
+    "error",
+    "exception",
+    "critical",
+    "fatal",
+    "log",
+];
+
+/// Nodes whose methods send nothing.
+const INERT_LITERALS: &[&str] = &[
+    "string",
+    "concatenated_string",
+    "integer",
+    "float",
+    "list",
+    "dictionary",
+    "tuple",
+    "set",
+];
+
+/// An exception class's name, by convention.
+fn is_exception_name(name: &str) -> bool {
+    name.ends_with("Error") || name.ends_with("Exception") || name.ends_with("Warning")
+}
+
+/// `self.x`, `cls.x` or `super().x`: a method of the receiver's class.
+fn is_receiver_call<'t>(function: Node<'t>, text: impl Fn(Node<'t>) -> &'t str) -> bool {
+    function.kind() == "attribute"
+        && function
+            .child_by_field_name("object")
+            .is_some_and(|object| match object.kind() {
+                "identifier" => matches!(text(object), "self" | "cls"),
+                "call" => object
+                    .child_by_field_name("function")
+                    .is_some_and(|f| text(f) == "super"),
+                _ => false,
+            })
 }
 
 /// What holds a value computed from a model parameter (see

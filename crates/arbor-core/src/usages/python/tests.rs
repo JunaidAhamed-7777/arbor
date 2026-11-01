@@ -8419,6 +8419,74 @@ fn a_parameter_another_request_sends_changed_is_not_listed() {
 }
 
 #[test]
+fn a_parameter_handed_to_code_that_may_send_it_is_not_listed() {
+    let head = "from openai import OpenAI\nimport httpx\nclient = OpenAI()\nRENAMED = {\"gpt-3.5-turbo\": \"gpt-4o-mini\"}\nURL = \"https://api.openai.com/v1/chat/completions\"\n";
+    let cases = [
+        // Put into a dict the request spreads.
+        "def ask(prompt, model):\n    params = {\"messages\": [prompt]}\n    if model in RENAMED:\n        params.update(model=RENAMED[model])\n        return client.chat.completions.create(**params)\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        // A method of a module-level instance.
+        "class Legacy:\n    def send(self, prompt, m):\n        return client.chat.completions.create(model=RENAMED[m], messages=[prompt])\nlegacy = Legacy()\ndef ask(prompt, model):\n    if model in RENAMED:\n        return legacy.send(prompt, model)\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        // Through two of the file's functions.
+        "def _send(prompt, m):\n    return client.chat.completions.create(model=RENAMED[m], messages=[prompt])\ndef _route(prompt, m):\n    return _send(prompt, m)\ndef ask(prompt, model):\n    if model in RENAMED:\n        return _route(prompt, model)\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        // Another module's wrapper, or any function it imports.
+        "from .base import send\ndef ask(prompt, model):\n    if model in RENAMED:\n        return send(prompt, model=RENAMED[model])\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        "from .compat import send_legacy\ndef ask(prompt, model):\n    if model in RENAMED:\n        return send_legacy(prompt, model)\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        // `self` handed to a function of the file that sends.
+        "def _legacy(chat, prompt):\n    return client.chat.completions.create(model=RENAMED[chat.model], messages=[prompt])\nclass Chat:\n    def __init__(self, model):\n        self.model = model\n    def ask(self, prompt):\n        if self.model in RENAMED:\n            return _legacy(self, prompt)\n        return client.chat.completions.create(model=self.model, messages=[prompt])\n",
+        // A request the scan does not follow, and a lambda.
+        "def ask(prompt, model):\n    if model in RENAMED:\n        return httpx.Client().post(URL, json={\"model\": RENAMED[model], \"messages\": [prompt]})\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        "def ask(prompt, model):\n    send = lambda m: client.chat.completions.create(model=RENAMED[m], messages=[prompt])\n    if model in RENAMED:\n        return send(model)\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        // A call chosen by it.
+        "HANDLERS = {}\ndef ask(prompt, model):\n    HANDLERS.get(model, print)(prompt)\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        // Written to a global, another object, a module-level container.
+        "CURRENT = None\ndef _send(prompt):\n    return client.chat.completions.create(model=CURRENT, messages=[prompt])\ndef ask(prompt, model):\n    global CURRENT\n    if model in RENAMED:\n        CURRENT = RENAMED[model]\n        return _send(prompt)\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        "def ask(prompt, model, settings):\n    settings.model = RENAMED.get(model, model)\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        "SEEN = {}\ndef ask(prompt, model):\n    SEEN[prompt] = RENAMED.get(model, model)\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        "SEEN = []\ndef ask(prompt, model):\n    SEEN.append(model)\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        // A class's `self` handed to a method the scan cannot see into.
+        "class Chat(Base):\n    def __init__(self, model):\n        self.model = model\n    def ask(self, prompt):\n        self.prepare()\n        return client.chat.completions.create(model=self.model, messages=[prompt])\n",
+    ];
+    for case in cases {
+        let source = format!("{head}{case}");
+        assert_eq!(model_params(&source, "llm.py"), [], "{case}");
+    }
+}
+
+#[test]
+fn a_test_on_the_parameter_that_picks_another_path_keeps_it_unlisted() {
+    let head = "from openai import OpenAI\nclient = OpenAI()\nRETIRED = {\"gpt-3.5-turbo\"}\nFALLBACK = \"gpt-4o-mini\"\n";
+    let cases = [
+        "def ask(prompt, model):\n    if model in RETIRED:\n        return client.chat.completions.create(model=FALLBACK, messages=[prompt])\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        "def ask(prompt, model):\n    match model:\n        case \"gpt-3.5-turbo\" | \"gpt-4-0613\":\n            return client.chat.completions.create(model=\"gpt-4o-mini\", messages=[prompt])\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        "class Chat:\n    def __init__(self, model):\n        self.model = model\n    def ask(self, prompt):\n        if self.model in RETIRED:\n            return client.chat.completions.create(model=FALLBACK, messages=[prompt])\n        return client.chat.completions.create(model=self.model, messages=[prompt])\n",
+        "def _fallback(prompt):\n    return client.chat.completions.create(model=FALLBACK, messages=[prompt])\ndef ask(prompt, model):\n    if model in RETIRED:\n        return _fallback(prompt)\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        // An `elif`, a conditional expression, `and`.
+        "def ask(prompt, model):\n    if not prompt:\n        return None\n    elif model in RETIRED:\n        return \"\"\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        "def ask(prompt, model):\n    return client.chat.completions.create(model=FALLBACK, messages=[prompt]) if model in RETIRED else client.chat.completions.create(model=model, messages=[prompt])\n",
+        "def ask(prompt, model):\n    model in RETIRED and client.chat.completions.create(model=FALLBACK, messages=[prompt])\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        // It never reaches the request.
+        "def ask(prompt, model):\n    if model not in {\"gpt-4o\", \"gpt-4.1\"}:\n        raise ValueError(model)\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        "def ask(prompt, model):\n    assert model not in RETIRED\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+    ];
+    for case in cases {
+        let source = format!("{head}{case}");
+        assert_eq!(model_params(&source, "llm.py"), [], "{case}");
+    }
+
+    // Each branch sends it, the test logs, a helper of the file builds
+    // the messages, a constructor of an imported base runs first.
+    let kept = [
+        "def ask(prompt, model):\n    if model.startswith(\"o1\"):\n        resp = client.chat.completions.create(model=model, messages=[prompt])\n        return resp.choices[0]\n    elif \"gpt-4\" in model:\n        return client.chat.completions.create(model=model, messages=[prompt], temperature=0)\n    return client.chat.completions.create(model=model, messages=[prompt], top_p=1)\n",
+        "import logging\nlogger = logging.getLogger(__name__)\ndef ask(prompt, model):\n    if model in RETIRED:\n        logger.warning(\"retired: %s\", model)\n    print(f\"using {model}\", len(model))\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        "from .types import Response\nclass Sampler(Base):\n    def __init__(self, model):\n        super().__init__()\n        self.model = model\n    def _pack(self, role, content):\n        return {\"role\": str(role), \"content\": content}\n    def __call__(self, prompt):\n        messages = [self._pack(\"user\", prompt)]\n        response = client.chat.completions.create(model=self.model, messages=messages)\n        if response.choices[0].message.content is None:\n            raise ValueError(\"empty\")\n        return Response(text=response.choices[0].message.content, messages=messages)\n",
+    ];
+    for case in kept {
+        let source = format!("{head}{case}");
+        assert!(!model_params(&source, "llm.py").is_empty(), "{case}");
+    }
+}
+
+#[test]
 fn a_wrapper_request_of_a_package_this_file_cannot_check_is_routed_unknown() {
     // What another scan exported for a package this one does not follow:
     // the calling file's checks do not cover it, so the route is not
