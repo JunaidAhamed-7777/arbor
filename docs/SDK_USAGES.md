@@ -550,8 +550,9 @@ that is also assigned or is a parameter, a wildcard import, a session or
 client (`requests.Session().post`, `httpx.Client().post`),
 `requests.request("POST", ...)` and every other method are not followed.
 
-**The URL** is the first positional argument or `url=`. It is read under the
-value rules, and only a value with no gap counts: a literal, or a same-file
+**The URL** is the first positional argument or `url=`; a `*` argument before
+the first positional one hides which argument it is, so the call records
+nothing. It is read under the value rules, and only a value with no gap counts: a literal, or a same-file
 constant or local. An f-string, an environment lookup (with or without a
 fallback), a parameter or a parameter default records nothing. The URL's
 scheme must be `https` or `http` and its host exactly `api.openai.com` or
@@ -604,18 +605,27 @@ does. The body is:
 
 Only the body's top-level `model` is read, plus the model keys nested in its
 containers (`requests[].params.model` in a Message Batch), as for any dict
-argument. An entry a later `**` expansion or computed key may replace is a
+argument, except under `metadata`: the caller's own tags, which the API stores
+and never reads as the model. An entry a later `**` expansion or computed key may replace is a
 `splat` gap that lists it. A body with no `model` is a `missing_model` gap,
 except a Message Batch, whose models are nested. A body the file cannot read
 (a parameter, a mutated dict, a string, form data, `files=`, more than one
 body) is an `unresolved_model` gap with the reason `request_body`. A call
 given `*args` or `**kwargs`, which may hold another body, keeps a `splat` gap
-with no key, which covers every model value of the call.
+with no key, which covers every model value of the call; a `*` argument after
+the URL may hold the body itself, so the body is not read (`request_body`).
 
-**Replaced.** Writing `post` on the library's module (`requests.post =
-fake`, `setattr(requests, "post", ...)`, `del requests.post`) or any of its
-attributes with a run-time name is a `dynamic_feature` gap on every raw HTTP
-request in the file, as is any dynamic feature of the whole file. A replaced
+**Replaced.** `post` hands what it is given down to the rest of the library
+(`Session.request`, `Session.send`, its adapters), so the scan fails closed: any
+attribute written, deleted or set with `setattr` on the library or anything in
+it (`requests.post = fake`, `del requests.post`, `requests.Session.request =
+pin`, `Session.send = pin` after `from requests import Session`), `post` or an
+attribute named at run time written on an object the scan cannot identify (`r =
+requests; r.post = fake`, a parameter, `self.http`), and a test helper aimed at
+the library (`monkeypatch.setattr(requests, "post", ...)`,
+`mock.patch("requests.post")`, `patch.object(...)`) is a `dynamic_feature` gap
+on every raw HTTP request in the file, as is any dynamic feature of the whole
+file. A replaced
 `post` may also change the dict it is given, so in such a file a dict passed
 as `json=` counts as passed elsewhere again, for SDK calls that expand it
 too. A `def` or `class` that rebinds the imported `post` (or any other
