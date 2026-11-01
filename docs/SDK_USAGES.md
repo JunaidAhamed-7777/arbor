@@ -886,7 +886,7 @@ The report assumes the rest. In particular:
   and for the Claude Code CLI one of its provider switches. The model an
   agent given none runs may come from `OPENAI_DEFAULT_MODEL`, and Claude
   Code options given none from `ANTHROPIC_MODEL`.
-- Claude Code's settings files (`.claude/settings.json` and the user's),
+- Claude Code's settings files (`.claude/settings.json` and the user's)
   may set the CLI's `env`, and so its provider. claude-agent-sdk 0.2 loads
   every source when `setting_sources` is `None` (its default, which matches
   the CLI's), and only the sources it names otherwise (`[]` loads none);

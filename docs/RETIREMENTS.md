@@ -213,8 +213,9 @@ it too. The check runs on the runner and sends nothing anywhere.
 - **Direct SDK calls and LangChain chat models.** It reads the `openai`, `anthropic`,
   `google-genai` and `google-generativeai` SDKs, and LangChain's `ChatOpenAI`,
   `AzureChatOpenAI` and `ChatAnthropic`, raw HTTP posts to OpenAI's and Anthropic's
-  REST APIs with `requests` or `httpx`, and the models given to the OpenAI Agents SDK,
-  the Claude Agent SDK and AgentScope. Calls through LiteLLM and on Amazon Bedrock are
+  REST APIs with `requests` or `httpx`, and the models passed to the OpenAI Agents SDK,
+  Claude Agent SDK and AgentScope classes listed in
+  [SDK_USAGES.md](SDK_USAGES.md#agent-frameworks). Calls through LiteLLM and on Amazon Bedrock are
   routed (`--include-routed`), and Bedrock's own schedule is not in the data. Other
   framework wrappers (LangChain's other integrations, LlamaIndex) are not checked yet. Model IDs in `.env`, YAML, JSON or notebooks are not read.
 - **Values it can see.** A model passed in from an environment variable, a function
