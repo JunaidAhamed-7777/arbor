@@ -8779,6 +8779,71 @@ fn a_dict_given_to_a_replaced_post_is_not_read() {
 }
 
 #[test]
+fn a_star_argument_hides_the_url_or_the_body() {
+    // Before the URL: which argument is the URL is not known.
+    let found = usages(
+        "import requests\nURL = \"https://api.openai.com/v1/chat/completions\"\nrequests.post(*parts, URL, json={\"model\": \"gpt-4o\"})\n",
+    );
+    assert!(found.calls.is_empty(), "{:?}", found.calls);
+    // After it: the body may be in it.
+    let found = usages(
+        "import requests\nURL = \"https://api.openai.com/v1/chat/completions\"\nrequests.post(URL, *rest, json={\"model\": \"gpt-4o\"})\n",
+    );
+    assert!(call_on(&found, 3).values.is_empty());
+    assert_eq!(
+        gaps_on(&found, 3),
+        ["unresolved_model/request_body", "unresolved_model/splat"]
+    );
+}
+
+#[test]
+fn a_model_in_a_bodys_metadata_is_not_read() {
+    let found = usages(
+        "import requests\nrequests.post(\"https://api.openai.com/v1/chat/completions\", json={\"model\": \"gpt-4o\", \"metadata\": {\"model\": \"gpt-3.5-turbo\"}, \"messages\": []})\n",
+    );
+    let call = call_on(&found, 2);
+    let keys: Vec<(&str, &str)> = call
+        .values
+        .iter()
+        .map(|v| (v.key.as_str(), v.value.as_str()))
+        .collect();
+    assert_eq!(keys, [("model", "gpt-4o")]);
+}
+
+#[test]
+fn a_url_with_userinfo_or_assigned_twice_is_not_followed() {
+    for setup in [
+        // The host is after the `@`.
+        "URL = \"https://api.openai.com@proxy.example/v1/chat/completions\"",
+        // Two values: the scan cannot say which is sent.
+        "URL = \"https://api.openai.com/v1/chat/completions\"\nif flag:\n    URL = \"https://proxy.example/v1/chat/completions\"",
+    ] {
+        let source = format!(
+            "import requests\n{setup}\nrequests.post(URL, json={{\"model\": \"gpt-4o\"}})\n"
+        );
+        let found = usages(&source);
+        assert!(
+            found.calls.iter().all(|c| c.package != "requests"),
+            "{setup}: {:?}",
+            found.calls
+        );
+    }
+}
+
+#[test]
+fn a_local_post_that_shadows_the_import_keeps_an_sdk_spread_readable() {
+    // `post` is the file's own function, not requests': the dict it is
+    // given is passed on like any other, so the SDK call's `**body` is a
+    // spread the scan does not read.
+    let found = usages(
+        "from requests import post\nfrom openai import OpenAI\nclient = OpenAI()\nbody = {\"model\": \"gpt-4o\", \"messages\": []}\ndef post(url, json):\n    json[\"model\"] = \"gpt-4o-mini\"\npost(\"https://api.openai.com/v1/chat/completions\", json=body)\nclient.chat.completions.create(**body)\n",
+    );
+    assert!(found.calls.iter().all(|c| c.package != "requests"));
+    assert!(call_on(&found, 8).values.is_empty());
+    assert!(gaps_on(&found, 8).contains(&"unresolved_model/splat".to_string()));
+}
+
+#[test]
 fn a_query_or_fragment_before_the_path_ends_the_host() {
     for url in [
         "https://api.openai.com?x/v1/chat/completions",

@@ -8304,8 +8304,20 @@ impl<'t> Ctx<'t> {
                 .find_map(|(k, value)| (k == name).then_some(*value))
         };
         let url_keyword = by_keyword("url");
-        let Some(url) = url_keyword.or_else(|| positional.first().copied()) else {
-            return;
+        // A `*` argument hides the position of every argument after it: one
+        // before the URL leaves the URL unknown, one after it may hold the
+        // body.
+        let first_splat = call
+            .child_by_field_name("arguments")
+            .map(named_children)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|a| a.kind() == "list_splat")
+            .map(|a| a.start_byte());
+        let url = match (url_keyword, positional.first()) {
+            (Some(url), _) => url,
+            (None, Some(first)) if first_splat.is_none_or(|at| at > first.start_byte()) => *first,
+            _ => return,
         };
         let endpoint = match self.resolve_value(url, scope, 0) {
             Ok(resolved) if resolved.is_certain() => http_endpoint(&resolved.value),
@@ -8333,11 +8345,16 @@ impl<'t> Ctx<'t> {
         }
         let skip = usize::from(url_keyword.is_none());
         for (index, value) in positional.iter().enumerate().skip(skip) {
+            let after_splat = first_splat.is_some_and(|at| at < value.start_byte());
             match (library, index - skip) {
+                _ if after_splat => bodies.push(None),
                 ("requests", 0) => bodies.push(self.json_dumps_argument(*value)),
                 ("requests", 1) => bodies.push(Some(*value)),
                 _ => bodies.push(None),
             }
+        }
+        if first_splat.is_some() {
+            bodies.push(None);
         }
 
         let chain = self.render(function);
@@ -8390,10 +8407,26 @@ impl<'t> Ctx<'t> {
                         }
                         self.take_value(&site, key, false, result, &mut values);
                     }
+                    // `metadata` holds the caller's own tags, which the API
+                    // stores and never reads as a model.
                     let nested = self.dict_nested(&expansion);
-                    self.take_nested(&site, nested.found.clone(), nested.cut, &mut values);
+                    let sent = |path: &str| {
+                        path.split(['.', '[']).next() != Some("metadata")
+                    };
+                    let found = nested
+                        .found
+                        .iter()
+                        .filter(|v| sent(&v.path))
+                        .cloned()
+                        .collect();
+                    self.take_nested(&site, found, nested.cut, &mut values);
                     let mut seen: HashSet<&str> = HashSet::new();
-                    for path in nested.overridden.iter().take(MAX_NESTED_VALUES) {
+                    for path in nested
+                        .overridden
+                        .iter()
+                        .filter(|p| sent(p))
+                        .take(MAX_NESTED_VALUES)
+                    {
                         if seen.insert(path.as_str()) {
                             let unresolved = Unresolved::new("splat", "{...}".to_string());
                             self.unresolved_gap(&site, path, &unresolved, None);
