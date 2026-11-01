@@ -1414,7 +1414,15 @@ struct NestedValue {
     path: String,
     positional: bool,
     resolved: Resolved,
+    /// A LiteLLM option the dict holding the value names next to it, which
+    /// replaces the model that dict sends (`deployment_id`) or picks its
+    /// provider (`custom_llm_provider`): a LiteLLM fallback's own.
+    beside: Option<&'static str>,
 }
+
+/// LiteLLM options a fallback dict may name next to its `model`, which then
+/// does not decide what that fallback sends, or where.
+const LITELLM_FALLBACK_OPTIONS: &[&str] = &["deployment_id", "custom_llm_provider"];
 
 /// A bounded read of nested model values.
 struct NestedRead {
@@ -7978,7 +7986,11 @@ impl<'t> Ctx<'t> {
 
         // `GenerativeModel("gemini-pro")`, `genai.embed_content("models/...", text)`:
         // the model is positional.
-        if !keyed {
+        // A LiteLLM call's first argument is its model even next to a
+        // `deployment_id`, which is a value key too.
+        let positional_open = !keyed
+            || (target.pkg == Pkg::Litellm && !args.value_args.iter().any(|(k, _)| k == "model"));
+        if positional_open {
             if let (Some(key), Some(first)) = (
                 positional_model_key(target.pkg, target.receiver, &member),
                 args.first_positional,
@@ -8040,6 +8052,14 @@ impl<'t> Ctx<'t> {
         // A LiteLLM call given a `deployment_id`, which replaces its `model`.
         let mut deployment =
             target.pkg == Pkg::Litellm && args.kwargs.iter().any(|k| k == "deployment_id");
+        // A LiteLLM call given a `prompt_id`, or a provider of its own
+        // (`custom_llm_provider`, `azure=True`).
+        let mut prompt = target.pkg == Pkg::Litellm && args.kwargs.iter().any(|k| k == "prompt_id");
+        let mut provider = target.pkg == Pkg::Litellm
+            && args
+                .kwargs
+                .iter()
+                .any(|k| k == "custom_llm_provider" || k == "azure");
         let mut expanded: Vec<usize> = Vec::new();
         // The model keys the expanded same-file dicts give.
         let mut expanded_keys: HashSet<&'static str> = HashSet::new();
@@ -8114,6 +8134,15 @@ impl<'t> Ctx<'t> {
             if pkg == Pkg::Litellm && expansion.summary.last.contains_key("deployment_id") {
                 deployment = true;
             }
+            if pkg == Pkg::Litellm && expansion.summary.last.contains_key("prompt_id") {
+                prompt = true;
+            }
+            if pkg == Pkg::Litellm
+                && (expansion.summary.last.contains_key("custom_llm_provider")
+                    || expansion.summary.last.contains_key("azure"))
+            {
+                provider = true;
+            }
             if pkg != Pkg::Boto3 {
                 let list = self.dict_nested(&expansion);
                 // The dict is read once for every call that expands it: the
@@ -8140,6 +8169,15 @@ impl<'t> Ctx<'t> {
                 nested_cut |= list.cut;
             }
         }
+        // A LiteLLM fallback that names its own `deployment_id` or provider.
+        let fallback_options: Vec<(String, &'static str)> = if pkg == Pkg::Litellm {
+            nested
+                .iter()
+                .filter_map(|v| v.beside.map(|option| (v.path.clone(), option)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.take_nested(&site, nested, nested_cut, &mut values);
         if site.gap_worthy && !nested_overridden.is_empty() {
             // One gap per key path, at most [`MAX_NESTED_VALUES`]; past
@@ -8345,12 +8383,15 @@ impl<'t> Ctx<'t> {
         }
 
         // LiteLLM may send the models a call names to others: through its
-        // process-wide `model_alias_map`, or through a `model_list` passed to
-        // the call (or held by a `**` expansion), which maps a model name to
-        // the deployment it calls. These gaps hold no key, so they cover
-        // every model value of the call, nested fallbacks included.
+        // process-wide `model_alias_map`, a `model_list` passed to the call
+        // (or held by a `**` expansion), which maps a model name to the
+        // deployment it calls, a `deployment_id`, which it sends to Azure in
+        // place of the model and of every fallback's, or a `prompt_id`, whose
+        // template may name the model. These gaps hold no key, so they cover
+        // every model value of the call, nested fallbacks included; the
+        // `deployment_id` itself is the value sent.
         if target.pkg == Pkg::Litellm {
-            let mut remapped = Vec::new();
+            let mut remapped: Vec<(Option<String>, &str, String)> = Vec::new();
             if let Some(feature) = self.litellm_aliases {
                 remapped.push((
                     None,
@@ -8374,17 +8415,35 @@ impl<'t> Ctx<'t> {
                 remapped.push((
                     None,
                     "splat",
-                    format!("`{chain}` is given a `**` expansion that may hold a `model_list`, which maps the model names it is given to the deployments LiteLLM calls"),
+                    format!("`{chain}` is given a `**` expansion that may hold a `model_list`, a `deployment_id` or a `prompt_id`, which may send other models in place of those it names"),
                 ));
             }
-            // `completion` sends the `deployment_id` in place of the
-            // `model` (and to Azure): the deployment is the value sent.
             if deployment {
+                let mut keys: Vec<String> = values
+                    .iter()
+                    .map(|v| v.key.clone())
+                    .filter(|key| key != "deployment_id")
+                    .collect();
+                keys.sort();
+                keys.dedup();
+                for key in keys {
+                    let detail = format!("`{key}` for `{chain}` is not sent: LiteLLM sends the `deployment_id` it is given to Azure in its place, for the model and for every fallback");
+                    remapped.push((Some(key), "deployment_id", detail));
+                }
+            }
+            if prompt {
                 remapped.push((
-                    Some("model"),
-                    "reassigned",
-                    format!("`model` for `{chain}` is replaced by the `deployment_id` it is given, which LiteLLM sends to Azure instead"),
+                    None,
+                    "prompt_id",
+                    format!("`{chain}` is given a `prompt_id`: with a prompt-management integration registered, the prompt's template may name the model LiteLLM sends"),
                 ));
+            }
+            for (key, option) in fallback_options {
+                let (reason, detail) = match option {
+                    "deployment_id" => ("deployment_id", format!("`{key}` for `{chain}` is not sent: its fallback names a `deployment_id`, which LiteLLM sends to Azure in its place")),
+                    _ => ("litellm_provider", format!("`{key}` for `{chain}` is sent to the provider its fallback's `custom_llm_provider` names, not the one its name suggests")),
+                };
+                remapped.push((Some(key), reason, detail));
             }
             for (key, reason, detail) in remapped {
                 self.out.gaps.push(UsageGap {
@@ -8394,9 +8453,28 @@ impl<'t> Ctx<'t> {
                     span: Some(span),
                     symbol: symbol.clone(),
                     chain: Some(chain.clone()),
-                    key: key.map(str::to_string),
+                    key,
                     reason: reason.to_string(),
                     detail,
+                    values: Vec::new(),
+                    values_complete: false,
+                    args: None,
+                });
+            }
+            // `custom_llm_provider` (or `azure=True`) picks the provider
+            // before the model's name does, so where the call goes is not
+            // what its model suggests.
+            if provider {
+                self.out.gaps.push(UsageGap {
+                    kind: GapKind::AmbiguousClient,
+                    sdk: Some(sdk),
+                    file: self.file.clone(),
+                    span: Some(span),
+                    symbol: symbol.clone(),
+                    chain: Some(chain.clone()),
+                    key: None,
+                    reason: "litellm_provider".to_string(),
+                    detail: format!("`{chain}` is given `custom_llm_provider` (or `azure=True`), which picks the provider LiteLLM sends the request to in place of the model's name"),
                     values: Vec::new(),
                     values_complete: false,
                     args: None,
@@ -9173,10 +9251,17 @@ impl<'t> Ctx<'t> {
                         if overridden {
                             read.overridden.push(path);
                         } else if let Ok(resolved) = self.resolve_value(value, place.scope, 0) {
+                            let beside = LITELLM_FALLBACK_OPTIONS
+                                .iter()
+                                .find(|option| {
+                                    **option != key && summary.last.contains_key(**option)
+                                })
+                                .copied();
                             read.found.push(NestedValue {
                                 path,
                                 positional: place.positional,
                                 resolved,
+                                beside,
                             });
                         }
                     } else if is_container(value) {

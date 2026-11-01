@@ -1194,18 +1194,29 @@ fn resolve<'d>(
         Schedule::Guess => {}
     }
     // Routed or unknown: a router prefix names the schedule, else the model
-    // ID's shape, else the SDK's own provider.
+    // ID's shape, else the SDK's own provider. A call the usage scan put a
+    // routing gap on stays unknown, wherever the model points.
+    let routed = if routing.gap.is_some() {
+        RoutingClass::Unknown
+    } else {
+        RoutingClass::Routed
+    };
     for (prefix, table) in ROUTER_PREFIXES {
         if let Some(id) = value.strip_prefix(prefix) {
             let mut hit = lookup(data, *table, id)?;
             hit.match_kind = MatchKind::RouterPrefix;
-            return Some((hit, RoutingClass::Routed));
+            return Some((hit, routed));
         }
     }
     // LiteLLM sends a Gemini model named with no provider prefix to Vertex
     // AI (`get_llm_provider`); only `gemini/<model>`, above, reaches the
-    // Gemini API.
+    // Gemini API. A call whose provider is chosen otherwise
+    // (`custom_llm_provider`, a routing gap) may reach either: neither is
+    // looked up.
     if routing.sdk == Some(Sdk::Litellm) && model_family(value) == Some(Sdk::Google) {
+        if routing.gap.is_some() {
+            return None;
+        }
         let mut hit = lookup(data, Table::Vertex, value)?;
         hit.notes.push(
             "LiteLLM sends a Gemini model named with no provider prefix to Vertex AI, so this is Google Cloud's (Vertex AI) schedule; `gemini/<model>` would reach the Gemini API instead."
@@ -1229,11 +1240,7 @@ fn resolve<'d>(
     // An SDK sending another provider's model is talking to a proxy.
     let crosses = routing.sdk.is_some_and(|sdk| sdk_table(sdk) != Some(table))
         && !(routing.sdk == Some(Sdk::Google) && table == Table::Vertex);
-    let class = if crosses {
-        RoutingClass::Routed
-    } else {
-        routing.class
-    };
+    let class = if crosses { routed } else { routing.class };
     Some((hit, class))
 }
 
@@ -2498,6 +2505,10 @@ fn unreadable(input: ScanInput<'_>) -> (Vec<Unreadable>, usize) {
         if gap.kind != GapKind::UnresolvedModel || gap.reason == "truncated" {
             continue;
         }
+        // A Bedrock call is never checked, so it is not counted either.
+        if gap.sdk == Some(Sdk::Aws) {
+            continue;
+        }
         if gap.reason == "missing_model" {
             no_model += 1;
             continue;
@@ -2549,10 +2560,11 @@ fn unresolved_clients(input: ScanInput<'_>) -> usize {
         .gaps
         .iter()
         // `getattr` methods are counted on their own; vendored code is not
-        // the project's.
+        // the project's; a Bedrock call is never checked.
         .filter(|g| {
             gaps::holds_routing(g)
                 && !matches!(g.kind, GapKind::DynamicDispatch | GapKind::VendoredPath)
+                && g.sdk != Some(Sdk::Aws)
         })
         .filter_map(|g| g.span.map(|s| (g.file.as_str(), s.start_byte)))
         .filter(|at| !shown.contains(at))
@@ -3672,6 +3684,43 @@ env.converse(modelId="claude-3-5-sonnet-20240620", messages=[])
         assert_eq!(report.routed[0].confidence, Confidence::ConfirmFirst);
         assert!(!report.routed[0].fails);
         assert_eq!(report.exit_code, 0);
+        // A retired model LiteLLM may not send fails nothing: a fallback
+        // next to a `deployment_id` (the call's or its own), a model next to
+        // a `prompt_id`, and any model of a call whose `completion` the file
+        // replaces, which is listed with its routing not confirmed.
+        for remap in [
+            "litellm.completion(model=\"gpt-4o\", deployment_id=\"chat-prod\", fallbacks=[{\"model\": \"gpt-3.5-turbo-0613\"}], messages=[])",
+            "litellm.completion(model=\"gpt-4o\", fallbacks=[{\"model\": \"gpt-3.5-turbo-0613\", \"deployment_id\": \"chat-old\"}], messages=[])",
+            "litellm.completion(model=\"gpt-3.5-turbo-0613\", prompt_id=\"welcome\", messages=[])",
+            "setattr(litellm, \"completion\", traced(litellm.completion))\nlitellm.completion(model=\"gpt-3.5-turbo-0613\", messages=[])",
+        ] {
+            let source = format!("import litellm\n{remap}\n");
+            let report = check_source(&source, &opts);
+            let retired: Vec<&Finding> = report
+                .findings
+                .iter()
+                .chain(&report.routed)
+                .filter(|f| f.status == State::Retired)
+                .collect();
+            assert_eq!(retired.len(), 1, "{remap}: {retired:#?}");
+            assert!(!retired[0].fails, "{remap}: {:#?}", retired[0]);
+            assert_eq!(report.exit_code, 0, "{remap}");
+        }
+        let source = "import litellm\nsetattr(litellm, \"completion\", traced(litellm.completion))\nlitellm.completion(model=\"gpt-3.5-turbo-0613\", messages=[])\n";
+        let report = check_source(source, &opts);
+        assert_eq!(report.findings.len(), 1, "{:#?}", report.findings);
+        assert_eq!(report.findings[0].routing_class, RoutingClass::Unknown);
+        // A provider the call picks itself: a bare Gemini model is looked up
+        // on neither Google schedule.
+        let source = "import litellm\nlitellm.completion(model=\"gemini-3.7-flash\", custom_llm_provider=\"gemini\", messages=[])\n";
+        let report = check_source(source, &opts);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        assert!(report.routed.is_empty(), "{:#?}", report.routed);
+        // A Bedrock call is neither listed nor counted as not checked.
+        let source = "import os\nimport boto3\nfrom langchain_aws import ChatBedrockConverse\nbrt = boto3.client(\"bedrock-runtime\")\nbrt.converse(modelId=os.environ[\"MODEL_ID\"], messages=[])\nllm = ChatBedrockConverse(model=\"amazon.nova-pro-v1:0\")\nllm.invoke(\"hi\", model_id=\"amazon.nova-lite-v1:0\", modelId=\"amazon.nova-micro-v1:0\")\n";
+        let report = check_source(source, &opts);
+        assert!(report.unreadable.is_empty(), "{:#?}", report.unreadable);
+        assert_eq!(report.summary.unresolved_clients, 0);
         // The same on a client passed in, which the scan cannot resolve.
         let source = "import boto3
 def ask(brt):

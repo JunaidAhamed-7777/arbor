@@ -91,6 +91,21 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     ),
     (
         GapKind::UnresolvedModel,
+        "deployment_id",
+        "LiteLLM is given a `deployment_id`, which it sends to Azure in place of the model",
+    ),
+    (
+        GapKind::UnresolvedModel,
+        "prompt_id",
+        "LiteLLM is given a `prompt_id`, whose prompt template may name another model",
+    ),
+    (
+        GapKind::UnresolvedModel,
+        "litellm_provider",
+        "a LiteLLM fallback names its own `custom_llm_provider`, so its model goes to that provider",
+    ),
+    (
+        GapKind::UnresolvedModel,
         "parameter_default",
         "the model is the default of a parameter other modules may pass",
     ),
@@ -172,6 +187,11 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
         GapKind::AmbiguousClient,
         "langchain_module_config",
         "this file configures the module-level OpenAI API, which a deprecated LangChain chat model uses on the pre-1.0 SDK",
+    ),
+    (
+        GapKind::AmbiguousClient,
+        "litellm_provider",
+        "LiteLLM is given `custom_llm_provider`, which picks the provider in place of the model's name",
     ),
     (
         GapKind::AmbiguousClient,

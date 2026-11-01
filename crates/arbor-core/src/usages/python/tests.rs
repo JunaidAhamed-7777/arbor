@@ -7593,7 +7593,7 @@ litellm.completion(model="gpt-4o", engine="x", model_name="y", messages=[])
             .filter(|g| g.span.is_some_and(|s| s.line == line))
             .collect();
         assert_eq!(replaced.len(), 1, "{line}: {replaced:?}");
-        assert_eq!(replaced[0].reason, "reassigned");
+        assert_eq!(replaced[0].reason, "deployment_id");
         assert_eq!(replaced[0].key.as_deref(), Some("model"));
     }
     let keys: Vec<&str> = call_on(&found, 6)
@@ -7603,6 +7603,72 @@ litellm.completion(model="gpt-4o", engine="x", model_name="y", messages=[])
         .collect();
     assert_eq!(keys, vec!["model"]);
     assert!(gaps_on(&found, 6).is_empty());
+
+    // The `deployment_id` is sent in place of every fallback too; a
+    // fallback's own `deployment_id` or provider decides that fallback; a
+    // `prompt_id` may name another model; `custom_llm_provider` (or
+    // `azure=True`) picks the provider; a positional model next to a
+    // `deployment_id` is still read.
+    let found = usages(
+        r#"
+import litellm
+litellm.completion(model="gpt-4o", deployment_id="chat-prod", fallbacks=[{"model": "gpt-3.5-turbo-0613"}], messages=[])
+litellm.completion(model="gpt-4o", fallbacks=[{"model": "gpt-3.5-turbo-0613", "deployment_id": "chat-old"}, {"model": "gemini-3.7-flash", "custom_llm_provider": "gemini"}], messages=[])
+litellm.completion(model="gpt-3.5-turbo-0613", prompt_id="welcome", messages=[])
+litellm.completion(model="gemini-3.7-flash", custom_llm_provider="gemini", messages=[])
+litellm.completion(model="gpt-4o", azure=True, messages=[])
+litellm.completion("gpt-3.5-turbo-0613", [], deployment_id="chat-prod")
+"#,
+    );
+    let gap_keys = |line: u32| -> Vec<(String, String)> {
+        let mut found: Vec<(String, String)> = found
+            .gaps
+            .iter()
+            .filter(|g| g.span.is_some_and(|s| s.line == line))
+            .map(|g| {
+                (
+                    format!("{}/{}", g.kind.as_str(), g.reason),
+                    g.key.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        found.sort();
+        found
+    };
+    let pair = |gap: &str, key: &str| (gap.to_string(), key.to_string());
+    assert_eq!(
+        gap_keys(3),
+        vec![
+            pair("unresolved_model/deployment_id", "fallbacks.model"),
+            pair("unresolved_model/deployment_id", "model"),
+        ]
+    );
+    assert_eq!(
+        value(call_on(&found, 3), "deployment_id"),
+        Some("chat-prod")
+    );
+    assert_eq!(
+        gap_keys(4),
+        vec![
+            pair("unresolved_model/deployment_id", "fallbacks.model"),
+            pair("unresolved_model/litellm_provider", "fallbacks.model"),
+        ]
+    );
+    assert_eq!(gap_keys(5), vec![pair("unresolved_model/prompt_id", "")]);
+    for line in [6, 7] {
+        assert_eq!(
+            gap_keys(line),
+            vec![pair("ambiguous_client/litellm_provider", "")],
+            "{line}"
+        );
+    }
+    let positional = call_on(&found, 8);
+    assert_eq!(value(positional, "model"), Some("gpt-3.5-turbo-0613"));
+    assert_eq!(value(positional, "deployment_id"), Some("chat-prod"));
+    assert_eq!(
+        gap_keys(8),
+        vec![pair("unresolved_model/deployment_id", "model")]
+    );
 }
 
 #[test]
