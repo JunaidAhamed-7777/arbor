@@ -143,6 +143,7 @@ fn build_report(args: &Args) -> Result<RetirementReport, String> {
         path,
         &UsageScanOptions {
             display_root: Some(args.path.clone()),
+            project_root: crate::commands::resolve_project_path(path).ok(),
             ..UsageScanOptions::default()
         },
     )

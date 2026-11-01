@@ -564,12 +564,19 @@ get_sql_agent`), another `agents` module (`from agents.tools import Agent`)
 and a relative import are not followed. When the scanned tree has an `agents`
 module of its own (an `agents.py`, a directory `agents` holding Python
 files, or a link named `agents` or `agents.py`, outside vendored, hidden and
-ignored directories), or the scan is of a directory inside an `agents`
-package (an `agents` directory with an `__init__.py`, the scan root or one of
-its parents), `from agents import Agent` may load it instead: every Agents
-SDK record then routes `unknown`, and each call gets a `local_module` gap on
-its routing and, when it has values, on its model. A single file scanned
-alone shows only the package it is inside. AgentScope is
+ignored directories), the scan is of a directory inside an `agents` package
+(an `agents` directory with an `__init__.py`, the scan root or one of its
+parents), or a scanned file's own folder or a folder above it, up to the
+project root, holds an `agents.py` or a directory `agents` holding a Python
+file, `from agents import Agent` may load it instead: every Agents SDK
+record then routes `unknown`, and each call gets a `local_module` gap on its
+routing and, when it has values, on its model. The gap names the module
+nearest the file. The project root is the one `arbor` uses (the nearest
+folder above the scanned path with a root marker such as `.git` or
+`pyproject.toml`) for `arbor usages` and `arbor retirements`, and the MCP
+server's project for `find_api_usages`; a scan of part of the project still
+sees a module there. One elsewhere outside the scanned tree (a sibling
+folder put on `PYTHONPATH`) is not seen. AgentScope is
 followed only through `from agentscope.model... import`; its models for
 other providers (`DashScopeChatModel`, `OllamaChatModel`...) and its 0.x
 model configurations are not. The Claude Agent SDK's modules are followed

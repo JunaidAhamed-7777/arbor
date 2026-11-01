@@ -36,6 +36,8 @@ pub fn run(path: &str, sdk: Option<&str>, json: bool) -> Result<()> {
         sdk,
         // Paths print relative to where the command was run.
         display_root: Some(path.display().to_string()),
+        // A module of the project's own may shadow an SDK import.
+        project_root: crate::commands::resolve_project_path(path).ok(),
         ..UsageScanOptions::default()
     };
     match scan_usages(path, &options) {

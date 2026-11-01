@@ -641,6 +641,7 @@ impl McpServer {
         let options = arbor_watcher::UsageScanOptions {
             sdk,
             display_root: Some(relative.to_string()),
+            project_root: Some(self.project_root.clone()),
             ..arbor_watcher::UsageScanOptions::default()
         };
         let scanned =
