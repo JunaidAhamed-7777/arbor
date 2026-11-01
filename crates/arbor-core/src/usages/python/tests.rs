@@ -8630,9 +8630,16 @@ fn a_model_a_run_may_be_given_leaves_agents_and_model_objects_unconfirmed() {
         "async def ask(q, run_config=None):\n    return await Runner.run(agent, q, run_config=run_config)\n",
         "async def ask(q, **kwargs):\n    return await Runner.run(agent, q, **kwargs)\n",
         "def ask(q):\n    return Runner.run_sync(agent, q, run_config=CONFIG)\n",
+        // A caller may pass another than the default, a `RunConfig` given
+        // none.
+        "def ask(q, run_config=RunConfig()):\n    return Runner.run_sync(agent, q, run_config=run_config)\n",
+        "DEFAULT = RunConfig(workflow_name=\"w\")\ndef ask(q, run_config=DEFAULT):\n    return Runner.run_sync(agent, q, run_config=run_config)\n",
+        "def ask(q, *, run_config=RunConfig()):\n    return Runner.run_sync(agent, q, run_config=run_config)\n",
+        "class Bot:\n    def ask(self, q, run_config=RunConfig()):\n        return Runner.run_sync(agent, q, run_config=run_config)\n",
+        "@app.get(\"/\")\ndef _ask(q, run_config=RunConfig()):\n    return Runner.run_sync(agent, q, run_config=run_config)\n",
     ] {
         let source = format!(
-            "from agents import Agent, Runner, OpenAIChatCompletionsModel\nfrom openai import AsyncOpenAI\nagent = Agent(name=\"a\", model=\"gpt-4o\")\nmodel = OpenAIChatCompletionsModel(\"gpt-4o\", AsyncOpenAI())\n{run}"
+            "from agents import Agent, Runner, RunConfig, OpenAIChatCompletionsModel\nfrom openai import AsyncOpenAI\nagent = Agent(name=\"a\", model=\"gpt-4o\")\nmodel = OpenAIChatCompletionsModel(\"gpt-4o\", AsyncOpenAI())\n{run}"
         );
         let found = usages(&source);
         for line in [3, 4] {
@@ -8650,6 +8657,9 @@ fn a_model_a_run_may_be_given_leaves_agents_and_model_objects_unconfirmed() {
         "Runner.run_sync(agent, \"hi\", run_config=None)",
         "Runner.run_sync(agent, \"hi\", run_config=RunConfig(workflow_name=\"w\"))",
         "Runner.run_sync(agent, \"hi\", run_config=config)",
+        // A private function every caller of which this file shows, none
+        // passing one.
+        "def _ask(q, run_config=RunConfig(workflow_name=\"w\")):\n    return Runner.run_sync(agent, q, run_config=run_config)\n_ask(\"hi\")",
     ] {
         let source = format!(
             "from agents import Agent, Runner, RunConfig\nagent = Agent(name=\"a\", model=\"gpt-4o\")\nconfig = RunConfig(workflow_name=\"w\")\n{run}\n"

@@ -8524,8 +8524,9 @@ impl<'t> Ctx<'t> {
     /// What may give the file's agents and model objects another model
     /// for a run, which replaces theirs: a `RunConfig` given a model (by
     /// keyword, by position or through an expansion); a `run_config=`
-    /// that is not `None` or a same-file `RunConfig` given none (a
-    /// parameter, `run_config=config` from elsewhere); and a `**` expansion
+    /// that is not `None` or always a same-file `RunConfig` given none (a
+    /// parameter, even one whose default is such a `RunConfig`, or
+    /// `run_config=config` from elsewhere); and a `**` expansion
     /// given to `Runner.run`, `run_sync` or `run_streamed`, which may hold
     /// one. Only in a file that imports one of the Agents SDK's tracked
     /// classes.
@@ -8596,15 +8597,21 @@ impl<'t> Ctx<'t> {
     }
 
     /// Whether a `run_config=` argument gives the run no model: `None`, or
-    /// a same-file `RunConfig` built with none.
+    /// a same-file `RunConfig` built with none that it always is. A
+    /// caveat means a caller may pass another (a parameter whose default
+    /// it is, a function every in-file caller passes it to).
     fn run_config_without_model(&mut self, config: Node<'t>, scope: usize) -> bool {
         if config.kind() == "none" {
             return true;
         }
         match self.eval(config, scope, 0) {
-            Val::Client { client, path } if path.is_empty() && !client.ambiguous => client
-                .site
-                .is_some_and(|site| self.agents_run_configs.get(&site) == Some(&false)),
+            Val::Client { client, path }
+                if path.is_empty() && !client.ambiguous && client.caveat.is_none() =>
+            {
+                client
+                    .site
+                    .is_some_and(|site| self.agents_run_configs.get(&site) == Some(&false))
+            }
             _ => false,
         }
     }
