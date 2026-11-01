@@ -651,19 +651,21 @@ another provider or endpoint, so:
   `unknown` with an `endpoint_option` gap;
 - options whose `env` or `settings` the file uses after they are built
   (`options.env["CLAUDE_CODE_USE_BEDROCK"] = "1"`, `options.env.update(...)`,
-  `options.settings = ...`), or writes with a run-time name, route `unknown`
-  with a `dynamic_feature` gap, and so does every Claude Code options object
-  in a file that uses `env` or `settings` on an object it cannot identify
-  (other than `self`, `cls` or a same-file class). The attribute's name may
-  be written as a string too (`setattr(options, "env", ...)`,
-  `options.__setattr__("env", ...)`, `options.__dict__["env"]`,
-  `vars(options)["env"]`). A write of `base_url` is not one: the CLI has
-  no such setting;
+  `options.settings = ...`), or writes or looks up with a run-time name
+  (`setattr(options, name, v)`, `getattr(options, name).update(v)`), route
+  `unknown` with a `dynamic_feature` gap, and so does every Claude Code
+  options object in a file that uses `env` or `settings` on an object it
+  cannot identify (other than `self`, `cls` or a same-file class). The
+  attribute's name may be written as a string too (`setattr(options, "env",
+  ...)`, `getattr(options, "env")`, `options.__setattr__("env", ...)`,
+  `options.__dict__["env"]`, `vars(options)["env"]`). A write of `base_url`
+  is not one: the CLI has no such setting;
 - options whose `extra_args` give the CLI `--settings` (`extra_args=
   {"settings": ...}`, or `extra_args` the file cannot read whole) route
   `unknown` with an `endpoint_option` gap. `extra_args` used after the
   options are built (`options.extra_args["settings"] = ...`, `setattr(options,
-  "extra_args", ...)`) count as their environment above, and also give their
+  "extra_args", ...)`, `getattr(options, "extra_args")`, or a lookup with a
+  run-time name) count as their environment above, and also give their
   values a `reassigned` gap: the flags may pass another model.
 
 An agent definition runs where its options do: built inside the options'

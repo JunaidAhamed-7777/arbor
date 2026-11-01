@@ -8605,6 +8605,11 @@ fn claude_options_rewritten_through_setattr_or_their_dict_are_gaps() {
         "options.__setattr__(\"settings\", \"settings.json\")",
         "options.__dict__[\"env\"] = {\"CLAUDE_CODE_USE_BEDROCK\": \"1\"}",
         "vars(options)[\"env\"] = {}",
+        // Looked up by name, then changed.
+        "getattr(options, \"env\")[\"CLAUDE_CODE_USE_BEDROCK\"] = \"1\"",
+        "getattr(options, \"env\").update({\"CLAUDE_CODE_USE_BEDROCK\": \"1\"})",
+        "env = getattr(options, \"env\")\nenv[\"CLAUDE_CODE_USE_BEDROCK\"] = \"1\"",
+        "for name, values in overrides.items():\n    getattr(options, name).update(values)",
     ] {
         let source = format!(
             "from claude_agent_sdk import ClaudeAgentOptions\noptions = ClaudeAgentOptions(model=\"claude-sonnet-4-5-20250929\")\n{change}\n"
@@ -8889,6 +8894,8 @@ fn claude_options_given_flags_after_they_are_built_are_gaps() {
         "options.extra_args[\"settings\"] = \"bedrock.json\"",
         "options.extra_args = {\"model\": \"claude-3-opus-20240229\"}",
         "setattr(options, \"extra_args\", flags)",
+        "getattr(options, \"extra_args\")[\"model\"] = \"claude-sonnet-4-5-20250929\"",
+        "getattr(options, name)[\"model\"] = \"claude-sonnet-4-5-20250929\"",
     ] {
         let source = format!(
             "from claude_agent_sdk import ClaudeAgentOptions\noptions = ClaudeAgentOptions(model=\"claude-sonnet-4-5-20250929\", extra_args={{}})\n{change}\n"

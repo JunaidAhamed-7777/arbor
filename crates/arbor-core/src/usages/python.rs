@@ -4873,6 +4873,14 @@ impl<'t> Ctx<'t> {
                 Some((_, Some(name))) => {
                     self.attr_uses.entry(name).or_default().escapes = true;
                     self.name_uses.entry(name).or_default().escapes = true;
+                    // `getattr(options, "env")[...] = ...` uses Claude Code
+                    // options' environment like `options.env` does.
+                    if let (Some(object), true) = (
+                        positional.first(),
+                        matches!(name, "env" | "settings" | "extra_args"),
+                    ) {
+                        self.options_env_objects.push((*object, scope, name));
+                    }
                     // `getattr(_A(), "_A__go")`.
                     self.note_mangled_use(name);
                     // `getattr(os, "environ")`, `getattr(builtins, "exec")`.
@@ -4890,6 +4898,11 @@ impl<'t> Ctx<'t> {
                 }
                 Some((_, None)) => {
                     self.dynamic_method_calls = true;
+                    // It may be Claude Code options' `env`, `settings` or
+                    // `extra_args`.
+                    if let Some(object) = positional.first() {
+                        self.options_env_objects.push((*object, scope, "*"));
+                    }
                     if positional
                         .first()
                         .is_some_and(|object| self.is_module_object(*object))
@@ -8429,8 +8442,10 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    /// An attribute named `env` or `settings`, of any object: Claude Code
-    /// options hold the CLI's environment and settings there.
+    /// An attribute named `env`, `settings` or `extra_args`, of any object:
+    /// Claude Code options hold the CLI's environment, settings and flags
+    /// there. `getattr` adds the same, and `*` for a run-time name (see
+    /// [`Ctx::note_attr_write_call`]).
     fn note_options_env(&mut self, node: Node<'t>, scope: usize) {
         let Some(attr) = node.child_by_field_name("attribute") else {
             return;
@@ -8446,7 +8461,8 @@ impl<'t> Ctx<'t> {
 
     /// Claude Code options whose `env` or `settings` the file uses after
     /// they are built (`options.env[...] = ...`, `options.env.update(...)`,
-    /// `options.settings = ...`), or writes with a run-time name: the CLI
+    /// `options.settings = ...`, `getattr(options, "env")`), or writes or
+    /// looks up with a run-time name: the CLI
     /// may then run on another provider. A use on an object this file
     /// cannot identify may be one on such options. Only in a file that
     /// imports the Claude Agent SDK or the Claude Code SDK.
@@ -8482,7 +8498,8 @@ impl<'t> Ctx<'t> {
             .chain(written)
             .collect();
         for (object, scope, attr) in objects {
-            let flags = attr == "extra_args";
+            // `*`: `getattr` with a run-time name, which may be `extra_args`.
+            let flags = matches!(attr, "extra_args" | "*");
             match self.eval(object, scope, 0) {
                 Val::Client { client, path }
                     if path.is_empty()
