@@ -1102,9 +1102,12 @@ fn is_claude_alias(value: &str) -> bool {
 /// `pkg` builds, which a write after it is built changes.
 fn framework_model_fields(pkg: Pkg) -> &'static [&'static str] {
     match pkg {
-        Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm => &["model"],
+        // A model settings' `extra_body` is sent over the model.
+        Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm => &["model", "model_settings"],
         Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk => &["model", "fallback_model"],
-        pkg if pkg.is_agentscope() => &["model", "model_name"],
+        // AgentScope sends the `model` of `generate_kwargs` and
+        // `extra_body` over its own.
+        pkg if pkg.is_agentscope() => &["model", "model_name", "generate_kwargs", "extra_body"],
         _ => &[],
     }
 }
@@ -2526,6 +2529,16 @@ struct Ctx<'t> {
     /// or the Claude Code SDK: a `ClaudeSDKClient`'s session then sends
     /// another model than its options' (see [`Ctx::note_options_rerouted`]).
     claude_set_model: Option<Feature>,
+    /// The objects of every `generate_kwargs` or `extra_body` attribute in
+    /// the file, which may be an AgentScope model's or an Agents SDK
+    /// model settings' (see [`Ctx::note_request_options`]).
+    request_option_objects: Vec<(Node<'t>, usize, &'t str)>,
+    /// An AgentScope model's `generate_kwargs` or `extra_body` may be used
+    /// after it is built (see [`Ctx::note_request_options`]).
+    agentscope_options_used: Option<Feature>,
+    /// The Agents SDK may be sent another model in a model settings'
+    /// `extra_body` (see [`Ctx::note_request_options`]).
+    agents_extra_body: Option<Feature>,
     /// What an Agents SDK construction (by call id) sends its requests
     /// through, as built: the client a model object is given, or the model
     /// object an agent or run is given. [`Ctx::reroute`] routes it at each
@@ -2702,6 +2715,9 @@ impl<'t> Ctx<'t> {
             agents_provider: None,
             agents_run_model: None,
             claude_set_model: None,
+            request_option_objects: Vec::new(),
+            agentscope_options_used: None,
+            agents_extra_body: None,
             agents_via: HashMap::new(),
             builtin_values: HashMap::new(),
             member_values: HashSet::new(),
@@ -8039,6 +8055,7 @@ impl<'t> Ctx<'t> {
         }
         self.note_agents_run_model();
         self.note_options_rerouted();
+        self.note_request_options();
         for (call, scope) in self.calls.clone() {
             if self.records() >= MAX_FILE_RECORDS {
                 return self.truncate_file(call, scope);
@@ -8450,17 +8467,21 @@ impl<'t> Ctx<'t> {
     /// An attribute named `env`, `settings` or `extra_args`, of any object:
     /// Claude Code options hold the CLI's environment, settings and flags
     /// there. `getattr` adds the same, and `*` for a run-time name (see
-    /// [`Ctx::note_attr_write_call`]).
+    /// [`Ctx::note_attr_write_call`]). Also one named `generate_kwargs` or
+    /// `extra_body`, which an AgentScope model and an Agents SDK model
+    /// settings send in their requests.
     fn note_options_env(&mut self, node: Node<'t>, scope: usize) {
         let Some(attr) = node.child_by_field_name("attribute") else {
             return;
         };
         let attr = self.text(attr);
-        if let (true, Some(object)) = (
-            matches!(attr, "env" | "settings" | "extra_args"),
-            node.child_by_field_name("object"),
-        ) {
+        let Some(object) = node.child_by_field_name("object") else {
+            return;
+        };
+        if matches!(attr, "env" | "settings" | "extra_args") {
             self.options_env_objects.push((object, scope, attr));
+        } else if matches!(attr, "generate_kwargs" | "extra_body") {
+            self.request_option_objects.push((object, scope, attr));
         }
     }
 
@@ -8609,6 +8630,147 @@ impl<'t> Ctx<'t> {
                 return;
             }
         }
+    }
+
+    /// What may send an agent framework's request another model than the
+    /// one its class is built with, over it, in the file:
+    ///
+    /// - AgentScope models (in a file that imports AgentScope): a use of
+    ///   `generate_kwargs` or `extra_body` after one is built
+    ///   (`model.generate_kwargs["model"] = ...`), on an AgentScope model
+    ///   or an object this file cannot identify.
+    /// - The Agents SDK (in a file that imports one of its tracked
+    ///   classes), which passes a model settings' `extra_body` to the
+    ///   OpenAI client, which merges it over the request: an `extra_body`
+    ///   that may name a `model` given to anything but a provider's own
+    ///   request (`ModelSettings(extra_body={"model": ...})`,
+    ///   `dataclasses.replace(settings, extra_body=...)`), a
+    ///   `ModelSettings` given a `**` expansion or as many positional
+    ///   arguments as reach `extra_body`, a `model_settings=` that is not
+    ///   `None` or a `ModelSettings` built in this file (in place, or
+    ///   assigned to the name it is given through), and a use of
+    ///   `extra_body` on an object that may be model settings.
+    fn note_request_options(&mut self) {
+        let agentscope = self.out.imports.iter().any(|i| i.package == "agentscope");
+        let agents = self.imports_agents();
+        if !agentscope && !agents {
+            return;
+        }
+        for (object, scope, attr) in self.request_option_objects.clone() {
+            let (scope_model, settings) = match self.eval(object, scope, 0) {
+                Val::Client { client, path } if path.is_empty() && client.pkg.is_agentscope() => {
+                    (true, false)
+                }
+                Val::Client { client, path }
+                    if matches!(client.pkg, Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm)
+                        && path.first().is_some_and(|p| p == "model_settings") =>
+                {
+                    (false, true)
+                }
+                Val::Client { .. }
+                | Val::Module { .. }
+                | Val::Symbol { .. }
+                | Val::Class(_)
+                | Val::Result(_)
+                | Val::GoogleNs => (false, false),
+                _ if object.kind() == "identifier"
+                    && (matches!(self.text(object), "self" | "cls")
+                        || self.class_receiver(object, scope).is_some()) =>
+                {
+                    (false, false)
+                }
+                _ => (true, true),
+            };
+            if agentscope && scope_model {
+                self.agentscope_options_used.get_or_insert(Self::feature(
+                    "`generate_kwargs` or `extra_body` used after the model is built",
+                    object,
+                ));
+            }
+            if agents && settings && attr == "extra_body" {
+                self.agents_extra_body.get_or_insert(Self::feature(
+                    "a model settings' `extra_body` used after it is built",
+                    object,
+                ));
+            }
+        }
+        if !agents || self.agents_extra_body.is_some() {
+            return;
+        }
+        for (call, scope) in self.calls.clone() {
+            let Some(function) = call.child_by_field_name("function") else {
+                continue;
+            };
+            let args = self.arguments(call);
+            // `extra_body` comes after a dozen other fields of `ModelSettings`
+            // in every release.
+            let settings_built = self.builds_model_settings(call)
+                && (args.splat || args.list_splat || args.positional > 12);
+            let named = self.option_may_name(call, "extra_body", &["model"])
+                && !matches!(
+                    self.eval(function, scope, 0),
+                    Val::Client { .. } | Val::Module { .. }
+                );
+            let given = keyword_value(call, |n| self.text(n), |k| k == "model_settings")
+                .is_some_and(|given| self.settings_may_send_model(given, scope));
+            if settings_built || named || given {
+                self.agents_extra_body = Some(Self::feature(
+                    "model settings whose `extra_body` may name another model",
+                    call,
+                ));
+                return;
+            }
+        }
+    }
+
+    /// Whether `call` builds a `ModelSettings` (by that name).
+    fn builds_model_settings(&self, call: Node<'t>) -> bool {
+        let name = call
+            .child_by_field_name("function")
+            .and_then(|f| match f.kind() {
+                "identifier" => Some(f),
+                "attribute" => f.child_by_field_name("attribute"),
+                _ => None,
+            });
+        name.is_some_and(|n| self.text(n) == "ModelSettings")
+    }
+
+    /// Whether a `model_settings=` argument may hold an `extra_body` this
+    /// file does not read: anything but `None` or a `ModelSettings` built
+    /// in this file, in place or assigned to the name given (each such
+    /// construction is read on its own, see
+    /// [`Ctx::note_request_options`]).
+    fn settings_may_send_model(&self, given: Node<'t>, scope: usize) -> bool {
+        let read = |value: Node<'t>| {
+            value.kind() == "none" || (value.kind() == "call" && self.builds_model_settings(value))
+        };
+        match given.kind() {
+            "identifier" => self
+                .assigned_values(given, scope)
+                .is_none_or(|values| !values.into_iter().all(read)),
+            _ => !read(given),
+        }
+    }
+
+    /// The values the definitions of a name that reach `node` give it, when
+    /// every one is a plain assignment (no import, parameter, loop,
+    /// unpacking or augmented assignment).
+    fn assigned_values(&self, node: Node<'t>, scope: usize) -> Option<Vec<Node<'t>>> {
+        let (key, at) = self.locate(self.text(node), scope, node.start_byte());
+        let assigns = self.assigns.get(&key)?;
+        let defs = match self.reaching(&key, at) {
+            Reach::All => self.all_defs(&key),
+            Reach::Subset(defs) => defs,
+        };
+        defs.into_iter()
+            .map(|def| match def {
+                DefRef::Assign(i) => assigns
+                    .get(i)
+                    .filter(|assign| !assign.unknowable)
+                    .and_then(|assign| assign.value),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Whether `function` may be the Agents SDK's `Runner.run`,
@@ -9817,6 +9979,14 @@ impl<'t> Ctx<'t> {
                 nested_cut |= list.cut;
             }
         }
+        // AgentScope sends only the `model` at the top of `generate_kwargs`
+        // and `extra_body` over its own: one nested deeper (`metadata`) is
+        // not the model sent, and `client_kwargs` configure the client.
+        if target.pkg.is_agentscope() {
+            let sent = |path: &str| matches!(path, "generate_kwargs.model" | "extra_body.model");
+            nested.retain(|item| sent(&item.path));
+            nested_overridden.retain(|path| sent(path));
+        }
         self.take_nested(&site, nested, nested_cut, &mut values);
         if site.gap_worthy && !nested_overridden.is_empty() {
             // One gap per key path, at most [`MAX_NESTED_VALUES`]; past
@@ -9958,11 +10128,23 @@ impl<'t> Ctx<'t> {
                     matches!(target.pkg, Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk)
                         .then_some(self.claude_set_model)
                         .flatten()
+                })
+                .or_else(|| {
+                    target
+                        .pkg
+                        .is_agentscope()
+                        .then_some(self.agentscope_options_used)
+                        .flatten()
                 });
             // A run's model replaces an agent's and a model object's.
             let run = (matches!(target.pkg, Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm)
                 && member != "RunConfig")
                 .then_some(self.agents_run_model)
+                .flatten();
+            // A model settings' `extra_body` is merged over every request,
+            // a run's included.
+            let settings = matches!(target.pkg, Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm)
+                .then_some(self.agents_extra_body)
                 .flatten();
             let changed =
                 written
@@ -9975,6 +10157,12 @@ impl<'t> Ctx<'t> {
                     .into_iter()
                     .chain(run.map(|feature| {
                         format!("may run with another model ({})", feature.describe())
+                    }))
+                    .chain(settings.map(|feature| {
+                        format!(
+                            "may be sent another model in its model settings' `extra_body` ({})",
+                            feature.describe()
+                        )
                     }));
             for what in changed {
                 self.out.gaps.push(UsageGap {

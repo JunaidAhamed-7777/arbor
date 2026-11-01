@@ -543,9 +543,10 @@ Nothing called on what they build is recorded (`agent.clone(...)`,
 The OpenAI Agents SDK's and the Claude Agent SDK's other arguments configure
 a run or the CLI (`trace_metadata`, `model_settings`, `extra_args`), so a
 `model` key nested in them, written at the call or in a dict expanded with
-`**`, is not read as a model. AgentScope's are read: it sends
-`generate_kwargs` (AgentScope 1) and `extra_body` (AgentScope 2) in its
-request over its own model (below).
+`**`, is not read as a model. Two of their arguments are sent over the
+model instead, and are read or give a gap (below): AgentScope's
+`generate_kwargs` (AgentScope 1) and `extra_body` (AgentScope 2), and an
+Agents SDK model settings' `extra_body`.
 
 | Framework | Classes | Imported from | Model |
 |---|---|---|---|
@@ -627,7 +628,24 @@ the file may give a run one:
   `getattr`) is not seen.
 
 So do they in a file that writes `model` on another object (`agent.model =
-...`). A run configured in another module is not seen. `Agent.clone(model=
+...`). A run configured in another module is not seen.
+
+The SDK passes a model settings' `extra_body` to the OpenAI client, which
+merges it over the request body, so a `model` in it is the model sent
+(`openai_chatcompletions.py`, `openai_responses.py` and `litellm_model.py`
+in openai-agents). Every Agents SDK record, `RunConfig` included, keeps a
+`dynamic_feature` gap in a file that:
+
+- gives an `extra_body` that may name a `model` (a dict naming one, or one
+  the file cannot read whole) to anything but a provider's own request
+  (`ModelSettings(extra_body=...)`, `dataclasses.replace(settings,
+  extra_body=...)`), or builds a `ModelSettings` from a `**` expansion;
+- passes a `model_settings=` that is not `None` or a `ModelSettings` built
+  in the file, in place or assigned to the name given (one from a
+  parameter, another module or a function's result);
+- uses `extra_body` on an object that may be model settings
+  (`agent.model_settings.extra_body = ...`), or writes `model_settings`
+  after an agent is built. `Agent.clone(model=
 ...)` is not read.
 
 **Claude Agent SDK.** The SDK runs the Claude Code CLI with the options'
@@ -711,10 +729,15 @@ So does a first positional argument that is neither a credential built in
 place (`OpenAICredential(...)`) nor a model name AgentScope 1 would take,
 such as a name holding a credential (`OpenAIChatModel(cred, model=...)`).
 AgentScope sends `generate_kwargs` (AgentScope 1) and `extra_body`
-(AgentScope 2) in its request over its own model: the model nested in them
-is read, and one that may hold a `model` (a dict literal naming one, one the
-file cannot read whole, or a `**` expansion that may hold them) gives the
-model the class is built with a `reassigned` gap. A credential counts only
+(AgentScope 2) in its request over its own model: the `model` at their top
+level is read (not one nested deeper, as in `metadata`, and not
+`client_kwargs`', which configure the client), and one that may hold a
+`model` (a dict literal naming one, one the file cannot read whole, or a
+`**` expansion that may hold them) gives the model the class is built with
+a `reassigned` gap. A use of `generate_kwargs` or `extra_body` after a
+model is built (`model.generate_kwargs["model"] = ...`), on an AgentScope
+model or an object the file cannot identify, gives every AgentScope model
+in the file a `dynamic_feature` gap. A credential counts only
 when an `agentscope` import binds its class
 (`from agentscope.credential import OpenAICredential`): another library's
 (`DefaultAzureCredential()`) is a credential this scan cannot read.

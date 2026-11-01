@@ -8912,6 +8912,90 @@ fn a_claude_client_given_another_model_leaves_the_options_unconfirmed() {
 }
 
 #[test]
+fn agentscope_request_options_used_after_the_model_is_built_are_gaps() {
+    for change in [
+        "model.generate_kwargs = {\"model\": \"o1\"}",
+        "model.generate_kwargs[\"model\"] = \"o1\"",
+        "model.extra_body.update({\"model\": \"o1\"})",
+        "kwargs = model.generate_kwargs\nkwargs[\"model\"] = \"o1\"",
+    ] {
+        let source = format!(
+            "from agentscope.model import OpenAIChatModel\nmodel = OpenAIChatModel(model_name=\"gpt-4o\")\n{change}\n"
+        );
+        let found = usages(&source);
+        assert_eq!(
+            gaps_on(&found, 2),
+            ["unresolved_model/dynamic_feature"],
+            "{change}"
+        );
+    }
+    // Only the `model` at the top of the options AgentScope sends is read.
+    let found = usages(
+        r#"from agentscope.model import OpenAIChatModel
+
+tagged = OpenAIChatModel(model_name="gpt-4o", generate_kwargs={"metadata": {"model": "gpt-4o-mini"}})
+client = OpenAIChatModel(model_name="gpt-4o", client_kwargs={"model": "gpt-4o-mini"})
+"#,
+    );
+    let tagged = call_on(&found, 3);
+    assert_eq!(tagged.values.len(), 1, "{:?}", tagged.values);
+    assert_eq!(value(tagged, "model_name"), Some("gpt-4o"));
+    assert!(gaps_on(&found, 3).is_empty(), "{:?}", found.gaps);
+    let client = call_on(&found, 4);
+    assert_eq!(client.values.len(), 1, "{:?}", client.values);
+}
+
+#[test]
+fn an_agents_model_settings_extra_body_may_send_another_model() {
+    for settings in [
+        "agent = Agent(name=\"a\", model=\"gpt-4o\", model_settings=ModelSettings(extra_body={\"model\": \"gpt-4.1-2025-04-14\"}))",
+        "agent = Agent(name=\"a\", model=\"gpt-4o\", model_settings=ModelSettings(extra_body=body))",
+        "agent = Agent(name=\"a\", model=\"gpt-4o\", model_settings=SETTINGS)",
+        "agent = Agent(name=\"a\", model=\"gpt-4o\", model_settings=make_settings())",
+        "agent = Agent(name=\"a\", model=\"gpt-4o\", model_settings=ModelSettings(**options))",
+        "settings = ModelSettings(extra_body={\"model\": \"x\"})\nagent = Agent(name=\"a\", model=\"gpt-4o\", model_settings=settings)",
+        "agent = Agent(name=\"a\", model=\"gpt-4o\", model_settings=ModelSettings(temperature=0))\nagent.model_settings.extra_body = {\"model\": \"x\"}",
+        "agent = Agent(name=\"a\", model=\"gpt-4o\")\nagent.model_settings = settings",
+        "agent = Agent(name=\"a\", model=\"gpt-4o\")\nconfig = RunConfig(model_settings=dataclasses.replace(base, extra_body={\"model\": \"x\"}))",
+    ] {
+        let source = format!(
+            "from agents import Agent, ModelSettings, RunConfig\n{settings}\n"
+        );
+        let found = usages(&source);
+        let line = agent_line(&source);
+        assert!(
+            gaps_on(&found, line).contains(&"unresolved_model/dynamic_feature".to_string()),
+            "{settings}: {:?}",
+            found.gaps
+        );
+    }
+    // Model settings this file builds without one, and another library's
+    // request given its own `extra_body`.
+    for settings in [
+        "agent = Agent(name=\"a\", model=\"gpt-4o\", model_settings=ModelSettings(temperature=0.2))",
+        "agent = Agent(name=\"a\", model=\"gpt-4o\", model_settings=None)",
+        "settings = ModelSettings(temperature=0)\nagent = Agent(name=\"a\", model=\"gpt-4o\", model_settings=settings)",
+        "agent = Agent(name=\"a\", model=\"gpt-4o\")\nclient = OpenAI()\nclient.chat.completions.create(model=\"gpt-4o\", messages=[], extra_body={\"model\": \"x\"})",
+    ] {
+        let source = format!(
+            "from agents import Agent, ModelSettings, RunConfig\nfrom openai import OpenAI\n{settings}\n"
+        );
+        let found = usages(&source);
+        assert!(
+            gaps_on(&found, agent_line(&source)).is_empty(),
+            "{settings}: {:?}",
+            found.gaps
+        );
+    }
+}
+
+/// The line of `source` that builds `agent`.
+fn agent_line(source: &str) -> u32 {
+    let at = source.find("agent = Agent(").expect("an agent");
+    source[..at].matches('\n').count() as u32 + 1
+}
+
+#[test]
 fn claude_options_given_flags_after_they_are_built_are_gaps() {
     for change in [
         "options.extra_args[\"settings\"] = \"bedrock.json\"",
