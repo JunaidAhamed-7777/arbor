@@ -2522,6 +2522,10 @@ struct Ctx<'t> {
     /// The file builds a `RunConfig` with a model, which every agent it
     /// runs uses instead of its own (see [`Ctx::note_agents_run_model`]).
     agents_run_model: Option<Feature>,
+    /// A `set_model(...)` call in a file that imports the Claude Agent SDK
+    /// or the Claude Code SDK: a `ClaudeSDKClient`'s session then sends
+    /// another model than its options' (see [`Ctx::note_options_rerouted`]).
+    claude_set_model: Option<Feature>,
     /// What an Agents SDK construction (by call id) sends its requests
     /// through, as built: the client a model object is given, or the model
     /// object an agent or run is given. [`Ctx::reroute`] routes it at each
@@ -2697,6 +2701,7 @@ impl<'t> Ctx<'t> {
             litellm_aliases: None,
             agents_provider: None,
             agents_run_model: None,
+            claude_set_model: None,
             agents_via: HashMap::new(),
             builtin_values: HashMap::new(),
             member_values: HashSet::new(),
@@ -8475,6 +8480,18 @@ impl<'t> Ctx<'t> {
         if !claude {
             return;
         }
+        // `client.set_model(...)` changes the model a `ClaudeSDKClient`'s
+        // session sends from then on. The receiver is not resolved, so any
+        // such call counts.
+        let set_model = self.calls.iter().find(|(call, _)| {
+            call.child_by_field_name("function")
+                .filter(|f| f.kind() == "attribute")
+                .and_then(|f| f.child_by_field_name("attribute"))
+                .is_some_and(|attr| self.text(attr) == "set_model")
+        });
+        if let Some((call, _)) = set_model {
+            self.claude_set_model = Some(Self::feature("a `set_model(...)` call", *call));
+        }
         // `setattr(o, "env", ...)`, `o.__setattr__("env", ...)`,
         // `o.__dict__["env"] = ...` and `vars(o)["env"] = ...` are attribute
         // writes too.
@@ -9930,11 +9947,18 @@ impl<'t> Ctx<'t> {
         // agent runs with the model a `RunConfig` gives every agent instead
         // of its own. These gaps hold no key: they cover every value.
         if target.pkg.is_agent_framework() {
-            let written = self.wild_attr_any.or_else(|| {
-                framework_model_fields(target.pkg)
-                    .iter()
-                    .find_map(|attr| self.outside_attr_writes.get(attr).copied())
-            });
+            let written = self
+                .wild_attr_any
+                .or_else(|| {
+                    framework_model_fields(target.pkg)
+                        .iter()
+                        .find_map(|attr| self.outside_attr_writes.get(attr).copied())
+                })
+                .or_else(|| {
+                    matches!(target.pkg, Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk)
+                        .then_some(self.claude_set_model)
+                        .flatten()
+                });
             // A run's model replaces an agent's and a model object's.
             let run = (matches!(target.pkg, Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm)
                 && member != "RunConfig")

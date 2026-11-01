@@ -8889,6 +8889,29 @@ later.env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = "claude-3-haiku-20240307"
 }
 
 #[test]
+fn a_claude_client_given_another_model_leaves_the_options_unconfirmed() {
+    for set in [
+        "await client.set_model(\"claude-3-opus-20240229\")",
+        "await client.set_model(model)",
+    ] {
+        let source = format!(
+            "from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient\noptions = ClaudeAgentOptions(model=\"claude-sonnet-4-5-20250929\")\nasync def ask(model):\n    async with ClaudeSDKClient(options=options) as client:\n        {set}\n        await client.query(\"hi\")\n"
+        );
+        let found = usages(&source);
+        assert_eq!(
+            gaps_on(&found, 2),
+            ["unresolved_model/dynamic_feature"],
+            "{set}"
+        );
+    }
+    // Not in a file without the Claude SDKs.
+    let found = usages(
+        "from agents import Agent\nagent = Agent(name=\"a\", model=\"gpt-4o\")\nengine.set_model(\"x\")\n",
+    );
+    assert!(gaps_on(&found, 2).is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
 fn claude_options_given_flags_after_they_are_built_are_gaps() {
     for change in [
         "options.extra_args[\"settings\"] = \"bedrock.json\"",

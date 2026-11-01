@@ -688,8 +688,10 @@ the environment with a run-time name; the options' `env=` may name one, a
 their environment after they are built), an alias the options are given
 (`"sonnet"`, `"opus"`, `"default"`...) and every model of an agent definition
 built inside them keep an `env_var` gap on their key; options given a full
-model ID do not. `query(...)`,
-`ClaudeSDKClient` and its `set_model(...)` are not read.
+model ID do not. `query(...)` and `ClaudeSDKClient` are not read, and a
+`set_model(...)` call anywhere in the file, which changes the model a
+client's session sends, gives every options object and agent definition a
+`dynamic_feature` gap.
 
 **AgentScope.** Each model builds its provider's SDK client: OpenAI's for
 `OpenAIChatModel` and `OpenAIResponseModel`, Anthropic's for
