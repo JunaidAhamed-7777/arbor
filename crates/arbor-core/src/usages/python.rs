@@ -9461,6 +9461,7 @@ impl<'t> Ctx<'t> {
             None
         } else {
             self.langchain_configurable
+                .or_else(|| self.langchain_sent_over())
         });
         let remapped = self
             .litellm_aliases
@@ -9600,6 +9601,33 @@ impl<'t> Ctx<'t> {
                 requests,
             }),
         });
+    }
+
+    /// An access in this file to a LangChain chat model's `model_kwargs`
+    /// or `extra_body` (`llm.model_kwargs = {...}`,
+    /// `llm.extra_body["model"] = ...`, `.update(...)`), whose entries
+    /// LangChain sends over the model it was built with. Any access counts,
+    /// since the object may be one a wrapper in another file built.
+    fn langchain_sent_over(&self) -> Option<Feature> {
+        ["model_kwargs", "extra_body"]
+            .iter()
+            .filter_map(|field| {
+                self.src
+                    .match_indices(&format!(".{field}"))
+                    .find(|(at, _)| {
+                        let end = at + field.len() + 1;
+                        !self.src[end..]
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    })
+            })
+            .map(|(at, _)| at)
+            .min()
+            .map(|at| Feature {
+                what: "an access to a LangChain chat model's `model_kwargs` or `extra_body`",
+                line: self.src[..at].matches('\n').count() as u32 + 1,
+            })
     }
 
     /// Why requests of `pkgs` that a wrapper call in this file reaches may

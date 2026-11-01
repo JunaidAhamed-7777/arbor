@@ -8518,6 +8518,9 @@ fn a_wrapper_call_keeps_what_the_calling_file_changes() {
     for later in [
         "llm.model_name = \"gpt-3.5-turbo\"",
         "llm = llm.configurable_fields(model_name=ConfigurableField(id=\"m\"))",
+        "llm.model_kwargs = {\"model\": \"gpt-4o-mini\"}",
+        "llm.extra_body[\"model\"] = \"gpt-4o-mini\"",
+        "llm.model_kwargs.update(model=\"gpt-4o-mini\")",
     ] {
         let caller =
             format!("from .llm import make_llm\nllm = make_llm(model=\"gpt-4o\")\n{later}\n");
