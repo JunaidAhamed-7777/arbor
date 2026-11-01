@@ -1106,10 +1106,23 @@ fn framework_model_fields(pkg: Pkg) -> &'static [&'static str] {
         Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm => &["model", "model_settings"],
         Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk => &["model", "fallback_model"],
         // AgentScope sends the `model` of `generate_kwargs` and
-        // `extra_body` over its own.
-        pkg if pkg.is_agentscope() => &["model", "model_name", "generate_kwargs", "extra_body"],
+        // `extra_body` over its own, except to Gemini (see
+        // [`agentscope_sends_options`]).
+        pkg if agentscope_sends_options(pkg) => {
+            &["model", "model_name", "generate_kwargs", "extra_body"]
+        }
+        pkg if pkg.is_agentscope() => &["model", "model_name"],
         _ => &[],
     }
+}
+
+/// Whether AgentScope's class of `pkg` sends the `model` of its request
+/// options (`generate_kwargs`, AgentScope 1; `extra_body`, AgentScope 2)
+/// over its own: OpenAI's and Anthropic's merge them into the request,
+/// Gemini's puts `generate_kwargs` into Gemini's `config` and takes no
+/// `extra_body`.
+fn agentscope_sends_options(pkg: Pkg) -> bool {
+    matches!(pkg, Pkg::AgentscopeOpenai | Pkg::AgentscopeAnthropic)
 }
 
 /// The two names a LangChain chat model of `pkg` takes its model under:
@@ -1985,12 +1998,16 @@ struct Assign<'t> {
 }
 
 /// The names and attributes a file assigns the Agents SDK's `Runner`
-/// (`runners`) or one of its run methods (`runs`), as written (see
+/// (`runners`) or one of its run methods (`runs`), as written, and the
+/// class attributes among them by name (`class_runners`, `class_runs`),
+/// which `self._runner`, `cls._runner` or `Bot._runner` read (see
 /// [`Ctx::runner_aliases`]).
 #[derive(Default)]
 struct RunnerAliases<'t> {
     runners: HashSet<&'t str>,
     runs: HashSet<&'t str>,
+    class_runners: HashSet<&'t str>,
+    class_runs: HashSet<&'t str>,
 }
 
 #[derive(Clone, Copy)]
@@ -2525,9 +2542,10 @@ struct Ctx<'t> {
     /// The file builds a `RunConfig` with a model, which every agent it
     /// runs uses instead of its own (see [`Ctx::note_agents_run_model`]).
     agents_run_model: Option<Feature>,
-    /// A `set_model(...)` call in a file that imports the Claude Agent SDK
-    /// or the Claude Code SDK: a `ClaudeSDKClient`'s session then sends
-    /// another model than its options' (see [`Ctx::note_options_rerouted`]).
+    /// A `set_model` attribute anywhere in the file, or one looked up by
+    /// name (`getattr(client, "set_model")`): a `ClaudeSDKClient`'s session
+    /// may then send another model than its options'. Read only for Claude
+    /// Code records.
     claude_set_model: Option<Feature>,
     /// The objects of every `generate_kwargs` or `extra_body` attribute in
     /// the file, which may be an AgentScope model's or an Agents SDK
@@ -2537,8 +2555,13 @@ struct Ctx<'t> {
     /// after it is built (see [`Ctx::note_request_options`]).
     agentscope_options_used: Option<Feature>,
     /// The Agents SDK may be sent another model in a model settings'
-    /// `extra_body` (see [`Ctx::note_request_options`]).
+    /// `extra_body`, by any of its records (see
+    /// [`Ctx::note_request_options`]).
     agents_extra_body: Option<Feature>,
+    /// The same for one agent, by construction call id: it is given model
+    /// settings this file does not read. Any model object may be its.
+    agents_settings_given: HashMap<usize, Feature>,
+    agents_settings_models: Option<Feature>,
     /// What an Agents SDK construction (by call id) sends its requests
     /// through, as built: the client a model object is given, or the model
     /// object an agent or run is given. [`Ctx::reroute`] routes it at each
@@ -2718,6 +2741,8 @@ impl<'t> Ctx<'t> {
             request_option_objects: Vec::new(),
             agentscope_options_used: None,
             agents_extra_body: None,
+            agents_settings_given: HashMap::new(),
+            agents_settings_models: None,
             agents_via: HashMap::new(),
             builtin_values: HashMap::new(),
             member_values: HashSet::new(),
@@ -4895,12 +4920,19 @@ impl<'t> Ctx<'t> {
                     self.attr_uses.entry(name).or_default().escapes = true;
                     self.name_uses.entry(name).or_default().escapes = true;
                     // `getattr(options, "env")[...] = ...` uses Claude Code
-                    // options' environment like `options.env` does.
-                    if let (Some(object), true) = (
-                        positional.first(),
-                        matches!(name, "env" | "settings" | "extra_args"),
-                    ) {
-                        self.options_env_objects.push((*object, scope, name));
+                    // options' environment like `options.env` does, and the
+                    // same for the other attributes read like it.
+                    if let Some(object) = positional.first() {
+                        if matches!(name, "env" | "settings" | "extra_args") {
+                            self.options_env_objects.push((*object, scope, name));
+                        } else if matches!(name, "generate_kwargs" | "extra_body") {
+                            self.request_option_objects.push((*object, scope, name));
+                        } else if name == "set_model" {
+                            self.claude_set_model.get_or_insert(Self::feature(
+                                "`set_model` looked up by name",
+                                call,
+                            ));
+                        }
                     }
                     // `getattr(_A(), "_A__go")`.
                     self.note_mangled_use(name);
@@ -4920,9 +4952,10 @@ impl<'t> Ctx<'t> {
                 Some((_, None)) => {
                     self.dynamic_method_calls = true;
                     // It may be Claude Code options' `env`, `settings` or
-                    // `extra_args`.
+                    // `extra_args`, or a framework's request options.
                     if let Some(object) = positional.first() {
                         self.options_env_objects.push((*object, scope, "*"));
+                        self.request_option_objects.push((*object, scope, "*"));
                     }
                     if positional
                         .first()
@@ -7428,6 +7461,27 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// Whether an AgentScope request option's `value` may hold a `model`:
+    /// anything but `None` or a dict literal whose keys are all strings,
+    /// none of them `model`, and whose `inner` option (the SDK's own
+    /// `extra_body` in AgentScope 1's `generate_kwargs`) holds none either.
+    fn request_option_may_name(&self, value: Node<'t>, inner: Option<&str>) -> bool {
+        match value.kind() {
+            "none" => false,
+            "dictionary" => dict_entries(value, |n| self.literal(n).ok(), |n| self.text(n))
+                .into_iter()
+                .any(|entry| match entry {
+                    None => true,
+                    Some((key, nested)) => {
+                        key == "model"
+                            || (Some(key.as_str()) == inner
+                                && self.request_option_may_name(nested, None))
+                    }
+                }),
+            _ => true,
+        }
+    }
+
     /// Why a client built by `class` may not reach the endpoint its
     /// constructor names: when it names none (`base_url` absent or `None`),
     /// the SDK reads its endpoint variable, which this file sets
@@ -8482,6 +8536,13 @@ impl<'t> Ctx<'t> {
             self.options_env_objects.push((object, scope, attr));
         } else if matches!(attr, "generate_kwargs" | "extra_body") {
             self.request_option_objects.push((object, scope, attr));
+        } else if attr == "set_model" {
+            // `client.set_model(...)` changes the model a `ClaudeSDKClient`'s
+            // session sends from then on, and a reference may be called
+            // later (`handlers = {"/model": client.set_model}`). The
+            // receiver is not resolved, so any such attribute counts.
+            self.claude_set_model
+                .get_or_insert(Self::feature("a `set_model` reference", node));
         }
     }
 
@@ -8500,18 +8561,6 @@ impl<'t> Ctx<'t> {
             .any(|i| matches!(i.package.as_str(), "claude_agent_sdk" | "claude_code_sdk"));
         if !claude {
             return;
-        }
-        // `client.set_model(...)` changes the model a `ClaudeSDKClient`'s
-        // session sends from then on. The receiver is not resolved, so any
-        // such call counts.
-        let set_model = self.calls.iter().find(|(call, _)| {
-            call.child_by_field_name("function")
-                .filter(|f| f.kind() == "attribute")
-                .and_then(|f| f.child_by_field_name("attribute"))
-                .is_some_and(|attr| self.text(attr) == "set_model")
-        });
-        if let Some((call, _)) = set_model {
-            self.claude_set_model = Some(Self::feature("a `set_model(...)` call", *call));
         }
         // `setattr(o, "env", ...)`, `o.__setattr__("env", ...)`,
         // `o.__dict__["env"] = ...` and `vars(o)["env"] = ...` are attribute
@@ -8656,22 +8705,43 @@ impl<'t> Ctx<'t> {
         if !agentscope && !agents {
             return;
         }
-        for (object, scope, attr) in self.request_option_objects.clone() {
+        // `setattr(m, "generate_kwargs", ...)` and the other written forms
+        // of the attribute, and writes with a run-time name (`*`).
+        let written: Vec<(Node<'t>, usize, &'t str)> = self
+            .config_assigns
+            .iter()
+            .filter(|assign| matches!(assign.attr, "generate_kwargs" | "extra_body"))
+            .map(|assign| (assign.object, assign.scope, assign.attr))
+            .chain(
+                self.wild_attr_objects
+                    .iter()
+                    .map(|(object, scope)| (*object, *scope, "*")),
+            )
+            .collect();
+        let agents_pkg = |pkg: Pkg| matches!(pkg, Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm);
+        for (object, scope, attr) in self
+            .request_option_objects
+            .clone()
+            .into_iter()
+            .chain(written)
+        {
             let (scope_model, settings) = match self.eval(object, scope, 0) {
                 Val::Client { client, path } if path.is_empty() && client.pkg.is_agentscope() => {
                     (true, false)
                 }
+                // An agent's or a clone's model settings: a clone shares
+                // them (`agent.clone().model_settings.extra_body = ...`).
                 Val::Client { client, path }
-                    if matches!(client.pkg, Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm)
-                        && path.first().is_some_and(|p| p == "model_settings") =>
+                    if agents_pkg(client.pkg) && path.iter().any(|p| p == "model_settings") =>
                 {
                     (false, true)
                 }
+                Val::Result(Some(pkg)) => (pkg.is_agentscope(), agents_pkg(pkg)),
+                Val::Result(None) => (true, true),
                 Val::Client { .. }
                 | Val::Module { .. }
                 | Val::Symbol { .. }
                 | Val::Class(_)
-                | Val::Result(_)
                 | Val::GoogleNs => (false, false),
                 _ if object.kind() == "identifier"
                     && (matches!(self.text(object), "self" | "cls")
@@ -8687,7 +8757,7 @@ impl<'t> Ctx<'t> {
                     object,
                 ));
             }
-            if agents && settings && attr == "extra_body" {
+            if agents && settings && matches!(attr, "extra_body" | "*") {
                 self.agents_extra_body.get_or_insert(Self::feature(
                     "a model settings' `extra_body` used after it is built",
                     object,
@@ -8698,6 +8768,9 @@ impl<'t> Ctx<'t> {
             return;
         }
         for (call, scope) in self.calls.clone() {
+            if self.agents_extra_body.is_some() {
+                return;
+            }
             let Some(function) = call.child_by_field_name("function") else {
                 continue;
             };
@@ -8713,12 +8786,48 @@ impl<'t> Ctx<'t> {
                 );
             let given = keyword_value(call, |n| self.text(n), |k| k == "model_settings")
                 .is_some_and(|given| self.settings_may_send_model(given, scope));
-            if settings_built || named || given {
-                self.agents_extra_body = Some(Self::feature(
-                    "model settings whose `extra_body` may name another model",
-                    call,
-                ));
-                return;
+            // An agent or run given a `**` expansion that may hold model
+            // settings: one the file cannot read, or one holding settings
+            // it does not read.
+            let class = match self.eval(function, scope, 0) {
+                Val::Class(class) if agents_pkg(class.pkg) => Some(class),
+                _ => None,
+            };
+            let expanded = !args.splats.is_empty()
+                && class.is_some()
+                && args
+                    .splats
+                    .iter()
+                    .any(|splat| match self.expand_splat(*splat, scope) {
+                        None => true,
+                        Some(expansion) => {
+                            expansion.summary.opaque
+                                || expansion.summary.last_unknown.is_some()
+                                || expansion.summary.last.get("model_settings").is_some_and(
+                                    |(_, value)| {
+                                        self.settings_may_send_model(*value, expansion.scope)
+                                    },
+                                )
+                        }
+                    });
+            let feature = Self::feature(
+                "model settings whose `extra_body` may name another model",
+                call,
+            );
+            // An agent's own settings reach only its requests (through
+            // whichever model object it is given); a run's reach every
+            // agent's.
+            if (given || expanded) && class.is_some_and(|class| class.name == "Agent") {
+                self.agents_settings_given.insert(call.id(), feature);
+                // Its model may be a model object unless it is a name given
+                // in place.
+                let named = keyword_value(call, |n| self.text(n), |k| k == "model")
+                    .is_some_and(|model| model.kind() == "string");
+                if !named {
+                    self.agents_settings_models.get_or_insert(feature);
+                }
+            } else if settings_built || named || given || expanded {
+                self.agents_extra_body = Some(feature);
             }
         }
     }
@@ -8783,6 +8892,14 @@ impl<'t> Ctx<'t> {
         {
             return true;
         }
+        // A class attribute read through `self`, `cls` or the class.
+        if function.kind() == "attribute"
+            && function
+                .child_by_field_name("attribute")
+                .is_some_and(|attr| aliases.class_runs.contains(self.text(attr)))
+        {
+            return true;
+        }
         function.kind() == "attribute"
             && function
                 .child_by_field_name("attribute")
@@ -8803,8 +8920,10 @@ impl<'t> Ctx<'t> {
             "attribute" => object.child_by_field_name("attribute"),
             _ => return false,
         };
-        last.is_some_and(|name| self.text(name).eq_ignore_ascii_case("runner"))
-            || aliases.runners.contains(self.text(object))
+        last.is_some_and(|name| {
+            self.text(name).eq_ignore_ascii_case("runner")
+                || (object.kind() == "attribute" && aliases.class_runners.contains(self.text(name)))
+        }) || aliases.runners.contains(self.text(object))
             || (object.kind() == "identifier"
                 && self.import_target(object, scope).is_some_and(|target| {
                     target.starts_with("agents.") && target.ends_with(".Runner")
@@ -8812,20 +8931,54 @@ impl<'t> Ctx<'t> {
     }
 
     /// The names and attributes this file assigns the Agents SDK's
-    /// `Runner` (`r = Runner`, `self._runner = Runner`) or one of its run
-    /// methods (`run = Runner.run`), through chains of such assignments,
-    /// matched as written wherever they are used.
+    /// `Runner` (`r = Runner`, `self._runner = Runner`, a class attribute
+    /// `_runner = Runner`) or one of its run methods (`run = Runner.run`),
+    /// through chains of such assignments, matched as written wherever they
+    /// are used (a class attribute by its name after any receiver). Every
+    /// target of `a = b = Runner`, `r, other = Runner, None` and `(r :=
+    /// Runner)` counts, and a value counts when any operand of `or`, `and`
+    /// or a conditional may be one (`runner or Runner`).
     fn runner_aliases(&self) -> RunnerAliases<'t> {
-        let mut assigns = Vec::new();
+        // Target, value, the scope it is in, and whether that is a class body.
+        let mut assigns: Vec<(Node<'t>, Node<'t>, usize, bool)> = Vec::new();
         let mut stack: Vec<Node<'t>> = self.root.into_iter().collect();
         while let Some(node) = stack.pop() {
-            if node.kind() == "assignment" {
-                if let (Some(left), Some(right)) = (
-                    node.child_by_field_name("left"),
-                    node.child_by_field_name("right"),
-                ) {
-                    if matches!(left.kind(), "identifier" | "attribute") {
-                        assigns.push((left, right, self.scope_at(node.start_byte())));
+            let pair = match node.kind() {
+                "assignment" => node
+                    .child_by_field_name("left")
+                    .zip(node.child_by_field_name("right")),
+                "named_expression" => node
+                    .child_by_field_name("name")
+                    .zip(node.child_by_field_name("value")),
+                _ => None,
+            };
+            if let Some((left, mut right)) = pair {
+                // `a = b = Runner`: each target is given the last value.
+                while right.kind() == "assignment" {
+                    match right.child_by_field_name("right") {
+                        Some(inner) => right = inner,
+                        None => break,
+                    }
+                }
+                let scope = self.scope_at(node.start_byte());
+                let class_body = self.scopes[scope].kind == ScopeKind::Class;
+                let targets: Vec<(Node<'t>, Node<'t>)> =
+                    if matches!(left.kind(), "pattern_list" | "tuple_pattern")
+                        && matches!(right.kind(), "expression_list" | "tuple")
+                    {
+                        let names = named_children(left);
+                        let values = named_children(right);
+                        if names.len() == values.len() {
+                            names.into_iter().zip(values).collect()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        vec![(left, right)]
+                    };
+                for (target, value) in targets {
+                    if matches!(target.kind(), "identifier" | "attribute") {
+                        assigns.push((target, value, scope, class_body));
                     }
                 }
             }
@@ -8835,18 +8988,56 @@ impl<'t> Ctx<'t> {
         let mut aliases = RunnerAliases::default();
         loop {
             let mut grew = false;
-            for &(left, right, scope) in &assigns {
+            for &(left, right, scope, class_body) in &assigns {
                 let target = self.text(left);
-                if self.may_be_runner(right, scope, &aliases) {
+                let class_attr = class_body && left.kind() == "identifier";
+                if self.value_may_be(right, 0, &|v| self.may_be_runner(v, scope, &aliases)) {
                     grew |= aliases.runners.insert(target);
-                } else if self.runs_agents(right, scope, &aliases) {
+                    if class_attr {
+                        grew |= aliases.class_runners.insert(target);
+                    }
+                } else if self.value_may_be(right, 0, &|v| self.runs_agents(v, scope, &aliases)) {
                     grew |= aliases.runs.insert(target);
+                    if class_attr {
+                        grew |= aliases.class_runs.insert(target);
+                    }
                 }
             }
             if !grew {
                 return aliases;
             }
         }
+    }
+
+    /// Whether a value `value` may evaluate to passes `test`, through
+    /// parentheses and each operand of `or`, `and` and a conditional (at
+    /// most 32 deep).
+    fn value_may_be(&self, value: Node<'t>, depth: usize, test: &dyn Fn(Node<'t>) -> bool) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        let operands = match value.kind() {
+            "parenthesized_expression" => named_children(value),
+            "boolean_operator" => value
+                .child_by_field_name("left")
+                .into_iter()
+                .chain(value.child_by_field_name("right"))
+                .collect(),
+            // `a if condition else b`: the first and last.
+            "conditional_expression" => {
+                let parts = named_children(value);
+                parts
+                    .first()
+                    .copied()
+                    .into_iter()
+                    .chain(parts.get(2).copied())
+                    .collect()
+            }
+            _ => return test(value),
+        };
+        operands
+            .into_iter()
+            .any(|operand| self.value_may_be(operand, depth + 1, test))
     }
 
     /// The innermost scope whose node holds byte `at`.
@@ -9980,10 +10171,21 @@ impl<'t> Ctx<'t> {
             }
         }
         // AgentScope sends only the `model` at the top of `generate_kwargs`
-        // and `extra_body` over its own: one nested deeper (`metadata`) is
-        // not the model sent, and `client_kwargs` configure the client.
+        // and `extra_body` over its own, and AgentScope 1 the SDK's own
+        // `extra_body` in `generate_kwargs`: one nested elsewhere
+        // (`metadata`) is not the model sent, `client_kwargs` configure the
+        // client, and Gemini's options go to its `config`.
         if target.pkg.is_agentscope() {
-            let sent = |path: &str| matches!(path, "generate_kwargs.model" | "extra_body.model");
+            let sends = agentscope_sends_options(target.pkg);
+            let sent = |path: &str| {
+                sends
+                    && matches!(
+                        path,
+                        "generate_kwargs.model"
+                            | "generate_kwargs.extra_body.model"
+                            | "extra_body.model"
+                    )
+            };
             nested.retain(|item| sent(&item.path));
             nested_overridden.retain(|path| sent(path));
         }
@@ -10130,9 +10332,7 @@ impl<'t> Ctx<'t> {
                         .flatten()
                 })
                 .or_else(|| {
-                    target
-                        .pkg
-                        .is_agentscope()
+                    agentscope_sends_options(target.pkg)
                         .then_some(self.agentscope_options_used)
                         .flatten()
                 });
@@ -10144,7 +10344,16 @@ impl<'t> Ctx<'t> {
             // A model settings' `extra_body` is merged over every request,
             // a run's included.
             let settings = matches!(target.pkg, Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm)
-                .then_some(self.agents_extra_body)
+                .then(|| {
+                    self.agents_extra_body
+                        .or_else(|| self.agents_settings_given.get(&call.id()).copied())
+                        .or_else(|| {
+                            self.agents_model_sites
+                                .contains(&call.id())
+                                .then_some(self.agents_settings_models)
+                                .flatten()
+                        })
+                })
                 .flatten();
             let changed =
                 written
@@ -10257,11 +10466,21 @@ impl<'t> Ctx<'t> {
         // (AgentScope 2) in its request over its own model: one that may
         // hold a `model` leaves the model it is built with unconfirmed. The
         // nested value, read above, is the one sent.
-        if target.pkg.is_agentscope() {
-            let given = ["generate_kwargs", "extra_body"]
-                .into_iter()
-                .find(|option| self.option_may_name(call, option, &["model"]))
-                .or((overrides_expanded || opaque_splat).then_some("a `**` expansion"));
+        if agentscope_sends_options(target.pkg) {
+            let text = |n: Node<'t>| self.text(n);
+            // AgentScope 1's `generate_kwargs` may hold the SDK's own
+            // `extra_body`, which is sent too.
+            let given = [
+                ("generate_kwargs", Some("extra_body")),
+                ("extra_body", None),
+            ]
+            .into_iter()
+            .find(|(option, inner)| {
+                keyword_value(call, text, |k| k == *option)
+                    .is_some_and(|value| self.request_option_may_name(value, *inner))
+            })
+            .map(|(option, _)| option)
+            .or((overrides_expanded || opaque_splat).then_some("a `**` expansion"));
             if let Some(option) = given {
                 let mut keys: Vec<String> = values
                     .iter()

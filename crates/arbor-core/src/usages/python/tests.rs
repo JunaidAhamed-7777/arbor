@@ -8094,12 +8094,26 @@ def make(given):
     assert!(from_env.contains(&"unresolved_model/env_var".to_string()));
     assert_eq!(call_on(&found, 8).routing, Routing::Unknown);
     assert!(gaps_on(&found, 8).contains(&"ambiguous_client/model_route".to_string()));
-    // The client it is given is re-routed after it is built.
+    // The client it is given is re-routed after it is built. The agent
+    // given `**options` may also be given it, with model settings that
+    // send another model.
     assert_eq!(call_on(&found, 10).routing, Routing::Unknown);
-    assert_eq!(gaps_on(&found, 10), ["ambiguous_client/base_url_assigned"]);
+    assert_eq!(
+        gaps_on(&found, 10),
+        [
+            "unresolved_model/dynamic_feature",
+            "ambiguous_client/base_url_assigned"
+        ]
+    );
     // A client this file does not resolve.
     assert_eq!(call_on(&found, 15).routing, Routing::Unknown);
-    assert_eq!(gaps_on(&found, 15), ["ambiguous_client/given_client"]);
+    assert_eq!(
+        gaps_on(&found, 15),
+        [
+            "unresolved_model/dynamic_feature",
+            "ambiguous_client/given_client"
+        ]
+    );
 
     // A model provider given to a run, or a `**` expansion a run is given.
     for run in [
@@ -8826,6 +8840,17 @@ fn a_runner_or_its_run_method_through_an_alias_given_an_expansion_leaves_agents_
         "class Bot:\n    def __init__(self):\n        self._runner = Runner\n    async def ask(self, q, **kw):\n        return await self._runner.run(agent, q, **kw)\n",
         "from agents import Runner as R\nfirst = R\nsecond = first\ndef ask(q, **kw):\n    return second.run_streamed(agent, q, **kw)\n",
         "class Bot:\n    def __init__(self):\n        self._go = Runner.run_sync\n    def ask(self, q, **kw):\n        return self._go(agent, q, **kw)\n",
+        // Class attributes, read through `self`, `cls` or the class.
+        "class Bot:\n    _runner: type[Runner] = Runner\n    async def ask(self, q, **kw):\n        return await self._runner.run(agent, q, **kw)\n",
+        "class Bot:\n    go = Runner.run_sync\n    def ask(self, q, **kw):\n        return self.go(agent, q, **kw)\n",
+        "class Bot:\n    runner_cls = Runner\ndef ask(q, **kw):\n    return Bot.runner_cls.run(agent, q, **kw)\n",
+        "class Bot:\n    _runner = Runner\n    @classmethod\n    def ask(cls, q, **kw):\n        return cls._runner.run_sync(agent, q, **kw)\n",
+        // Other assignment forms.
+        "r, other = Runner, None\nasync def ask(q, **kw):\n    return await r.run(agent, q, **kw)\n",
+        "default_runner = r = Runner\nasync def ask(q, **kw):\n    return await default_runner.run(agent, q, **kw)\n",
+        "async def ask(q, **kw):\n    if (r := Runner) is not None:\n        return await r.run(agent, q, **kw)\n",
+        "class Bot:\n    def __init__(self, runner=None):\n        self._r = runner or Runner\n    def ask(self, q, **kw):\n        return self._r.run_sync(agent, q, **kw)\n",
+        "class Bot:\n    def __init__(self):\n        self._r = Runner if os.environ.get(\"X\") else None\n    async def ask(self, q, **kw):\n        return await self._r.run(agent, q, **kw)\n",
     ] {
         let source = format!(
             "from agents import Agent, Runner\nagent = Agent(name=\"a\", model=\"gpt-4o\")\n{run}"
@@ -8893,6 +8918,12 @@ fn a_claude_client_given_another_model_leaves_the_options_unconfirmed() {
     for set in [
         "await client.set_model(\"claude-3-opus-20240229\")",
         "await client.set_model(model)",
+        // Referenced, then called elsewhere.
+        "handlers = {\"/model\": client.set_model}",
+        "ui.on_model_change(client.set_model)",
+        "switch = client.set_model",
+        "await getattr(client, \"set_model\")(model)",
+        "await functools.partial(client.set_model, model)()",
     ] {
         let source = format!(
             "from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient\noptions = ClaudeAgentOptions(model=\"claude-sonnet-4-5-20250929\")\nasync def ask(model):\n    async with ClaudeSDKClient(options=options) as client:\n        {set}\n        await client.query(\"hi\")\n"
@@ -8918,6 +8949,8 @@ fn agentscope_request_options_used_after_the_model_is_built_are_gaps() {
         "model.generate_kwargs[\"model\"] = \"o1\"",
         "model.extra_body.update({\"model\": \"o1\"})",
         "kwargs = model.generate_kwargs\nkwargs[\"model\"] = \"o1\"",
+        "getattr(model, \"generate_kwargs\")[\"model\"] = \"o1\"",
+        "setattr(model, \"extra_body\", {\"model\": \"o1\"})",
     ] {
         let source = format!(
             "from agentscope.model import OpenAIChatModel\nmodel = OpenAIChatModel(model_name=\"gpt-4o\")\n{change}\n"
@@ -8943,6 +8976,39 @@ client = OpenAIChatModel(model_name="gpt-4o", client_kwargs={"model": "gpt-4o-mi
     assert!(gaps_on(&found, 3).is_empty(), "{:?}", found.gaps);
     let client = call_on(&found, 4);
     assert_eq!(client.values.len(), 1, "{:?}", client.values);
+
+    // AgentScope 1 passes `generate_kwargs` into the SDK call, so the SDK's
+    // own `extra_body` there is sent too. Gemini's go to its `config`.
+    let found = usages(
+        r#"from agentscope.model import OpenAIChatModel, AnthropicChatModel, GeminiChatModel
+
+nested = OpenAIChatModel(model_name="gpt-4o", generate_kwargs={"extra_body": {"model": "gpt-4o-mini"}})
+opaque = OpenAIChatModel(model_name="gpt-4o", generate_kwargs={"extra_body": EXTRA})
+claude = AnthropicChatModel(model_name="claude-3-5-haiku-20241022", generate_kwargs={"extra_body": {"enable_thinking": False, **BASE}})
+thinking = OpenAIChatModel(model_name="gpt-4o", generate_kwargs={"extra_body": {"enable_thinking": False}})
+gemini = GeminiChatModel(model_name="gemini-2.5-flash", generate_kwargs={"model": "gemini-1.5-pro"})
+"#,
+    );
+    assert_eq!(
+        value(call_on(&found, 3), "generate_kwargs.extra_body.model"),
+        Some("gpt-4o-mini")
+    );
+    for line in [3, 4, 5] {
+        assert!(
+            gaps_on(&found, line).contains(&"unresolved_model/reassigned".to_string()),
+            "{line}: {:?}",
+            found.gaps
+        );
+    }
+    assert!(gaps_on(&found, 6).is_empty(), "{:?}", found.gaps);
+    let gemini = call_on(&found, 7);
+    assert_eq!(gemini.values.len(), 1, "{:?}", gemini.values);
+    assert!(gaps_on(&found, 7).is_empty(), "{:?}", found.gaps);
+    // Nor does a write of Gemini's options change its model.
+    let found = usages(
+        "from agentscope.model import GeminiChatModel\nm = GeminiChatModel(model_name=\"gemini-2.5-flash\")\nm.generate_kwargs[\"model\"] = \"x\"\n",
+    );
+    assert!(gaps_on(&found, 2).is_empty(), "{:?}", found.gaps);
 }
 
 #[test]
@@ -8957,6 +9023,14 @@ fn an_agents_model_settings_extra_body_may_send_another_model() {
         "agent = Agent(name=\"a\", model=\"gpt-4o\", model_settings=ModelSettings(temperature=0))\nagent.model_settings.extra_body = {\"model\": \"x\"}",
         "agent = Agent(name=\"a\", model=\"gpt-4o\")\nagent.model_settings = settings",
         "agent = Agent(name=\"a\", model=\"gpt-4o\")\nconfig = RunConfig(model_settings=dataclasses.replace(base, extra_body={\"model\": \"x\"}))",
+        // Through an expansion.
+        "COMMON = {\"model_settings\": SETTINGS, \"instructions\": \"be brief\"}\nagent = Agent(name=\"a\", model=\"gpt-4o\", **COMMON)",
+        "agent = Agent(name=\"a\", model=\"gpt-4o\", **{\"model_settings\": get_settings()})",
+        "agent = Agent(name=\"a\", model=\"gpt-4o\", **options)",
+        // Written by name, or through a clone, which shares them.
+        "settings = ModelSettings(temperature=0)\nsetattr(settings, \"extra_body\", {\"model\": \"x\"})\nagent = Agent(name=\"a\", model=\"gpt-4o\", model_settings=settings)",
+        "settings = ModelSettings(temperature=0)\ngetattr(settings, \"extra_body\")[\"model\"] = \"x\"\nagent = Agent(name=\"a\", model=\"gpt-4o\", model_settings=settings)",
+        "agent = Agent(name=\"a\", model=\"gpt-4o\", model_settings=ModelSettings(temperature=0))\nother = agent.clone(name=\"b\")\nother.model_settings.extra_body = {\"model\": \"x\"}",
     ] {
         let source = format!(
             "from agents import Agent, ModelSettings, RunConfig\n{settings}\n"
@@ -8975,10 +9049,13 @@ fn an_agents_model_settings_extra_body_may_send_another_model() {
         "agent = Agent(name=\"a\", model=\"gpt-4o\", model_settings=ModelSettings(temperature=0.2))",
         "agent = Agent(name=\"a\", model=\"gpt-4o\", model_settings=None)",
         "settings = ModelSettings(temperature=0)\nagent = Agent(name=\"a\", model=\"gpt-4o\", model_settings=settings)",
+        "COMMON = {\"model_settings\": ModelSettings(temperature=0)}\nagent = Agent(name=\"a\", model=\"gpt-4o\", **COMMON)",
+        "agent = Agent(name=\"a\", model=\"gpt-4o\")\nother = Agent(name=\"b\", model=\"gpt-4.1\", model_settings=SETTINGS)",
+        "agent = Agent(name=\"a\", model=\"gpt-4o\")\nm = OpenAIChatCompletionsModel(\"gpt-4o\", client)\nother = Agent(name=\"b\", model=\"gpt-4.1\", **options)",
         "agent = Agent(name=\"a\", model=\"gpt-4o\")\nclient = OpenAI()\nclient.chat.completions.create(model=\"gpt-4o\", messages=[], extra_body={\"model\": \"x\"})",
     ] {
         let source = format!(
-            "from agents import Agent, ModelSettings, RunConfig\nfrom openai import OpenAI\n{settings}\n"
+            "from agents import Agent, ModelSettings, OpenAIChatCompletionsModel, RunConfig\nfrom openai import OpenAI\n{settings}\n"
         );
         let found = usages(&source);
         assert!(
