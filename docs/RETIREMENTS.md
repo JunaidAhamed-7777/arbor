@@ -1,12 +1,20 @@
 # Find code that calls retiring AI models
 
 AI providers retire models on fixed dates, and a request to a retired model fails.
-OpenAI shuts down `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` on
-**14 January 2027**. `arbor retirements` finds the direct `openai`, `anthropic` and
-Google SDK calls in your code that use a model its provider has retired or is
-retiring. For each call it shows the replacement the provider lists, the other
+OpenAI's deprecations page lists five dated snapshots for shutdown on
+**14 January 2027**: `gpt-4o-2024-08-06`, `gpt-4o-2024-11-20`, `gpt-4o-mini-2024-07-18`,
+`gpt-4.1-2025-04-14` and `gpt-4.1-mini-2025-04-14`. The page gives the bare `gpt-4o`,
+`gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` no row, but OpenAI's
+[API reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+lists each of them as "Deprecated. Announced shutdown date: 2027-01-14", and OpenAI's
+models API returned that date for each when we checked on 18 October 2026.
+`arbor retirements` finds the direct `openai`, `anthropic` and
+Google SDK calls in your code, and LangChain's `ChatOpenAI`, `AzureChatOpenAI` and
+`ChatAnthropic` chat models, that use a model its provider has retired or is
+retiring. For each SDK call it shows the replacement the provider lists, the other
 arguments that have to change with it, and the choices your repository has to make
-first.
+first. A LangChain chat model gets the replacement and only the checks about the
+model itself ([below](#what-it-prints)).
 
 ```bash
 npx @anandb71/arbor-cli retirements .
@@ -34,7 +42,7 @@ Model retirements in . (1 Python file checked)
                   also change: max_tokens → max_completion_tokens
                   decide: keep reasoning off (add reasoning_effort="none"; keep temperature) or let the model reason (remove temperature)
   app/chat.py:21  gpt-4o-mini (line 22) → gpt-6-luna  fallback of an environment or config lookup: confirm the deployed value
-                  decide: keep reasoning off (add reasoning_effort="none") or let the model reason (no change)
+                  decide: keep reasoning off (add reasoning_effort="none"; check stop) or let the model reason (check stop)
                   check: stop and logit_bias are not supported on gpt-6-luna (400).
   app/chat.py:29  gpt-4.1 → gpt-6-luna
                   decide: keep reasoning off (add reasoning_effort="none"; keep tools) or let the model reason (remove tools)
@@ -47,7 +55,7 @@ Model retirements in . (1 Python file checked)
   ...
 
 Not checked: 1 call takes the model from somewhere Arbor cannot read (an environment variable, a function argument, another module); arbor usages lists it.
-Not listed: 1 call reaches these models through Azure, another host in base_url or another cloud, where the provider's dates may not apply. Add --include-routed to list it.
+Not listed: 1 call reaches these models through Azure, another host in base_url, another cloud or LiteLLM, where the provider's dates may not apply. Add --include-routed to list it.
 Summary: 4 calls in 1 file use retired or retiring models: 1 already retired, 3 retiring (next: 14 Jan 2027, 88 days).
 3 can move once this repo makes the choice shown under decide; 1 needs a manual check.
 Failing (exit 1): 1 call uses a model that is already retired.
@@ -62,42 +70,63 @@ For each affected call it reports:
 | **Where** | `file:line`, and the line of the string to edit when the model comes from a constant or a default |
 | **When** | Already retired, or the shutdown date and the days left. Google lists its Gemini dates as the earliest possible, so those read "on or after". |
 | **Replacement** | The model the provider's deprecation page lists. Arbor does not pick a "better" one. When the listed model is itself retired or retiring, Arbor follows what the provider lists for it in turn and shows the first one that still works: `gpt-4-vision-preview → gpt-6-luna (via gpt-4o)`. Such a call always needs a manual check, and `--json` has the whole chain. When the provider lists several models, or none, the report says so. |
-| **Also change** | Arguments that must change with the replacement, worked out from the arguments the call passes: for example `max_tokens` becomes `max_completion_tokens` on gpt-6-luna. Only changes the provider documents as required are listed here. |
-| **Decide** | Choices your repository makes once, which Arbor never makes for you. Today that is the reasoning effort on OpenAI's new models: gpt-6-luna and GPT-5.6 run at medium reasoning effort by default, so they can reason, while gpt-4o and gpt-4.1 did not. You can keep reasoning off (`reasoning_effort="none"`; parameters such as `temperature` and `tools` keep working) or let the model reason (when it does, the call is slower and reasoning tokens are billed; those parameters have to go). The same goes for Claude's thinking on claude-sonnet-5-5, which thinks by default where the Sonnet models it replaces did not: you can send `thinking={"type": "between_tools"}` (no thinking before the answer) or let the model think (slower and costlier when it does, and a response can begin with thinking blocks). The report shows both options with their effect and how well each effect is established. A call with a decision moves only once the repository has chosen: its *also change* edits, such as the `max_tokens` rename, go in together with the chosen option. |
+| **Also change** | Arguments that must change with the replacement, worked out from the arguments the call passes: for example `max_tokens` becomes `max_completion_tokens` on gpt-6-luna. Only changes that the provider documents, or that live calls showed to be required, are listed here: OpenAI's API reference documents `max_tokens` as deprecated in favor of `max_completion_tokens`, and live calls with `max_tokens` returned 400 on gpt-6-luna and gpt-5.6-terra ([E1](LIVE_CHECKS_2026-10-18.md#e1-max_tokens-is-rejected)). |
+| **Decide** | Choices your repository makes once, which Arbor never makes for you. Today that is the reasoning effort on OpenAI's new models: gpt-6-luna and GPT-5.6 run at medium reasoning effort by default, so they can reason, while gpt-4o and gpt-4.1 did not. You can keep reasoning off (`reasoning_effort="none"`; parameters such as `temperature` and `tools` keep working) or let the model reason (when it does, the call is slower and reasoning tokens are billed; those parameters have to go). The same goes for Claude's thinking on claude-sonnet-5-5, which thinks by default where the Sonnet models it replaces did not: you can send `thinking={"type": "between_tools"}` (no thinking before the answer) or let the model think (slower and costlier when it does, and a response can begin with thinking blocks). The report shows both options with their effect and how well each effect is established. A call with a decision moves only once the repository has chosen: its *also change* edits, such as the `max_tokens` rename, go in together with the chosen option. An option reads *no change* only when Arbor read every argument the call sends and no check line names one of them. When some come from a `**` expression Arbor cannot read (a parameter such as `**kwargs`, an attribute) or are sent in `extra_body`, each option says *could not check the arguments from `**options`* (naming the expression as the code does) or *in `extra_body`*, and a check line asks you to look at them: `temperature` or `tools` among them would need removing to let the model reason, and `max_tokens` or `stop` return 400 with reasoning off too (`unchecked_args` and `unread_spreads` in `--json`). A dict literal in the same file spread in with `**` (`**PARAMS`) is read: its keys, whatever they are called (`max_tokens` included), are checked like arguments written at the call. A dict that the same file changes or passes on after building it is named, not read; a change made to it from another module is not seen. When a check line names an argument the call sends that neither option removes or keeps, each option names it: *check `stop`* when the line says it fails or changes on the replacement (Claude's non-default `temperature`, `stop` on gpt-6-luna, and `temperature` in a Responses API call moving to gpt-6-luna, where the check line quotes OpenAI's "Using GPT-6" guide), *could not check `temperature`* when nothing verified it for that API (sampling arguments in a Responses API call moving to a GPT-5.6 model, such as `gpt-4-turbo` → `gpt-5.6-sol`, which no live check called) (`options[].check` and `options[].unverified` in `--json`). A check line that a live check saw on another API says so (*Seen on Chat Completions only; the Responses API was not checked.*). An argument the live checks sent only with reasoning off (`seed` and `n` on gpt-6-luna) reads *could not check `seed`* on the option that lets the model reason. Arbor reads argument names, not values, so `temperature=1` still reads *remove temperature* for letting the model reason. |
 | **Check** | What needs a person: parameters the replacement rejects (`stop`, `logit_bias`), fine-tuned models, embedding models (new vectors), several listed replacements, a model set in a request parameter object such as a tool config, and a model nested in a call's arguments, such as a Message Batch's `requests[].params` or a tool's `model` in `tools=[...]`. The call's own argument checks do not apply to a nested model: only the checks about the model itself do, and the report says to check the parameters next to it by hand. |
-| **Confidence** | *Confirmed*: a literal or a constant in the same file, at a call where the usage scan (`arbor usages`) left no gap for it. *Confirm first*: the fallback of `os.getenv(...)`, a parameter default, one of the values a dict lookup, a branch or an in-file caller may give, or any value the usage scan put a gap on: a class attribute a subclass in another module may override, a name something in the file may change at run time (`exec`, `globals()`, `setattr`...), a call that passes more nested model values than the scan reads. The value at run time may differ, and the report says why. *Gap*: an SDK-shaped call whose client Arbor could not resolve (built by a factory, passed in). |
-| **Routing** | A provider's dates apply to its own API. A client whose `base_url` is the provider's own host (`https://api.openai.com/v1`) or `None` is a direct call. When the usage scan cannot confirm where a call goes, it is listed with *routing not confirmed* and the reason: a `base_url` read from the environment (even one that falls back to the provider's host, since the deployment may set the variable) or from code Arbor cannot read, a client assigned more than one way or passed in by callers in other modules, a file that sets `OPENAI_BASE_URL`, module-level configuration outside the file's setup block, a Gemini client given `http_options` or `vertexai=True`, or a file that may rebind it at run time. A Gemini client follows Google Cloud's (Vertex AI) schedule only when it is built with `vertexai=True`; with `vertexai=False`, `None` or no flag it follows the Gemini API's. When `vertexai=` is decided at run time, Arbor looks the model up on Vertex AI first, then on the Gemini API, and the check says which schedule it used. Calls through Azure OpenAI, another host in `base_url` (OpenRouter, LiteLLM, a proxy), Bedrock, Vertex for Claude or LiteLLM's own API are counted separately; `--include-routed` lists them. |
+| **Confidence** | *Confirmed*: a literal or a constant in the same file, at a call where the usage scan (`arbor usages`) left no gap for it. *Confirm first*: the fallback of `os.getenv(...)`, a parameter default, one of the values a dict lookup, a branch or an in-file caller may give, or any value the usage scan put a gap on: a class attribute a subclass in another module may override, a name something in the file may change at run time (`exec`, `globals()`, `setattr`...), a call that passes more nested model values than the scan reads. The value at run time may differ, and the report says why. *Gap*: an SDK-shaped call whose client Arbor could not resolve (built by a factory, passed in, or a package's subclass of the SDK client). Its arguments are still checked, as for any other call. |
+| **Routing** | A provider's dates apply to its own API. A client whose `base_url` is the provider's own host (`https://api.openai.com/v1`) or `None` is a direct call. When the usage scan cannot confirm where a call goes, it is listed with *routing not confirmed* and the reason: a `base_url` read from the environment (even one that falls back to the provider's host, since the deployment may set the variable) or from code Arbor cannot read, a client (or a LangChain chat model's class) assigned more than one way or passed in by callers in other modules, a file that sets `OPENAI_BASE_URL`, module-level configuration outside the file's setup block, a Gemini client given `http_options` or `vertexai=True`, or a file that may rebind it at run time. A Gemini client follows Google Cloud's (Vertex AI) schedule only when it is built with `vertexai=True`; with `vertexai=False`, `None` or no flag it follows the Gemini API's. When `vertexai=` is decided at run time, Arbor looks the model up on Vertex AI first, then on the Gemini API, and the check says which schedule it used. Calls through Azure OpenAI, another host in `base_url` (OpenRouter, LiteLLM, a proxy), the Anthropic SDK's `AnthropicBedrock` or `AnthropicVertex`, or LiteLLM's own API are counted separately; `--include-routed` lists them. |
 
 LangChain's OpenAI and Anthropic chat models (`ChatOpenAI`, `AzureChatOpenAI` and
 `ChatAnthropic`, from the partner packages or the deprecated
 `langchain_community.chat_models` and `langchain.chat_models`) are checked where they
-are built: `ChatOpenAI(model="gpt-4o")` is listed with its date and replacement, and
-routed like the client it builds ([SDK_USAGES.md](SDK_USAGES.md#langchain-chat-models)).
-LangChain takes its own arguments and builds the request, so only the checks about the
-model itself apply there: no *also change* or *decide* lines, and a check to review the
-parameters LangChain sends against the replacement by hand. A retired model there still
-fails the check.
+are built, and where a call on one passes its own `model` (`llm.invoke(q, model=...)`):
+`ChatOpenAI(model="gpt-4o")` is listed with its date and replacement, and routed like
+the client it builds ([SDK_USAGES.md](SDK_USAGES.md#langchain-chat-models)), so an
+`AzureChatOpenAI` counts as a call through Azure OpenAI. One whose class is chosen at run
+time (`AzureChatOpenAI` or `ChatOpenAI` under one name) is listed with its route
+unconfirmed. LangChain takes its own arguments and builds the request, so only the checks
+about the model itself apply there: no *also change* or *decide* lines, and a check to
+review the parameters LangChain sends against the replacement by hand. A retired model
+there still fails the check. A request made through the SDK client a chat model holds
+(`llm.root_client.chat.completions.create(...)`, or `llm.client.create(...)`, which is
+`chat.completions.create`) is an SDK request, so every check applies to it as it does to
+the same request on the SDK's own client.
 
-Calls through LiteLLM (`litellm.completion`, `acompletion`) and on Amazon Bedrock (a
-`boto3` `bedrock-runtime` client, LangChain's `ChatBedrock` and `ChatBedrockConverse`) are
-routed: they are counted, and `--include-routed` lists them
+Calls through LiteLLM (`litellm.completion`, `acompletion`) are routed: they are
+counted, and `--include-routed` lists them
 ([SDK_USAGES.md](SDK_USAGES.md#amazon-bedrock-and-litellm)). A LiteLLM model is looked up
 on the schedule its router prefix names (`anthropic/claude-3-5-sonnet-20241022` on
 Anthropic's), else by its shape (`gpt-4o` on OpenAI's), with only the checks about the
 model, since LiteLLM takes OpenAI-style arguments and translates them for each provider.
 A Gemini model with no prefix (`gemini-2.5-flash`) is looked up on Google Cloud's (Vertex
-AI) schedule, where LiteLLM sends it; `gemini/gemini-2.5-flash` reaches the Gemini API.
-AWS keeps Bedrock's model schedule, which the data does not hold, so nothing is looked up
-for a Bedrock call, whatever its model ID (`anthropic.claude-3-5-sonnet-20240620-v1:0`).
+AI) schedule, where LiteLLM sends it; `gemini/gemini-2.5-flash` reaches the Gemini API, and
+a call that picks its provider itself (`custom_llm_provider`) is looked up on neither.
+A LiteLLM call the usage scan puts a routing gap on (a provider it picks itself, a
+replaced `litellm.completion`) is listed with *routing not confirmed*, and a model
+LiteLLM may not send (one next to a `deployment_id` or a `prompt_id`, a fallback that
+names its own deployment) is *confirm first*.
+Calls on Amazon Bedrock (a `boto3` `bedrock-runtime` client, LangChain's `ChatBedrock` and
+`ChatBedrockConverse`) are not checked: AWS keeps Bedrock's model schedule, which the data
+does not hold, so nothing is looked up for them, whatever their routing or model ID
+(`anthropic.claude-3-5-sonnet-20240620-v1:0`), and they are neither listed nor counted.
+`arbor usages` lists them.
 
 A raw HTTP request that posts JSON to the provider's REST API (`requests.post(...)` or
-`httpx.post(...)` to a listed `api.openai.com` or `api.anthropic.com` endpoint) is a
-direct call on that provider's schedule, with the model read from its JSON body
-([SDK_USAGES.md](SDK_USAGES.md#raw-http-requests)). Its argument names are the HTTP
-library's, and the scan reads only the model in the body, so only the checks about the
-model apply, with a check to review the body's other fields by hand. Other LangChain models and
-integrations, LlamaIndex and other wrappers are not checked yet, so a clean result says
-"No direct openai/anthropic/google SDK calls" and nothing more.
+`httpx.post(...)` to a listed `api.openai.com` or `api.anthropic.com` endpoint, its URL a
+literal or a constant in the same file) is a direct call on that provider's schedule,
+with the model read from its JSON body ([SDK_USAGES.md](SDK_USAGES.md#raw-http-requests)).
+Its argument names are the HTTP library's, and the scan reads only the model in the
+body, so only the checks about the model apply, with a check to review the body's other
+fields by hand.
+
+Other LangChain models and integrations, other HTTP requests (through a `Session` or
+`Client`, `requests.request(...)`, a URL built at run time, an unlisted endpoint),
+LlamaIndex and other wrappers are not checked yet. When the report
+lists no call, its summary says that Arbor found no direct calls to OpenAI, Anthropic or
+Google that use retired or retiring models, names those wrappers as not checked, and
+claims nothing more. Calls through Azure or another host are not direct: the *Not
+listed* line counts them, and with `--include-routed` they are listed under a heading of
+their own and counted on a summary line of their own, and that sentence is not printed.
 
 Fine-tuned models (`ft:<base>:...`) follow their base model's schedule. Arbor names a
 base model to retrain on only when the provider lists one that supports fine-tuning;
@@ -126,7 +155,7 @@ exit 1 only with `--count-unconfirmed`.
 | `--markdown-out <file>` | Also write the Markdown report to a file, from the same scan |
 | `--fail-within <days>` | Also fail when a model retires within this many days |
 | `--count-unconfirmed` | Also let unconfirmed calls fail the check (see below) |
-| `--include-routed` | List calls through Azure, another host in `base_url` or another cloud, and let them fail the check |
+| `--include-routed` | List calls through Azure, another host in `base_url`, another cloud or LiteLLM, and let them fail the check |
 | `--quiet` | Only the calls and the summary |
 
 | Exit code | Meaning |
@@ -159,14 +188,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: Anandb71/arbor@v3.1.0
+      - uses: Anandb71/arbor@v3.1.1
         with:
           mode: retirements
           # retirements-fail-on: retired   # or a number of days, e.g. 90
 ```
 
 The Action scans once. The job summary gets the Markdown report, which lists every
-call. Affected lines get warning annotations: GitHub shows at most 10 warnings per
+call the scan finds. Affected lines get warning annotations: GitHub shows at most 10 warnings per
 step, so Arbor writes 10, the calls that fail the check first and then the most
 urgent, and one notice saying how many more the summary lists. The Action fails the build only if you set `retirements-fail-on` to
 `retired` or to a number of days, with one exception: when the check cannot run
@@ -182,21 +211,25 @@ it too. The check runs on the runner and sends nothing anywhere.
 
 - **Python only.** `.py` files and Python scripts. TypeScript and JavaScript are coming.
 - **Providers:** OpenAI, Anthropic, the Gemini API and Gemini on Google Cloud (Vertex AI):
-  283 entries (276 model IDs; 7 listed by both the Gemini API and Vertex; aliases
+  308 entries (297 model IDs; 11 listed by both the Gemini API and Vertex; aliases
   included) from their deprecation pages, with the aliases and changelog entries those
   pages leave out, such as the four OpenAI aliases above.
-- **Direct SDK calls and LangChain chat models.** It reads the `openai`, `anthropic`,
-  `google-genai` and `google-generativeai` SDKs, and LangChain's `ChatOpenAI`,
-  `AzureChatOpenAI` and `ChatAnthropic`, and raw HTTP posts to OpenAI's and Anthropic's
-  REST APIs with `requests` or `httpx`. Calls through LiteLLM and on Amazon Bedrock are
-  routed (`--include-routed`), and Bedrock's own schedule is not in the data. Other
-  framework wrappers (LangChain's other integrations, LlamaIndex) are not checked yet. Model IDs in `.env`, YAML, JSON or notebooks are not read.
+- **Direct SDK calls, three LangChain chat models and some raw HTTP posts.** It reads the `openai`,
+  `anthropic`, `google-genai` and `google-generativeai` SDKs, and LangChain's
+  `ChatOpenAI`, `AzureChatOpenAI` and `ChatAnthropic`, and `requests.post` or
+  `httpx.post` to a listed OpenAI or Anthropic endpoint whose URL is a literal or a
+  same-file constant. Calls through LiteLLM are routed
+  (`--include-routed`); calls on Amazon Bedrock are not checked, since Bedrock's own
+  schedule is not in the data. Other framework wrappers (LangChain's other chat models
+  and integrations, LlamaIndex) are not checked yet. Model IDs in `.env`, YAML, JSON or notebooks are not read.
 - **Values it can see.** A model passed in from an environment variable, a function
   argument or another module is counted under "Not checked"; `arbor usages` lists those
-  calls. So is a call that passes no model, where the SDK's or the server's default
-  applies. Argument checks look at the argument *names* a call passes, not their values,
-  and not at parameters nested in config objects such as Gemini's
-  `GenerateContentConfig`.
+  calls. So is a copy of a LangChain chat model whose `update` may give it another
+  model (`llm.copy(update=...)`). A call that passes no model is counted there too: the
+  SDK's or the server's default applies, or LangChain's for a `ChatOpenAI` or
+  `ChatAnthropic` built with none (an `AzureChatOpenAI` serves its deployment).
+  Argument checks look at the argument *names* a call passes, not their values, and not
+  at parameters nested in config objects such as Gemini's `GenerateContentConfig`.
 - **What it did not read.** Every part of the scan that could hide a call gets its own
   "Not checked" line, so a clean result never claims more than was read: parts of files
   the usage scan did not analyze (scopes nested more than 64 deep, more records than it
@@ -215,10 +248,13 @@ it too. The check runs on the runner and sends nothing anywhere.
 
 The model IDs, dates and replacements come from the providers' own deprecation pages,
 and every one was checked against a saved copy of the page. Each report prints the day
-each provider's pages were read (in the bundled data: OpenAI on 18 October 2026,
-Anthropic and Google on 16 October 2026), and the data date in `--json` is the oldest
-of them. The argument rules come from the providers' migration guides and API
-references. A rule marked `live` in the JSON was confirmed with real API calls on
+each provider's pages were read (in the bundled data: 28 October 2026 for every
+provider, when every page was read and checked again), and the data date in `--json`
+is the oldest of them. Between 23 and 26 October, OpenAI's page started listing bare
+IDs and dated snapshots together in its rows, which added 15 IDs: seven bare IDs, among
+them `gpt-5` and `o3` (11 December 2026), and eight dated snapshots, such as
+`gpt-5.1-2025-11-13` (1 April 2027). The argument rules come from the
+providers' migration guides and API references. A rule marked `live` in the JSON was confirmed with real API calls on
 18 October 2026; the label is shown only for the models those calls used and only on
 Chat Completions, the one API they called. [Live checks, 18 October 2026](LIVE_CHECKS_2026-10-18.md)
 lists each of those calls with its request, status and error message, word for word,
@@ -244,8 +280,15 @@ arguments, and credential-shaped strings are never captured or printed. For a cl
 given a `base_url`, Arbor reads that argument to tell the provider's own host from a
 proxy; it reports only that class, never the URL.
 
-The human report ends with one line offering automated fix pull requests. That line is
-never printed with `--json`, `--markdown`, `--annotations`, `--quiet`, or when `CI` is set.
-Its link (`https://getarbor.dev/retirements?utm_source=arbor-cli`) carries only that
-`utm_source` tag, so a fix-PR signup from the page can be credited to the CLI; nothing
-about your code or the run is in it, and Arbor opens nothing itself.
+The human report can end with an offer of help. It is never printed with `--json`,
+`--markdown`, `--annotations`, `--quiet`, or when `CI` is set, and Arbor opens nothing
+itself. When the report lists at least one call to a retired or retiring model, the offer
+is a paid readiness review, and its link
+(`https://getarbor.dev/retirements?utm_source=arbor-cli&review=1&calls=4&retired=1&next=2027-01-14`,
+for example) carries only the number of calls in the summary, how many of them are already
+retired and the soonest shutdown date among the retiring ones, never code, paths, file
+names, repository names or model names; opening it sends those values to getarbor.dev like
+any page visit, and your email only if you submit the form. For any other listed or routed
+call the offer is automated fix pull requests, and its link
+(`https://getarbor.dev/retirements?utm_source=arbor-cli`) carries only the `utm_source` tag
+that credits a signup to the CLI. A clean report has no offer.

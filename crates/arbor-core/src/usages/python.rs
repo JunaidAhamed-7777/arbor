@@ -104,10 +104,10 @@
 //! gap listing the values the callers pass.
 
 use super::{
-    is_capturable_value, is_credential_value, is_identifier_key, is_secret_key, is_value_key,
-    model_family, BindingKind, CapturedValue, ClientConstruction, ClientScope, FileUsages, GapKind,
-    Receiver, Routing, Sdk, SdkCall, SdkImport, Span, UsageGap, ValueOrigin, VertexAi,
-    BEDROCK_VALUE_KEYS,
+    is_argument_name, is_capturable_value, is_credential_value, is_identifier_key, is_secret_key,
+    is_value_key, model_family, BindingKind, CallArgs, CapturedValue, ClientConstruction,
+    ClientScope, FileUsages, GapKind, Receiver, Routing, Sdk, SdkCall, SdkImport, Span, Spread,
+    UsageGap, ValueOrigin, VertexAi, BEDROCK_VALUE_KEYS,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -326,6 +326,9 @@ const MAX_STARS: usize = 16;
 /// Longest string literal read, in source bytes. A captured value is at
 /// most 256 bytes, so a longer literal is refused without being copied.
 const MAX_LITERAL_BYTES: usize = 4096;
+/// Most argument names recorded for one `**` expression. A dict with more
+/// is recorded as one Arbor could not read in full.
+const MAX_SPREAD_KEYS: usize = 64;
 /// Most arguments an environment, config or dict lookup takes. A call with
 /// more is not a lookup and its arguments are not scanned.
 const MAX_LOOKUP_ARGS: usize = 8;
@@ -496,6 +499,18 @@ impl Pkg {
             _ => return false,
         };
         self.named_symbols().contains(&name.as_str())
+    }
+
+    /// The SDK package a LangChain chat model builds its client from
+    /// (`openai`, `anthropic`); an SDK's package is its own.
+    fn base(self) -> Pkg {
+        match self.sdk() {
+            _ if !self.is_langchain() => self,
+            Sdk::Openai => Pkg::Openai,
+            Sdk::Anthropic => Pkg::Anthropic,
+            Sdk::Aws => Pkg::Boto3,
+            _ => self,
+        }
     }
 
     /// A LangChain OpenAI chat model that may run on the pre-1.0 `openai`
@@ -745,6 +760,28 @@ const LANGCHAIN_CLIENT_FIELDS: &[&str] = &[
     "_async_client",
 ];
 
+/// The path on the SDK client that the field `field` of a LangChain chat
+/// model of `pkg` holds: `chat.completions` for the OpenAI classes'
+/// `client` and `async_client` (`root_client.chat.completions`, or
+/// `openai.ChatCompletion` on the pre-1.0 SDK), and the client itself (`""`)
+/// for `root_client` and `root_async_client` on `langchain_openai`,
+/// `ChatAnthropic`'s `_client` and `_async_client`, and the deprecated
+/// `ChatAnthropic`'s `client` and `async_client`. `None` for a field the
+/// class does not hold an SDK client in.
+fn held_client_path(pkg: Pkg, field: &str) -> Option<&'static str> {
+    match (pkg, field) {
+        (_, "client" | "async_client") if pkg.sdk() == Sdk::Openai => Some("chat.completions"),
+        (Pkg::LangchainOpenai, "root_client" | "root_async_client")
+        | (Pkg::LangchainAnthropic, "_client" | "_async_client")
+        | (
+            Pkg::LangchainCommunityAnthropic | Pkg::LangchainLegacyAnthropic,
+            "client" | "async_client",
+        )
+        | (Pkg::LangchainAws, "client") => Some(""),
+        _ => None,
+    }
+}
+
 /// Arguments of a LangChain call that configure LangChain's run (tracing,
 /// callbacks, configurable fields) and never reach the provider's request:
 /// a `model` key inside them is not a model the request uses.
@@ -756,6 +793,21 @@ const LANGCHAIN_RUN_OPTIONS: &[&str] = &[
     "callbacks",
     "run_name",
 ];
+
+/// Fields of a LangChain chat model that decide the model its requests
+/// send: the model field under either of its names, and `model_kwargs` and
+/// `extra_body`, which are sent over it.
+const LANGCHAIN_MODEL_FIELDS: &[&str] = &[
+    "model",
+    "model_name",
+    "model_id",
+    "model_kwargs",
+    "extra_body",
+];
+
+/// The dicts a LangChain chat model sends over its model field: a `model`
+/// key in one replaces it in the request.
+const LANGCHAIN_SENT_OVER: &[&str] = &["model_kwargs", "extra_body"];
 
 /// Keyword names that set a client's endpoint: the SDKs' own, and
 /// LangChain's field names for it (`base_url` is their alias).
@@ -811,14 +863,20 @@ fn value_keys(pkg: Pkg, receiver: Receiver) -> ValueKeys {
             ValueKeys::Only(&["model_id", "modelId"])
         }
         Pkg::LangchainAws => ValueKeys::Only(&["model_id", "model"]),
+        // `completion(model, ...)` takes no `engine` or `model_name`; a
+        // `deployment_id` replaces the model (see the `reassigned` gap).
+        Pkg::Litellm => ValueKeys::Only(&["model", "deployment_id"]),
         _ => ValueKeys::DEFAULT,
     }
 }
 
 /// The two names a LangChain chat model of `pkg` takes its model under:
-/// its field, then the field's alias.
-fn langchain_model_names(pkg: Pkg) -> [&'static str; 2] {
+/// its field, then the field's alias. On a call on a built Bedrock model
+/// (`receiver` is a client) they are the call's two spellings, which
+/// langchain-aws folds into one `modelId`.
+fn langchain_model_names(pkg: Pkg, receiver: Receiver) -> [&'static str; 2] {
     match pkg {
+        Pkg::LangchainAws if receiver == Receiver::Client => ["model_id", "modelId"],
         Pkg::LangchainAws => ["model_id", "model"],
         _ => ["model", "model_name"],
     }
@@ -1238,8 +1296,11 @@ enum Origin {
     /// (`AzureOpenAI if azure else build`, `try: from openai import
     /// AzureOpenAI as Maker` / `except ImportError: from mylib import
     /// FakeClient as Maker`); calling it builds an ambiguous client of the
-    /// first constructor's package.
-    MixedClasses(Pkg),
+    /// first constructor's package. A LangChain chat model among them
+    /// (`Chat = AzureChatOpenAI if azure else ChatOpenAI`) is still built
+    /// with the model its requests use: calling it records the construction
+    /// with an ambiguous route (see [`Ctx::analyze_call`]).
+    MixedClasses(Pkg, Option<ClientClass>),
     /// A dynamic feature of the file may rebind or replace the value.
     Dynamic(Feature),
     Other,
@@ -1438,7 +1499,15 @@ struct NestedValue {
     path: String,
     positional: bool,
     resolved: Resolved,
+    /// A LiteLLM option the dict holding the value names next to it, which
+    /// replaces the model that dict sends (`deployment_id`) or picks its
+    /// provider (`custom_llm_provider`): a LiteLLM fallback's own.
+    beside: Option<&'static str>,
 }
+
+/// LiteLLM options a fallback dict may name next to its `model`, which then
+/// does not decide what that fallback sends, or where.
+const LITELLM_FALLBACK_OPTIONS: &[&str] = &["deployment_id", "custom_llm_provider"];
 
 /// A bounded read of nested model values.
 struct NestedRead {
@@ -1756,6 +1825,18 @@ struct ConfigAssign<'t> {
     at: usize,
 }
 
+/// A write of a dict a LangChain chat model sends over its model field
+/// ([`LANGCHAIN_SENT_OVER`]) on an object other than `self` or a same-file
+/// class (see [`Ctx::sent_over_write`]).
+#[derive(Debug, Clone, Copy)]
+struct SentOverWrite<'t> {
+    attr: &'t str,
+    /// The value written and the scope it is written in, or `None` when it
+    /// is not read here (`+=`, `del`, a write through a borrowed `self`).
+    value: Option<(Node<'t>, usize)>,
+    feature: Feature,
+}
+
 /// Calls and the scope each is in.
 type CallSites<'t> = Rc<[(Node<'t>, usize)]>;
 
@@ -1875,6 +1956,15 @@ struct DictSummary<'t> {
     expansion: Vec<(String, usize, Node<'t>)>,
     /// Part of the dict could not be read, or the expansion list was cut.
     opaque: bool,
+    /// Its string keys in the order Python sends them (first occurrence),
+    /// at most [`MAX_SPREAD_KEYS`]: the argument names a `**` expansion of
+    /// it passes. Secret-sounding names (`max_tokens`) are listed: they are
+    /// names, never values.
+    keys: Vec<String>,
+    /// It sends a key `keys` does not list: one past [`MAX_SPREAD_KEYS`],
+    /// or one that is not an argument name Arbor records (not an
+    /// identifier, or shaped like a credential).
+    keys_missing: bool,
 }
 
 impl DictSummary<'_> {
@@ -2155,6 +2245,11 @@ struct Ctx<'t> {
     /// The file mentions LiteLLM's `model_alias_map`, which may map the
     /// model a LiteLLM call is given to another one.
     litellm_aliases: Option<Feature>,
+    /// Outside writes of a dict a LangChain chat model sends over its model
+    /// field, in source order (see [`Ctx::note_langchain_sent_over`]).
+    sent_over_writes: Vec<SentOverWrite<'t>>,
+    /// [`Ctx::sent_over_write`] by field and key.
+    sent_over_found: HashMap<(&'static str, String), Option<Feature>>,
     /// Namespace builtins used as a value, by name (see
     /// [`Ctx::note_builtin_value`]).
     builtin_values: HashMap<&'t str, Feature>,
@@ -2315,6 +2410,8 @@ impl<'t> Ctx<'t> {
             openai_caveat: None,
             langchain_configurable: None,
             litellm_aliases: None,
+            sent_over_writes: Vec::new(),
+            sent_over_found: HashMap::new(),
             builtin_values: HashMap::new(),
             member_values: HashSet::new(),
             method_self_writes: Vec::new(),
@@ -3967,9 +4064,17 @@ impl<'t> Ctx<'t> {
             } else {
                 continue;
             };
-            self.outside_attr_writes
-                .entry(attr)
-                .or_insert_with(|| Self::feature(what, object));
+            let feature = Self::feature(what, object);
+            self.outside_attr_writes.entry(attr).or_insert(feature);
+            // Its value is not read here: it may hold any key (see
+            // [`Self::sent_over_write`]).
+            if LANGCHAIN_SENT_OVER.contains(&attr) {
+                self.sent_over_writes.push(SentOverWrite {
+                    attr,
+                    value: None,
+                    feature,
+                });
+            }
         }
         for (object, scope) in self.wild_attr_objects.clone() {
             if let Some(feature) = self.rebound_receiver(object, scope) {
@@ -6501,7 +6606,7 @@ impl<'t> Ctx<'t> {
             Val::Module { pkg, .. } | Val::Symbol { pkg, .. } => Val::Result(Some(pkg)),
             Val::Result(pkg) => Val::Result(pkg),
             Val::GoogleNs => Val::untracked(Origin::Other),
-            Val::Untracked(Origin::MixedClasses(pkg)) => Val::Client {
+            Val::Untracked(Origin::MixedClasses(pkg, _)) => Val::Client {
                 client: Client {
                     pkg,
                     routing: Routing::Unknown,
@@ -6976,6 +7081,7 @@ impl<'t> Ctx<'t> {
                 ),
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
             return;
         }
@@ -6998,6 +7104,7 @@ impl<'t> Ctx<'t> {
                 ),
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         }
         self.settle_builtin_values();
@@ -7041,6 +7148,7 @@ impl<'t> Ctx<'t> {
                 line: self.src[..at].matches('\n').count() as u32 + 1,
             });
         }
+        self.note_langchain_sent_over();
         for (call, scope) in self.calls.clone() {
             if self.records() >= MAX_FILE_RECORDS {
                 return self.truncate_file(call, scope);
@@ -7076,6 +7184,7 @@ impl<'t> Ctx<'t> {
             ),
             values: Vec::new(),
             values_complete: false,
+            args: None,
         });
     }
 
@@ -7468,9 +7577,11 @@ impl<'t> Ctx<'t> {
             .map(|n| self.text(n));
             let hooked: &[Pkg] = match name {
                 Some("register" | "register_first" | "register_last") => {
+                    // The event name may be a same-file constant.
                     let event = keyword_value(call, |n| self.text(n), |k| k == "event_name")
                         .or(self.arguments(call).first_positional)
-                        .and_then(|n| self.literal(n).ok());
+                        .and_then(|n| self.resolve_value(n, scope, 0).ok())
+                        .map(|resolved| resolved.value);
                     if event.is_some_and(|e| EVENTS.iter().any(|p| e.starts_with(p))) {
                         &BEDROCK
                     } else {
@@ -7510,6 +7621,87 @@ impl<'t> Ctx<'t> {
                 });
             }
         }
+    }
+
+    /// `x.model_kwargs = ...` or `x.extra_body = ...` on an object other
+    /// than `self` or a same-file class: a LangChain chat model sends these
+    /// over its model field, so the write replaces the models a constructor
+    /// gives in them, and may change the others (see
+    /// [`Self::langchain_rewrite`]).
+    fn note_langchain_sent_over(&mut self) {
+        let writes: Vec<SentOverWrite<'t>> = self
+            .config_assigns
+            .iter()
+            .filter(|write| LANGCHAIN_SENT_OVER.contains(&write.attr))
+            .map(|write| SentOverWrite {
+                attr: write.attr,
+                value: write.value.map(|value| (value, write.scope)),
+                feature: Self::feature("a write of the attribute on another object", write.object),
+            })
+            .collect();
+        self.sent_over_writes.extend(writes);
+    }
+
+    /// The write, on an object other than `self` or a same-file class, that
+    /// may give a built LangChain chat model another model where it is
+    /// given the value keyed `key` (`model_name`, `extra_body.model`).
+    /// LangChain sends the model field (`model` or `model_name`), then
+    /// `model_kwargs` over its own parameters, then `extra_body` over the
+    /// request body. So a value is replaced by any write of the field it is
+    /// given in (either name, for the model field), and by a write of a
+    /// dict sent after that field whose value may hold the request key the
+    /// value is sent as (`model`, for the model field and for
+    /// `model_kwargs.model`). A write of `model` or `model_name` leaves the
+    /// values given in `model_kwargs` and `extra_body`, which are sent over
+    /// it.
+    fn langchain_rewrite(&mut self, key: &str) -> Option<Feature> {
+        let (field, rest) = key.split_once('.').unwrap_or((key, ""));
+        let next = rest.split('.').next().unwrap_or(rest);
+        // The request key the value is sent as, and the dicts sent after the
+        // field it is given in.
+        let (sent_as, after): (&str, &[&'static str]) = match field {
+            "model" | "model_name" | "model_id" => ("model", LANGCHAIN_SENT_OVER),
+            "model_kwargs" => (next, &["extra_body"]),
+            _ => (next, &[]),
+        };
+        let written = match field {
+            "model" | "model_name" | "model_id" => ["model", "model_name", "model_id"]
+                .iter()
+                .find_map(|name| self.outside_attr_writes.get(name)),
+            _ => self.outside_attr_writes.get(field),
+        }
+        .copied();
+        written.or_else(|| {
+            after
+                .iter()
+                .find_map(|over| self.sent_over_write(over, sent_as))
+        })
+    }
+
+    /// The first write of `field`, one of [`LANGCHAIN_SENT_OVER`], whose
+    /// value may hold `key` ([`Self::may_hold_keys`]). One whose value is
+    /// not read here may hold any key.
+    fn sent_over_write(&mut self, field: &'static str, key: &str) -> Option<Feature> {
+        let cache_key = (field, key.to_string());
+        if let Some(found) = self.sent_over_found.get(&cache_key) {
+            return *found;
+        }
+        let mut found = None;
+        for index in 0..self.sent_over_writes.len() {
+            let write = self.sent_over_writes[index];
+            if write.attr != field {
+                continue;
+            }
+            if write
+                .value
+                .is_none_or(|(value, scope)| self.may_hold_keys(value, scope, &[key]))
+            {
+                found = Some(write.feature);
+                break;
+            }
+        }
+        self.sent_over_found.insert(cache_key, found);
+        found
     }
 
     /// Clients given a new `base_url` after they are built
@@ -7607,12 +7799,21 @@ impl<'t> Ctx<'t> {
                 client.caveat = Some(ClientCaveat::Dynamic(feature));
             }
         }
-        if let Some(feature) = self.sdk_patched.get(&client.pkg) {
+        if let Some(feature) = self.sdk_patch(client.pkg) {
             if client.caveat.is_none() && !client.ambiguous {
-                client.caveat = Some(ClientCaveat::Dynamic(*feature));
+                client.caveat = Some(ClientCaveat::Dynamic(feature));
             }
         }
         client
+    }
+
+    /// A member of `pkg` replaced in this file, or, for a LangChain chat
+    /// model, one of the SDK whose client it builds (`openai.OpenAI = ...`).
+    fn sdk_patch(&self, pkg: Pkg) -> Option<Feature> {
+        self.sdk_patched
+            .get(&pkg)
+            .or_else(|| self.sdk_patched.get(&pkg.base()))
+            .copied()
     }
 
     /// Why the module-level API of `pkg` may not route as reported.
@@ -7790,11 +7991,9 @@ impl<'t> Ctx<'t> {
                         routing: self.module_routing(class.pkg),
                         client_line: None,
                         ambiguous: false,
-                        caveat: self.module_caveat(class.pkg).or_else(|| {
-                            self.sdk_patched
-                                .get(&class.pkg)
-                                .map(|f| ClientCaveat::Dynamic(*f))
-                        }),
+                        caveat: self
+                            .module_caveat(class.pkg)
+                            .or_else(|| self.sdk_patch(class.pkg).map(ClientCaveat::Dynamic)),
                     };
                     self.record_call(call, function, scope, target);
                 }
@@ -7841,6 +8040,27 @@ impl<'t> Ctx<'t> {
                     client_line: client.line,
                     ambiguous: client.ambiguous,
                     caveat: client.caveat,
+                };
+                self.record_call(call, function, scope, target);
+            }
+            // `Chat = AzureChatOpenAI if azure else ChatOpenAI`, or the same
+            // choice made by a `try`/`except ImportError` import: a LangChain
+            // chat model is built with the model its requests use, but which
+            // class builds it, and so its route, is decided at run time.
+            Val::Untracked(Origin::MixedClasses(_, Some(class))) => {
+                let receiver = if function.kind() == "attribute" {
+                    Receiver::Module
+                } else {
+                    Receiver::Symbol
+                };
+                let target = CallTarget {
+                    pkg: class.pkg,
+                    member: class.name.to_string(),
+                    receiver,
+                    routing: Routing::Unknown,
+                    client_line: None,
+                    ambiguous: true,
+                    caveat: None,
                 };
                 self.record_call(call, function, scope, target);
             }
@@ -8115,6 +8335,7 @@ impl<'t> Ctx<'t> {
                 detail,
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         }
         if args.splat || args.list_splat {
@@ -8134,6 +8355,7 @@ impl<'t> Ctx<'t> {
                 ),
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         }
         // The request goes where its URL says unless `post` itself, or
@@ -8162,6 +8384,7 @@ impl<'t> Ctx<'t> {
                 detail,
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         }
 
@@ -8180,6 +8403,7 @@ impl<'t> Ctx<'t> {
             }
         }
 
+        let spreads = self.spreads(&args, scope);
         self.out.calls.push(SdkCall {
             sdk: endpoint.sdk,
             package: library.to_string(),
@@ -8196,6 +8420,7 @@ impl<'t> Ctx<'t> {
             file: self.file.clone(),
             span,
             symbol,
+            spreads,
             kwargs: args.kwargs,
             positional: args.positional,
             splat: args.splat,
@@ -8216,13 +8441,49 @@ impl<'t> Ctx<'t> {
         let keys = value_keys(target.pkg, target.receiver);
         let args = self.arguments_with(call, keys);
         let sdk = target.pkg.sdk();
-        let member = clip_owned(strip_wrappers(&target.member));
-        let request = is_request_of(target.pkg, &member);
+        let mut member = clip_owned(strip_wrappers(&target.member));
+        // A LangChain call is a construction or a call on a chat model, never
+        // an SDK request, whatever its method is called (`llm.stream`). A
+        // call through the SDK client the model holds
+        // (`llm.root_client.chat.completions.create`, `llm.client.create`)
+        // is the SDK's own: it is made with the SDK's package, under the
+        // chat model's routing, and its member is the path on that client.
+        // One through a field the class does not hold an SDK client in stays
+        // a call on the chat model.
+        let held = (target.pkg.is_langchain() && target.receiver == Receiver::Client)
+            .then(|| {
+                let (field, rest) = member.split_once('.').unwrap_or((member.as_str(), ""));
+                let path = held_client_path(target.pkg, field)?;
+                let path = match (path, rest) {
+                    ("", rest) => rest.to_string(),
+                    (path, "") => path.to_string(),
+                    (path, rest) => format!("{path}.{rest}"),
+                };
+                (!path.is_empty()).then_some(path)
+            })
+            .flatten();
+        let through_client = held.is_some();
+        if let Some(path) = held {
+            member = path;
+        }
+        let langchain = target.pkg.is_langchain() && !through_client;
+        let pkg = if through_client {
+            target.pkg.base()
+        } else {
+            target.pkg
+        };
+        let request = is_request_of(pkg, &member) && !langchain;
         // Only LiteLLM's request functions are recorded for it.
-        let model_bearing = is_model_bearing(&member) || target.pkg == Pkg::Litellm;
+        let model_bearing = is_model_bearing(&member) || pkg == Pkg::Litellm;
         // Bedrock, LangChain's Bedrock models and LiteLLM need a model: none
         // given is an error, not a default.
-        let default_model = !matches!(target.pkg, Pkg::Boto3 | Pkg::LangchainAws | Pkg::Litellm);
+        let default_model = !matches!(pkg, Pkg::Boto3 | Pkg::LangchainAws | Pkg::Litellm);
+        // `llm.copy(update=...)` and `llm.model_copy(update=...)` set fields
+        // by their own names, not LangChain's aliases, and the copy is not
+        // followed: what `update` holds is never a value of the call.
+        let langchain_copy = langchain
+            && target.receiver == Receiver::Client
+            && matches!(member.as_str(), "copy" | "model_copy");
 
         // An unresolved model matters where it reaches a request, a model
         // object, or any call on a client or SDK module; on an SDK type
@@ -8257,7 +8518,11 @@ impl<'t> Ctx<'t> {
 
         // `GenerativeModel("gemini-pro")`, `genai.embed_content("models/...", text)`:
         // the model is positional.
-        if !keyed {
+        // A LiteLLM call's first argument is its model even next to a
+        // `deployment_id`, which is a value key too.
+        let positional_open = !keyed
+            || (target.pkg == Pkg::Litellm && !args.value_args.iter().any(|(k, _)| k == "model"));
+        if positional_open {
             if let (Some(key), Some(first)) = (
                 positional_model_key(target.pkg, target.receiver, &member),
                 args.first_positional,
@@ -8282,13 +8547,15 @@ impl<'t> Ctx<'t> {
                 .as_deref()
                 .is_none_or(|k| LANGCHAIN_RUN_OPTIONS.contains(&k));
             // A Bedrock request's other fields (`inferenceConfig`,
-            // `additionalModelRequestFields`, `requestMetadata`) do not
-            // name the model it is sent to.
-            // LiteLLM's `model_list` names deployments, not the model the
-            // call sends (a `model_list` gap below covers it).
-            let deployments =
-                target.pkg == Pkg::Litellm && keyword.as_deref() == Some("model_list");
-            if (target.pkg.is_langchain() && run_option) || target.pkg == Pkg::Boto3 || deployments
+            // `additionalModelRequestFields`, `requestMetadata`) do not name
+            // the model it is sent to, and LiteLLM's `model_list` names
+            // deployments, not the model the call sends (a `model_list` gap
+            // below covers it).
+            let deployments = pkg == Pkg::Litellm && keyword.as_deref() == Some("model_list");
+            if langchain && run_option
+                || langchain_copy && keyword.as_deref() == Some("update")
+                || pkg == Pkg::Boto3
+                || deployments
             {
                 continue;
             }
@@ -8314,9 +8581,28 @@ impl<'t> Ctx<'t> {
         // same-file dict.
         let mut model_list =
             target.pkg == Pkg::Litellm && args.kwargs.iter().any(|k| k == "model_list");
+        // A LiteLLM call given a `deployment_id`, which replaces its `model`.
+        let mut deployment =
+            target.pkg == Pkg::Litellm && args.kwargs.iter().any(|k| k == "deployment_id");
+        // A LiteLLM call given a `prompt_id`, or a provider of its own
+        // (`custom_llm_provider`, `azure=True`).
+        let mut prompt = target.pkg == Pkg::Litellm && args.kwargs.iter().any(|k| k == "prompt_id");
+        let mut provider = target.pkg == Pkg::Litellm
+            && args
+                .kwargs
+                .iter()
+                .any(|k| k == "custom_llm_provider" || k == "azure");
         let mut expanded: Vec<usize> = Vec::new();
         // The model keys the expanded same-file dicts give.
         let mut expanded_keys: HashSet<&'static str> = HashSet::new();
+        // A copy's `update`, with the scope it is written in: given at the
+        // call or by a same-file dict (`llm.copy(**ARGS)`).
+        let mut updates: Vec<(Node<'t>, usize)> = Vec::new();
+        if langchain_copy {
+            if let Some(update) = keyword_value(call, |n| self.text(n), |k| k == "update") {
+                updates.push((update, scope));
+            }
+        }
         for splat in &args.splats {
             let Some(expansion) = self.expand_splat(*splat, scope) else {
                 opaque_splat = true;
@@ -8328,12 +8614,19 @@ impl<'t> Ctx<'t> {
                 continue;
             }
             expanded.push(expansion.node.id());
+            // An `update` that a `**` or computed key after it may replace
+            // is the opaque expansion's, which has its `splat` gap.
+            if langchain_copy {
+                if let Lookup::Found(update) = self.dict_lookup(expansion.node, "update") {
+                    updates.push((update, expansion.scope));
+                }
+            }
             for (key, index, value) in expansion.summary.expansion.iter() {
                 if !keys.reads(key) {
                     continue;
                 }
                 keyed = true;
-                if let Some(known) = langchain_model_names(target.pkg)
+                if let Some(known) = langchain_model_names(target.pkg, target.receiver)
                     .into_iter()
                     .find(|k| *k == key.as_str())
                 {
@@ -8367,28 +8660,56 @@ impl<'t> Ctx<'t> {
                 }
                 self.take_value(&site, key, false, result, &mut values);
             }
-            if target.pkg == Pkg::Litellm && expansion.summary.last.contains_key("model_list") {
+            if pkg == Pkg::Litellm && expansion.summary.last.contains_key("model_list") {
                 model_list = true;
             }
-            if target.pkg != Pkg::Boto3 {
+            if pkg == Pkg::Litellm && expansion.summary.last.contains_key("deployment_id") {
+                deployment = true;
+            }
+            if pkg == Pkg::Litellm && expansion.summary.last.contains_key("prompt_id") {
+                prompt = true;
+            }
+            if pkg == Pkg::Litellm
+                && (expansion.summary.last.contains_key("custom_llm_provider")
+                    || expansion.summary.last.contains_key("azure"))
+            {
+                provider = true;
+            }
+            if pkg != Pkg::Boto3 {
                 let list = self.dict_nested(&expansion);
-                let deployments =
-                    |path: &str| target.pkg == Pkg::Litellm && path.starts_with("model_list.");
+                // The dict is read once for every call that expands it: the
+                // run options (and a copy's `update`) it holds are dropped
+                // here, for a LangChain call, and a LiteLLM `model_list`.
+                let reaches_request = |path: &str| {
+                    let option = path.split('.').next().unwrap_or(path);
+                    !(langchain && LANGCHAIN_RUN_OPTIONS.contains(&option)
+                        || langchain_copy && option == "update"
+                        || pkg == Pkg::Litellm && option == "model_list")
+                };
                 nested.extend(
                     list.found
                         .iter()
-                        .filter(|item| !deployments(&item.path))
+                        .filter(|v| reaches_request(&v.path))
                         .cloned(),
                 );
                 nested_overridden.extend(
                     list.overridden
                         .iter()
-                        .filter(|path| !deployments(path))
+                        .filter(|path| reaches_request(path))
                         .cloned(),
                 );
                 nested_cut |= list.cut;
             }
         }
+        // A LiteLLM fallback that names its own `deployment_id` or provider.
+        let fallback_options: Vec<(String, &'static str)> = if pkg == Pkg::Litellm {
+            nested
+                .iter()
+                .filter_map(|v| v.beside.map(|option| (v.path.clone(), option)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.take_nested(&site, nested, nested_cut, &mut values);
         if site.gap_worthy && !nested_overridden.is_empty() {
             // One gap per key path, at most [`MAX_NESTED_VALUES`]; past
@@ -8422,6 +8743,7 @@ impl<'t> Ctx<'t> {
                     ),
                     values: Vec::new(),
                     values_complete: false,
+                    args: None,
                 });
             }
         }
@@ -8432,25 +8754,62 @@ impl<'t> Ctx<'t> {
             Pkg::LangchainAws => "model_id",
             _ => "model",
         };
-        // A call on a built LangChain Bedrock model may be given its model
-        // through `**` too.
-        let bedrock_model_call =
-            target.pkg == Pkg::LangchainAws && target.receiver == Receiver::Client;
-        if !keyed && opaque_splat && (request || model_bearing || bedrock_model_call) {
+        // A call on a built LangChain chat model (`invoke`, `bind`, `batch`,
+        // `stream`...) sends its kwargs over the model's own parameters, so
+        // a `model` there replaces the field.
+        let on_chat_model = langchain && target.receiver == Receiver::Client;
+        // On a Bedrock one, through the Converse API (see the `conditional`
+        // gap below).
+        let bedrock_model_call = on_chat_model && target.pkg == Pkg::LangchainAws;
+        // A LangChain chat model takes its model under its field's name or
+        // its alias (`model` or `model_name`; `model_id` or `model` on
+        // Bedrock, and `model_id` or `modelId` on a call on a built Bedrock
+        // model).
+        let [field, alias] = langchain_model_names(target.pkg, target.receiver);
+        if !keyed && opaque_splat && (request || model_bearing || on_chat_model) {
             let unresolved = Unresolved::new("splat", "**kwargs".to_string());
             self.unresolved_gap(&site, model_key, &unresolved, None);
         } else if !keyed && model_bearing && default_model && !args.list_splat {
-            // No model at all: the SDK's or the server's default applies,
-            // and it may be one that retires.
-            let unresolved = Unresolved::new("missing_model", String::new());
+            // No model at all: the SDK's, the server's or LangChain's
+            // default applies, and it may be one that retires.
+            let default = if langchain {
+                "LangChain's default model"
+            } else {
+                ""
+            };
+            let unresolved = Unresolved::new("missing_model", default.to_string());
             self.unresolved_gap(&site, model_key, &unresolved, None);
         }
-        // A LangChain chat model takes its model under its field's name or
-        // its alias (`model` or `model_name`; `model_id` or `model` on
-        // Bedrock). Given both, which one it keeps is not confirmed; given
-        // one, an opaque `**` expansion may hold the other, which (unlike a
-        // second `model=` in an SDK call) is no `TypeError`.
-        let [field, alias] = langchain_model_names(target.pkg);
+        // A copy whose `update` may set the model (by either name, since
+        // which one is the field depends on the class, or through a `model`
+        // in `model_kwargs` or `extra_body`) may have another model, or its
+        // own: either way it is not confirmed.
+        if langchain_copy {
+            let changes_model = updates
+                .into_iter()
+                .any(|(update, scope)| self.update_may_set_model(update, scope));
+            if changes_model {
+                self.out.gaps.push(UsageGap {
+                    kind: GapKind::UnresolvedModel,
+                    sdk: Some(sdk),
+                    file: self.file.clone(),
+                    span: Some(span),
+                    symbol: symbol.clone(),
+                    chain: Some(chain.clone()),
+                    key: Some(field.to_string()),
+                    reason: "langchain_copy".to_string(),
+                    detail: format!(
+                        "`{chain}` copies a LangChain chat model with an `update` that may set its model, by name or through a `model` in the `model_kwargs` or `extra_body` sent over it; the copy sets fields by their own names (`model_name` on the OpenAI classes, `model` on `ChatAnthropic`), not by alias, and calls on it are not followed"
+                    ),
+                    values: Vec::new(),
+                    values_complete: false,
+                    args: None,
+                });
+            }
+        }
+        // Given both of its names, which one LangChain keeps is not
+        // confirmed; given one, an opaque `**` expansion may hold the other,
+        // which (unlike a second `model=` in an SDK call) is no `TypeError`.
         let given = |key: &str| args.kwargs.iter().any(|k| k == key) || expanded_keys.contains(key);
         let names = (given(field), given(alias));
         // The key a gap about the model as a whole holds: the name the call
@@ -8471,32 +8830,43 @@ impl<'t> Ctx<'t> {
             )),
             _ => None,
         };
-        // Its requests read the model field when they are sent, so
-        // `llm.model_name = ...` after it is built changes it. Any write of
-        // that name, or one with a run-time name, on an object other than
-        // `self` or a same-file class may be one.
-        let rewritten = (target.receiver != Receiver::Client)
-            .then(|| {
-                self.wild_attr_any
-                    .or_else(|| {
-                        [field, alias]
-                            .iter()
-                            .find_map(|attr| self.outside_attr_writes.get(attr).copied())
-                    })
-                    .or(self.langchain_configurable)
-            })
-            .flatten()
-            .map(|feature| {
-                (
-                    "dynamic_feature",
-                    format!(
-                        "may be given another model after it is built ({})",
-                        feature.describe()
-                    ),
-                )
-            });
-        if target.pkg.is_langchain() {
-            for (reason, what) in aliased.into_iter().chain(rewritten) {
+        let mut model_gaps: Vec<(&str, String, Option<String>)> = aliased
+            .into_iter()
+            .map(|(reason, what)| (reason, what, model_key.clone()))
+            .collect();
+        // Its requests read the model field, `model_kwargs` and
+        // `extra_body` when they are sent, so a write of one after it is
+        // built, on an object other than `self` or a same-file class, may
+        // replace a value it is given (see [`Self::langchain_rewrite`]), and
+        // a write with a run-time name or a model made configurable may
+        // replace any. A constructor given no model field already has its
+        // own gap.
+        if langchain && target.receiver != Receiver::Client {
+            let mut keys: Vec<String> = [(field, names.0), (alias, names.1)]
+                .into_iter()
+                .filter(|(_, given)| *given)
+                .map(|(name, _)| name.to_string())
+                .collect();
+            for value in &values {
+                let field = value.key.split('.').next().unwrap_or_default();
+                if LANGCHAIN_SENT_OVER.contains(&field) && !keys.contains(&value.key) {
+                    keys.push(value.key.clone());
+                }
+            }
+            let any = self.wild_attr_any.or(self.langchain_configurable);
+            for key in keys {
+                let Some(feature) = any.or_else(|| self.langchain_rewrite(&key)) else {
+                    continue;
+                };
+                let what = format!(
+                    "may be given another model after it is built ({})",
+                    feature.describe()
+                );
+                model_gaps.push(("dynamic_feature", what, Some(key)));
+            }
+        }
+        if langchain {
+            for (reason, what, key) in model_gaps {
                 self.out.gaps.push(UsageGap {
                     kind: GapKind::UnresolvedModel,
                     sdk: Some(sdk),
@@ -8504,11 +8874,12 @@ impl<'t> Ctx<'t> {
                     span: Some(span),
                     symbol: symbol.clone(),
                     chain: Some(chain.clone()),
-                    key: model_key.clone(),
+                    key,
                     reason: reason.to_string(),
                     detail: format!("the LangChain chat model `{chain}` {what}"),
                     values: Vec::new(),
                     values_complete: false,
+                    args: None,
                 });
             }
         }
@@ -8538,19 +8909,24 @@ impl<'t> Ctx<'t> {
                     reason: "conditional".to_string(),
                     values: Vec::new(),
                     values_complete: false,
+                    args: None,
                 });
             }
         }
 
         // LiteLLM may send the models a call names to others: through its
-        // process-wide `model_alias_map`, or through a `model_list` passed to
-        // the call (or held by a `**` expansion), which maps a model name to
-        // the deployment it calls. These gaps hold no key, so they cover
-        // every model value of the call, nested fallbacks included.
+        // process-wide `model_alias_map`, a `model_list` passed to the call
+        // (or held by a `**` expansion), which maps a model name to the
+        // deployment it calls, a `deployment_id`, which it sends to Azure in
+        // place of the model and of every fallback's, or a `prompt_id`, whose
+        // template may name the model. These gaps hold no key, so they cover
+        // every model value of the call, nested fallbacks included; the
+        // `deployment_id` itself is the value sent.
         if target.pkg == Pkg::Litellm {
-            let mut remapped = Vec::new();
+            let mut remapped: Vec<(Option<String>, &str, String)> = Vec::new();
             if let Some(feature) = self.litellm_aliases {
                 remapped.push((
+                    None,
                     "dynamic_feature",
                     format!(
                         "{} may map the models `{chain}` names to other ones",
@@ -8560,6 +8936,7 @@ impl<'t> Ctx<'t> {
             }
             if model_list {
                 remapped.push((
+                    None,
                     "model_list",
                     format!("`{chain}` is given a `model_list`, which maps the model names it is given to the deployments LiteLLM calls"),
                 ));
@@ -8568,11 +8945,39 @@ impl<'t> Ctx<'t> {
             // says it.
             if opaque_splat && !values.is_empty() {
                 remapped.push((
+                    None,
                     "splat",
-                    format!("`{chain}` is given a `**` expansion that may hold a `model_list`, which maps the model names it is given to the deployments LiteLLM calls"),
+                    format!("`{chain}` is given a `**` expansion that may hold a `model_list`, a `deployment_id` or a `prompt_id`, which may send other models in place of those it names"),
                 ));
             }
-            for (reason, detail) in remapped {
+            if deployment {
+                let mut keys: Vec<String> = values
+                    .iter()
+                    .map(|v| v.key.clone())
+                    .filter(|key| key != "deployment_id")
+                    .collect();
+                keys.sort();
+                keys.dedup();
+                for key in keys {
+                    let detail = format!("`{key}` for `{chain}` is not sent: LiteLLM sends the `deployment_id` it is given to Azure in its place, for the model and for every fallback");
+                    remapped.push((Some(key), "deployment_id", detail));
+                }
+            }
+            if prompt {
+                remapped.push((
+                    None,
+                    "prompt_id",
+                    format!("`{chain}` is given a `prompt_id`: with a prompt-management integration registered, the prompt's template may name the model LiteLLM sends"),
+                ));
+            }
+            for (key, option) in fallback_options {
+                let (reason, detail) = match option {
+                    "deployment_id" => ("deployment_id", format!("`{key}` for `{chain}` is not sent: its fallback names a `deployment_id`, which LiteLLM sends to Azure in its place")),
+                    _ => ("litellm_provider", format!("`{key}` for `{chain}` is sent to the provider its fallback's `custom_llm_provider` names, not the one its name suggests")),
+                };
+                remapped.push((Some(key), reason, detail));
+            }
+            for (key, reason, detail) in remapped {
                 self.out.gaps.push(UsageGap {
                     kind: GapKind::UnresolvedModel,
                     sdk: Some(sdk),
@@ -8580,11 +8985,31 @@ impl<'t> Ctx<'t> {
                     span: Some(span),
                     symbol: symbol.clone(),
                     chain: Some(chain.clone()),
-                    key: None,
+                    key,
                     reason: reason.to_string(),
                     detail,
                     values: Vec::new(),
                     values_complete: false,
+                    args: None,
+                });
+            }
+            // `custom_llm_provider` (or `azure=True`) picks the provider
+            // before the model's name does, so where the call goes is not
+            // what its model suggests.
+            if provider {
+                self.out.gaps.push(UsageGap {
+                    kind: GapKind::AmbiguousClient,
+                    sdk: Some(sdk),
+                    file: self.file.clone(),
+                    span: Some(span),
+                    symbol: symbol.clone(),
+                    chain: Some(chain.clone()),
+                    key: None,
+                    reason: "litellm_provider".to_string(),
+                    detail: format!("`{chain}` is given `custom_llm_provider` (or `azure=True`), which picks the provider LiteLLM sends the request to in place of the model's name"),
+                    values: Vec::new(),
+                    values_complete: false,
+                    args: None,
                 });
             }
         }
@@ -8595,6 +9020,18 @@ impl<'t> Ctx<'t> {
             _ => "base_url",
         };
         if target.ambiguous {
+            // A chat model built by a class chosen at run time (see
+            // [`Origin::MixedClasses`]), or a call on a receiver assigned
+            // more than one way.
+            let detail = if target.receiver == Receiver::Client {
+                format!(
+                    "the receiver of `{chain}` is assigned more than one kind of client or a non-client value, so its routing depends on a runtime branch"
+                )
+            } else {
+                format!(
+                    "`{chain}` is bound to more than one class, or to a class and another value, so which chat model it builds, and its routing, depend on a runtime branch"
+                )
+            };
             self.out.gaps.push(UsageGap {
                 kind: GapKind::AmbiguousClient,
                 sdk: Some(sdk),
@@ -8604,11 +9041,10 @@ impl<'t> Ctx<'t> {
                 chain: Some(chain.clone()),
                 key: None,
                 reason: "multiple_assignments".to_string(),
-                detail: format!(
-                    "the receiver of `{chain}` is assigned more than one kind of client or a non-client value, so its routing depends on a runtime branch"
-                ),
+                detail,
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         } else if let Some(caveat) = &target.caveat {
             let (reason, detail) = match caveat {
@@ -8727,6 +9163,7 @@ impl<'t> Ctx<'t> {
                 detail,
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         } else if let Some(feature) = self.file_dynamic {
             // Anything in this file may be rebound, the receiver and the
@@ -8746,6 +9183,7 @@ impl<'t> Ctx<'t> {
                 ),
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         }
 
@@ -8765,9 +9203,10 @@ impl<'t> Ctx<'t> {
             }
         }
 
+        let spreads = self.spreads(&args, scope);
         self.out.calls.push(SdkCall {
             sdk,
-            package: target.pkg.package().to_string(),
+            package: pkg.package().to_string(),
             chain,
             request,
             member,
@@ -8777,6 +9216,7 @@ impl<'t> Ctx<'t> {
             file: self.file.clone(),
             span,
             symbol,
+            spreads,
             kwargs: args.kwargs,
             positional: args.positional,
             splat: args.splat,
@@ -8875,6 +9315,7 @@ impl<'t> Ctx<'t> {
                 ),
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         }
     }
@@ -8898,6 +9339,9 @@ impl<'t> Ctx<'t> {
             ),
             _ if unresolved.reason == "splat" => {
                 format!("`{key}` for `{chain}` is not passed by name and may come from `**kwargs`")
+            }
+            _ if unresolved.reason == "missing_model" && !shape.is_empty() => {
+                format!("`{key}` for `{chain}` is not passed, so {shape} applies")
             }
             _ if unresolved.reason == "missing_model" => {
                 format!("`{key}` for `{chain}` is not passed, so the SDK or server default applies")
@@ -8985,6 +9429,7 @@ impl<'t> Ctx<'t> {
             reason: unresolved.reason.to_string(),
             detail,
             values_complete: complete && !values.is_empty(),
+            args: None,
             values,
         });
     }
@@ -9044,6 +9489,7 @@ impl<'t> Ctx<'t> {
             ),
             values: Vec::new(),
             values_complete: false,
+            args: None,
         });
     }
 
@@ -9125,6 +9571,7 @@ impl<'t> Ctx<'t> {
                 values.push(captured(key, resolved, false));
             }
         }
+        let spreads = self.spreads(&args, scope);
         self.out.gaps.push(UsageGap {
             kind: GapKind::UnknownClientFactory,
             sdk: Some(sdk),
@@ -9137,6 +9584,13 @@ impl<'t> Ctx<'t> {
             detail,
             values,
             values_complete: false,
+            // The arguments are known even when the client is not: the
+            // retirement check applies its argument rules to them.
+            args: Some(CallArgs {
+                spreads,
+                kwargs: args.kwargs,
+                splat: args.splat,
+            }),
         });
     }
 
@@ -9171,6 +9625,7 @@ impl<'t> Ctx<'t> {
             ),
             values: Vec::new(),
             values_complete: false,
+            args: None,
         });
     }
 
@@ -9328,10 +9783,17 @@ impl<'t> Ctx<'t> {
                         if overridden {
                             read.overridden.push(path);
                         } else if let Ok(resolved) = self.resolve_value(value, place.scope, 0) {
+                            let beside = LITELLM_FALLBACK_OPTIONS
+                                .iter()
+                                .find(|option| {
+                                    **option != key && summary.last.contains_key(**option)
+                                })
+                                .copied();
                             read.found.push(NestedValue {
                                 path,
                                 positional: place.positional,
                                 resolved,
+                                beside,
                             });
                         }
                     } else if is_container(value) {
@@ -10424,6 +10886,53 @@ impl<'t> Ctx<'t> {
         })
     }
 
+    /// What each `**` expression of a call is: its name, and the argument
+    /// names it sends when it is a same-file dict literal (read through the
+    /// same summary as [`Self::expand_splat`], so each dict is read once).
+    /// Names only: a value is never recorded.
+    fn spreads(&mut self, args: &Args<'t>, scope: usize) -> Vec<Spread> {
+        let mut out = Vec::new();
+        for splat in &args.splats {
+            let name = self.spread_name(*splat);
+            let Some(expansion) = self.expand_splat(*splat, scope) else {
+                out.push(Spread {
+                    name,
+                    keys: Vec::new(),
+                    complete: false,
+                });
+                continue;
+            };
+            // Read once per dict: a large dict spread into many calls costs
+            // at most [`MAX_SPREAD_KEYS`] names per call. A dict with more
+            // keys than that, or with a key it does not record, is one Arbor
+            // could not read in full.
+            let summary = &expansion.summary;
+            out.push(Spread {
+                name,
+                keys: summary.keys.clone(),
+                complete: !expansion.opaque() && !summary.keys_missing,
+            });
+        }
+        out
+    }
+
+    /// The name of a `**` expression as written, values elided (`PARAMS`,
+    /// `self.options`, `config[...]`), or `None` when it has none (a dict
+    /// written inline, a conditional) or a part of it is credential-named.
+    fn spread_name(&self, expr: Node<'t>) -> Option<String> {
+        if !matches!(
+            expr.kind(),
+            "identifier" | "attribute" | "subscript" | "call"
+        ) {
+            return None;
+        }
+        let name = self.render(expr);
+        let secret = name
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(is_secret_key);
+        (!secret && !name.contains("<expr>")).then_some(name)
+    }
+
     /// Looks `key` up in a dict literal: the last matching entry wins, as in
     /// Python, unless an unreadable entry after it could override it.
     fn dict_lookup(&mut self, dict: Node<'t>, key: &str) -> Lookup<'t> {
@@ -10436,6 +10945,61 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// Whether `value`, a dict a LangChain chat model takes its model from
+    /// (a copy's `update`, or `model_kwargs` or `extra_body` written after
+    /// it is built), may hold one of `keys`. `None`, written there or bound
+    /// to a name assigned once, does not, nor does a dict literal
+    /// [`Self::dict_node`] reads that has none of them; anything else may.
+    fn may_hold_keys(&mut self, value: Node<'t>, scope: usize, keys: &[&str]) -> bool {
+        if self.is_none_value(value, scope) {
+            return false;
+        }
+        match self.dict_node(value, scope, 0) {
+            Some(dict) => keys
+                .iter()
+                .any(|key| !matches!(self.dict_lookup(dict.node, key), Lookup::Absent)),
+            None => true,
+        }
+    }
+
+    /// Whether a copy's `update` may set the model the copy sends: it may
+    /// name the model field (by either name), or give `model_kwargs` or
+    /// `extra_body` a value that may hold a `model`, which is sent over it
+    /// (the rule of a write of those fields, [`Self::sent_over_write`]).
+    fn update_may_set_model(&mut self, update: Node<'t>, scope: usize) -> bool {
+        if self.is_none_value(update, scope) {
+            return false;
+        }
+        let Some(dict) = self.dict_node(update, scope, 0) else {
+            return true;
+        };
+        LANGCHAIN_MODEL_FIELDS
+            .iter()
+            .any(|field| match self.dict_lookup(dict.node, field) {
+                Lookup::Absent => false,
+                Lookup::Found(value) if LANGCHAIN_SENT_OVER.contains(field) => {
+                    self.may_hold_keys(value, dict.scope, &["model"])
+                }
+                _ => true,
+            })
+    }
+
+    /// `None`, written there or through a name assigned once, to `None`.
+    fn is_none_value(&mut self, value: Node<'t>, scope: usize) -> bool {
+        match value.kind() {
+            "none" => true,
+            "identifier" => {
+                let (key, defs) = self.defs_at(self.text(value), scope, value.start_byte());
+                let only = defs
+                    .only_assign
+                    .filter(|_| !defs.param && !defs.imported && defs.assigns == 1)
+                    .and_then(|i| self.assigns.get(&key)?.get(i).copied());
+                only.is_some_and(|a| !a.unknowable && a.value.is_some_and(|v| v.kind() == "none"))
+            }
+            _ => false,
+        }
+    }
+
     fn dict_summary(&mut self, dict: Node<'t>) -> Rc<DictSummary<'t>> {
         if let Some(summary) = self.dict_cache.get(&dict.id()) {
             return Rc::clone(summary);
@@ -10445,6 +11009,8 @@ impl<'t> Ctx<'t> {
             last_unknown: None,
             expansion: Vec::new(),
             opaque: false,
+            keys: Vec::new(),
+            keys_missing: false,
         };
         let entries = dict_entries(dict, |n| self.literal(n).ok(), |n| self.text(n));
         for (index, entry) in entries.into_iter().enumerate() {
@@ -10468,6 +11034,17 @@ impl<'t> Ctx<'t> {
                     summary.expansion.push((key.clone(), index, value));
                 } else {
                     summary.opaque = true;
+                }
+            }
+            // Every key is an argument the expansion sends, whatever it is
+            // called: `max_tokens` must be checked like the call's own
+            // `max_tokens=`. A key that is not recorded leaves the dict
+            // unread in full, so the call never reads as fully checked.
+            if !summary.last.contains_key(&key) {
+                if !is_argument_name(&key) || summary.keys.len() >= MAX_SPREAD_KEYS {
+                    summary.keys_missing = true;
+                } else {
+                    summary.keys.push(key.clone());
                 }
             }
             summary.last.insert(key, (index, value));
@@ -11224,12 +11801,40 @@ fn combine(vals: Vec<Val>) -> Val {
         })
         .collect();
     if let Some(first) = classes.first() {
+        // `try: from langchain_openai import ChatOpenAI` / `except
+        // ImportError: from langchain_community.chat_models import
+        // ChatOpenAI`: one LangChain chat model, whichever package gives it.
+        // A deprecated copy that reads the module-level OpenAI configuration
+        // ([`Pkg::reads_module_config`]) stands for them all: it routes like
+        // the others unless the file configures that API, where its gap is
+        // the conservative result.
+        let one_chat_model = classes.len() == real.len()
+            && classes.iter().all(|c| {
+                c.pkg.is_langchain()
+                    && c.pkg.sdk() == first.pkg.sdk()
+                    && c.name == first.name
+                    && c.family == first.family
+            });
+        if one_chat_model {
+            let class = classes
+                .iter()
+                .find(|c| c.pkg.reads_module_config())
+                .unwrap_or(first);
+            return Val::Class(*class);
+        }
         if classes.len() < real.len()
             || classes
                 .iter()
                 .any(|c| c.pkg != first.pkg || c.family != first.family)
         {
-            return Val::untracked(Origin::MixedClasses(first.pkg));
+            // A chat model that takes a model first, so one built with none
+            // keeps its `missing_model` gap.
+            let chat_model = classes
+                .iter()
+                .filter(|c| c.pkg.is_langchain())
+                .min_by_key(|c| !is_model_bearing(c.name))
+                .copied();
+            return Val::untracked(Origin::MixedClasses(first.pkg, chat_model));
         }
     }
 

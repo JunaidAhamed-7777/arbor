@@ -879,6 +879,291 @@ shared.chat.completions.create(model="gpt-4", messages=[])
 }
 
 #[test]
+fn an_unresolved_client_call_keeps_its_argument_names() {
+    // #290: a package's subclass of `openai.OpenAI`, exported under the same
+    // name. The client is not resolved, but the retirement check needs the
+    // call's argument names (`temperature`, `tools`, `max_tokens`).
+    let found = usages(
+        r#"
+from tracing_sdk.ai.openai import OpenAI
+
+def explain(report):
+    return OpenAI(tracker=None).chat.completions.create(
+        model="gpt-4.1-2025-04-14",
+        temperature=0.1,
+        messages=[{"role": "user", "content": report}],
+    )
+
+def passthrough(text, **options):
+    return OpenAI(tracker=None).chat.completions.create(model="gpt-4o-mini", messages=[], **options)
+"#,
+    );
+    let unknown = gaps(&found, GapKind::UnknownClientFactory);
+    assert_eq!(unknown.len(), 2, "{unknown:#?}");
+    let explain = unknown[0].args.as_ref().expect("arguments recorded");
+    assert_eq!(explain.kwargs, ["model", "temperature", "messages"]);
+    assert!(!explain.splat);
+    let passthrough = unknown[1].args.as_ref().expect("arguments recorded");
+    assert_eq!(passthrough.kwargs, ["model", "messages"]);
+    assert!(passthrough.splat);
+    // Names only: never an argument's value.
+    let json = serde_json::to_string(&found).unwrap();
+    assert!(
+        json.contains(r#""args":{"kwargs":["model","temperature","messages"]}"#),
+        "{json}"
+    );
+    assert!(!json.contains("0.1"), "{json}");
+    // Other gaps record no arguments.
+    assert!(found
+        .gaps
+        .iter()
+        .filter(|g| g.kind != GapKind::UnknownClientFactory)
+        .all(|g| g.args.is_none()));
+}
+
+#[test]
+fn a_spread_is_named_and_a_same_file_dict_is_read() {
+    // #291 round 3: `**PARAMS` read "could not check the arguments from
+    // **kwargs", although PARAMS is a dict literal in the same file.
+    let found = usages(
+        r#"
+from openai import OpenAI
+from tracing_sdk.ai.openai import OpenAI as Traced
+
+client = OpenAI()
+traced = Traced(tracker=None)
+PARAMS = {"model": "gpt-4o-mini", "temperature": 0.1}
+OPEN = {"temperature": 0.2, **EXTRA}
+SECRET_OPTIONS = {"model": "gpt-4o-mini"}
+
+def from_params(messages):
+    return client.chat.completions.create(messages=messages, **PARAMS)
+
+def inline(messages):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, **{"top_p": 0.5})
+
+def open_dict(messages):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, **OPEN)
+
+def forwarded(messages, settings, **kwargs):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, **settings.llm, **kwargs)
+
+def conditional(messages, tools=None):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, **({"tools": tools} if tools else {}))
+
+def credential_named(messages):
+    return client.chat.completions.create(messages=messages, **SECRET_OPTIONS)
+
+def wrapped(messages):
+    return traced.chat.completions.create(messages=messages, **PARAMS)
+"#,
+    );
+    let spreads_of = |line: u32| -> Vec<(Option<String>, Vec<String>, bool)> {
+        found
+            .calls
+            .iter()
+            .find(|c| c.span.line == line)
+            .map(|c| c.spreads.clone())
+            .or_else(|| {
+                found
+                    .gaps
+                    .iter()
+                    .find(|g| g.span.is_some_and(|s| s.line == line) && g.args.is_some())
+                    .map(|g| g.args.clone().unwrap().spreads)
+            })
+            .unwrap_or_else(|| panic!("no call on line {line}: {found:#?}"))
+            .into_iter()
+            .map(|s| (s.name, s.keys, s.complete))
+            .collect()
+    };
+    let owned = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+
+    // A same-file literal: every key, in order, and complete.
+    assert_eq!(
+        spreads_of(12),
+        [(
+            Some("PARAMS".into()),
+            owned(&["model", "temperature"]),
+            true
+        )]
+    );
+    // Inline: no name, but read.
+    assert_eq!(spreads_of(15), [(None, owned(&["top_p"]), true)]);
+    // A dict that spreads another: its own keys are sent, the rest unseen.
+    assert_eq!(
+        spreads_of(18),
+        [(Some("OPEN".into()), owned(&["temperature"]), false)]
+    );
+    // Not a same-file literal: named only.
+    assert_eq!(
+        spreads_of(21),
+        [
+            (Some("settings.llm".into()), Vec::new(), false),
+            (Some("kwargs".into()), Vec::new(), false),
+        ]
+    );
+    // A conditional is read as neither.
+    assert_eq!(spreads_of(24), [(None, Vec::new(), false)]);
+    // A credential-shaped name is never repeated, and its dict never read.
+    assert_eq!(spreads_of(27), [(None, Vec::new(), false)]);
+    // A wrapped client's call records them too.
+    assert_eq!(
+        spreads_of(30),
+        [(
+            Some("PARAMS".into()),
+            owned(&["model", "temperature"]),
+            true
+        )]
+    );
+
+    // Names only: never a value.
+    let json = serde_json::to_string(&found).unwrap();
+    assert!(
+        json.contains(
+            r#""spreads":[{"name":"PARAMS","keys":["model","temperature"],"complete":true}]"#
+        ),
+        "{json}"
+    );
+    for value in ["0.1", "0.2", "0.5"] {
+        assert!(!json.contains(value), "{value} in {json}");
+    }
+    // A call that spreads nothing has no `spreads`.
+    let plain = usages(
+        "from openai import OpenAI\nclient = OpenAI()\nclient.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+    );
+    assert!(!serde_json::to_string(&plain).unwrap().contains("spreads"));
+}
+
+/// The `(name, keys, complete)` of each `**` expression of the call on
+/// `line`.
+fn spreads_on(found: &FileUsages, line: u32) -> Vec<(Option<String>, Vec<String>, bool)> {
+    found
+        .calls
+        .iter()
+        .find(|c| c.span.line == line)
+        .unwrap_or_else(|| panic!("no call on line {line}: {found:#?}"))
+        .spreads
+        .iter()
+        .map(|s| (s.name.clone(), s.keys.clone(), s.complete))
+        .collect()
+}
+
+#[test]
+fn a_spread_dict_key_is_recorded_whatever_it_is_called() {
+    // #291 round 3 review: `max_tokens` holds "token", so the secret-name
+    // filter dropped it from `keys` while the dict still read as complete:
+    // the call lost its max_tokens -> max_completion_tokens rename.
+    let found = usages(
+        r#"
+from openai import OpenAI
+
+client = OpenAI()
+GEN = {"temperature": 0.2, "max_tokens": 512, "api_key": KEY}
+ODD = {"max-tokens": 5}
+SHAPED = {"sk_live_51Habcdefghijklmnop": 1, "top_p": 0.5}
+
+def gen(messages):
+    return client.chat.completions.create(model="gpt-4o", messages=messages, **GEN)
+
+def inline(messages):
+    return client.chat.completions.create(model="gpt-4o", messages=messages, **{"max_tokens": 50})
+
+def odd(messages):
+    return client.chat.completions.create(model="gpt-4o", messages=messages, **ODD)
+
+def shaped(messages):
+    return client.chat.completions.create(model="gpt-4o", messages=messages, **SHAPED)
+"#,
+    );
+    let owned = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+    // Secret-sounding names are argument names: listed, and complete.
+    assert_eq!(
+        spreads_on(&found, 10),
+        [(
+            Some("GEN".into()),
+            owned(&["temperature", "max_tokens", "api_key"]),
+            true
+        )]
+    );
+    assert_eq!(
+        spreads_on(&found, 13),
+        [(None, owned(&["max_tokens"]), true)]
+    );
+    // A key that is not an identifier is not recorded: the dict is not
+    // read in full.
+    assert_eq!(
+        spreads_on(&found, 16),
+        [(Some("ODD".into()), Vec::new(), false)]
+    );
+    // Nor is a credential-shaped one, which is never repeated.
+    assert_eq!(
+        spreads_on(&found, 19),
+        [(Some("SHAPED".into()), owned(&["top_p"]), false)]
+    );
+    let json = serde_json::to_string(&found).unwrap();
+    assert!(!json.contains("sk_live"), "{json}");
+    for value in ["0.2", "512", "KEY", "0.5"] {
+        assert!(!json.contains(value), "{value} in {json}");
+    }
+}
+
+#[test]
+fn a_spread_dict_changed_after_it_is_built_is_not_complete() {
+    // #291 round 3 review: "(no change)" relies on `complete`, so a dict
+    // that is changed or passed on in its file must never be complete.
+    let found = usages(
+        r#"
+from openai import OpenAI
+
+client = OpenAI()
+
+def subscript(messages):
+    p = {"messages": messages}
+    p["temperature"] = 0.2
+    return client.chat.completions.create(model="gpt-4o", **p)
+
+def update(messages):
+    p = {"messages": messages}
+    p.update(temperature=0.2)
+    return client.chat.completions.create(model="gpt-4o", **p)
+
+def merged(messages):
+    p = {"messages": messages}
+    p |= {"temperature": 0.2}
+    return client.chat.completions.create(model="gpt-4o", **p)
+
+def passed(messages, helper):
+    p = {"messages": messages}
+    helper(p)
+    return client.chat.completions.create(model="gpt-4o", **p)
+
+def aliased(messages):
+    p = {"messages": messages}
+    q = p
+    q["temperature"] = 0.2
+    return client.chat.completions.create(model="gpt-4o", **p)
+
+def untouched(messages):
+    kept = {"messages": messages}
+    return client.chat.completions.create(model="gpt-4o", **kept)
+"#,
+    );
+    for line in [9, 14, 19, 24, 30] {
+        let spreads = spreads_on(&found, line);
+        assert_eq!(spreads.len(), 1, "line {line}: {spreads:?}");
+        let (name, _, complete) = &spreads[0];
+        assert_eq!(name.as_deref(), Some("p"), "line {line}");
+        assert!(!complete, "line {line}: a changed dict read as complete");
+    }
+    // A dict nothing changes is read. (A name changed anywhere in the file
+    // counts as changed everywhere in it, so this one has its own name.)
+    assert_eq!(
+        spreads_on(&found, 34),
+        [(Some("kept".into()), vec!["messages".to_string()], true)]
+    );
+}
+
+#[test]
 fn messages_create_counts_only_where_anthropic_is_imported() {
     let twilio = usages(
         r#"
@@ -6815,6 +7100,27 @@ chosen.converse(modelId="amazon.titan-text-lite-v1", messages=[])
     assert_eq!(unknown[1].values[0].key, "modelId");
     assert_eq!(unknown[1].values[0].value, "amazon.titan-text-lite-v1");
 
+    // A session given its own botocore session, or a `**` expansion, is
+    // not followed: calls on its clients are Bedrock-shaped gaps.
+    let found = usages(
+        r#"
+import boto3
+custom = boto3.Session(botocore_session=bs)
+custom.client("bedrock-runtime").converse(modelId="amazon.nova-pro-v1:0", messages=[])
+spread = boto3.Session(**cfg)
+spread.client("bedrock-runtime").converse(modelId="amazon.nova-pro-v1:0", messages=[])
+"#,
+    );
+    assert!(found.clients.is_empty(), "{:?}", found.clients);
+    assert!(found.calls.is_empty(), "{:?}", found.calls);
+    for line in [4, 6] {
+        assert_eq!(
+            gaps_on(&found, line),
+            vec!["unknown_client_factory/sdk_call_result".to_string()],
+            "{line}"
+        );
+    }
+
     // Without a boto3 import, `converse` is not taken for Bedrock's.
     let found = usages(
         "from chatkit import bot\nimport openai\n\ndef run(agent):\n    agent.converse(modelId=\"x\")\n",
@@ -7119,6 +7425,31 @@ llm.invoke("hi", model="amazon.nova-lite-v1:0")
     assert!(call_on(&found, 13).values.is_empty());
     assert!(gaps_on(&found, 13).is_empty());
 
+    // A call's two spellings are folded into one `modelId`, the later one
+    // winning: given both, or one next to an opaque `**`, the call's model
+    // is not confirmed.
+    let found = usages(
+        r#"
+from langchain_aws import ChatBedrockConverse
+llm = ChatBedrockConverse(model_id="amazon.nova-pro-v1:0")
+llm.invoke("hi", model_id="amazon.nova-lite-v1:0", modelId="amazon.nova-micro-v1:0")
+llm.invoke("hi", modelId="amazon.nova-lite-v1:0", **options)
+"#,
+    );
+    assert_eq!(
+        gaps_on(&found, 4),
+        vec!["unresolved_model/reassigned".to_string()]
+    );
+    assert_eq!(
+        gaps_on(&found, 5),
+        vec!["unresolved_model/splat".to_string()]
+    );
+    let splat = gaps(&found, GapKind::UnresolvedModel)
+        .into_iter()
+        .find(|g| g.span.unwrap().line == 5)
+        .unwrap();
+    assert_eq!(splat.key.as_deref(), Some("modelId"));
+
     // Its requests read `model_id` when they are sent.
     let found = usages(
         "from langchain_aws import ChatBedrock\nllm = ChatBedrock(model_id=\"amazon.nova-pro-v1:0\")\nllm.model_id = pick()\n",
@@ -7239,6 +7570,105 @@ litellm.completion(model="gpt-4o", messages=[])
         "{:?}",
         found.gaps
     );
+
+    // `deployment_id`, by keyword or in a same-file dict, replaces the
+    // model (and sends it to Azure); `engine` and `model_name` are no
+    // parameters of `completion`.
+    let found = usages(
+        r#"
+import litellm
+AZURE = {"deployment_id": "chat-prod"}
+litellm.completion(model="gpt-3.5-turbo", deployment_id="chat-prod", messages=[])
+litellm.completion(model="gpt-3.5-turbo", messages=[], **AZURE)
+litellm.completion(model="gpt-4o", engine="x", model_name="y", messages=[])
+"#,
+    );
+    let keyed = call_on(&found, 4);
+    assert_eq!(value(keyed, "model"), Some("gpt-3.5-turbo"));
+    assert_eq!(value(keyed, "deployment_id"), Some("chat-prod"));
+    for line in [4, 5] {
+        let replaced: Vec<&UsageGap> = found
+            .gaps
+            .iter()
+            .filter(|g| g.span.is_some_and(|s| s.line == line))
+            .collect();
+        assert_eq!(replaced.len(), 1, "{line}: {replaced:?}");
+        assert_eq!(replaced[0].reason, "deployment_id");
+        assert_eq!(replaced[0].key.as_deref(), Some("model"));
+    }
+    let keys: Vec<&str> = call_on(&found, 6)
+        .values
+        .iter()
+        .map(|v| v.key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["model"]);
+    assert!(gaps_on(&found, 6).is_empty());
+
+    // The `deployment_id` is sent in place of every fallback too; a
+    // fallback's own `deployment_id` or provider decides that fallback; a
+    // `prompt_id` may name another model; `custom_llm_provider` (or
+    // `azure=True`) picks the provider; a positional model next to a
+    // `deployment_id` is still read.
+    let found = usages(
+        r#"
+import litellm
+litellm.completion(model="gpt-4o", deployment_id="chat-prod", fallbacks=[{"model": "gpt-3.5-turbo-0613"}], messages=[])
+litellm.completion(model="gpt-4o", fallbacks=[{"model": "gpt-3.5-turbo-0613", "deployment_id": "chat-old"}, {"model": "gemini-3.7-flash", "custom_llm_provider": "gemini"}], messages=[])
+litellm.completion(model="gpt-3.5-turbo-0613", prompt_id="welcome", messages=[])
+litellm.completion(model="gemini-3.7-flash", custom_llm_provider="gemini", messages=[])
+litellm.completion(model="gpt-4o", azure=True, messages=[])
+litellm.completion("gpt-3.5-turbo-0613", [], deployment_id="chat-prod")
+"#,
+    );
+    let gap_keys = |line: u32| -> Vec<(String, String)> {
+        let mut found: Vec<(String, String)> = found
+            .gaps
+            .iter()
+            .filter(|g| g.span.is_some_and(|s| s.line == line))
+            .map(|g| {
+                (
+                    format!("{}/{}", g.kind.as_str(), g.reason),
+                    g.key.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        found.sort();
+        found
+    };
+    let pair = |gap: &str, key: &str| (gap.to_string(), key.to_string());
+    assert_eq!(
+        gap_keys(3),
+        vec![
+            pair("unresolved_model/deployment_id", "fallbacks.model"),
+            pair("unresolved_model/deployment_id", "model"),
+        ]
+    );
+    assert_eq!(
+        value(call_on(&found, 3), "deployment_id"),
+        Some("chat-prod")
+    );
+    assert_eq!(
+        gap_keys(4),
+        vec![
+            pair("unresolved_model/deployment_id", "fallbacks.model"),
+            pair("unresolved_model/litellm_provider", "fallbacks.model"),
+        ]
+    );
+    assert_eq!(gap_keys(5), vec![pair("unresolved_model/prompt_id", "")]);
+    for line in [6, 7] {
+        assert_eq!(
+            gap_keys(line),
+            vec![pair("ambiguous_client/litellm_provider", "")],
+            "{line}"
+        );
+    }
+    let positional = call_on(&found, 8);
+    assert_eq!(value(positional, "model"), Some("gpt-3.5-turbo-0613"));
+    assert_eq!(value(positional, "deployment_id"), Some("chat-prod"));
+    assert_eq!(
+        gap_keys(8),
+        vec![pair("unresolved_model/deployment_id", "model")]
+    );
 }
 
 #[test]
@@ -7291,6 +7721,11 @@ fn bedrock_and_litellm_members_replaced_or_hooked_are_dynamic() {
         ("atexit.register(cleanup)", false),
         ("admin.site.register(Model)", false),
         ("codecs.register(\"search\")", false),
+        // An event name held in a same-file constant.
+        (
+            "EVENT = \"before-call.bedrock-runtime.Converse\"; boto3.Session()._session.register(EVENT, hook)",
+            true,
+        ),
     ] {
         let source = format!(
             "import atexit\nimport boto3\nimport botocore.session\n{setup}\nclient = boto3.client(\"bedrock-runtime\")\nclient.converse(modelId=\"amazon.nova-pro-v1:0\", messages=[])\n"
@@ -7336,6 +7771,671 @@ fn bedrock_and_litellm_files_pass_the_prefilter() {
     assert!(!may_use_sdk(
         "import boto3\ns3 = boto3.client(\"s3\")\ns3.put_object(Bucket=\"b\", Key=\"k\", Body=b\"\")\n"
     ));
+}
+
+#[test]
+fn langchain_calls_on_a_chat_model_may_pass_their_own_model() {
+    // LangChain sends a call's kwargs over the model's own parameters, so
+    // a `**` expansion the file cannot read may hold the model it sends.
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+
+llm = ChatOpenAI(model="gpt-4.1")
+claude = ChatAnthropic(model="claude-sonnet-5-5")
+OPTS = {"stop": ["\n"]}
+
+def ask(q, **kwargs):
+    return llm.invoke(q, **kwargs)
+
+def tools(params):
+    return claude.bind(**params)
+
+async def later(qs, **opts):
+    await llm.abatch(qs, **opts)
+
+llm.batch(["a"], **OPTS)
+llm.invoke("hi", model="gpt-3.5-turbo-0301")
+"#,
+    );
+    for line in [10, 13, 16] {
+        let splat: Vec<&UsageGap> = found
+            .gaps
+            .iter()
+            .filter(|g| g.span.unwrap().line == line)
+            .collect();
+        assert_eq!(splat.len(), 1, "line {line}: {:?}", found.gaps);
+        assert_eq!(splat[0].kind, GapKind::UnresolvedModel);
+        assert_eq!(splat[0].reason, "splat");
+        assert_eq!(splat[0].key.as_deref(), Some("model"));
+    }
+    // A same-file dict with no model in it hides nothing.
+    assert!(gaps_on(&found, 18).is_empty(), "{:?}", found.gaps);
+    assert_eq!(
+        value(call_on(&found, 19), "model"),
+        Some("gpt-3.5-turbo-0301")
+    );
+    // The constructors keep their own values, with no gap.
+    assert_eq!(value(call_on(&found, 5), "model"), Some("gpt-4.1"));
+    assert_eq!(
+        value(call_on(&found, 6), "model"),
+        Some("claude-sonnet-5-5")
+    );
+    assert!(gaps_on(&found, 5).is_empty() && gaps_on(&found, 6).is_empty());
+}
+
+/// Every `(line, key, value)` the calls of `found` carry.
+fn model_values(found: &FileUsages) -> Vec<(u32, &str, &str)> {
+    found
+        .calls
+        .iter()
+        .flat_map(|c| {
+            c.values
+                .iter()
+                .map(move |v| (c.span.line, v.key.as_str(), v.value.as_str()))
+        })
+        .collect()
+}
+
+#[test]
+fn langchain_run_options_in_an_expanded_dict_are_not_read() {
+    // Run options never reach the request, whether written at the call or
+    // in a same-file dict expanded with `**`.
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI
+
+LLM_KWARGS = {"model": "gpt-6-luna", "metadata": {"model": "gpt-3.5-turbo-0301"}}
+RUN = {"config": {"configurable": {"model": "gpt-4"}}, "tags": [{"model": "gpt-4-0613"}]}
+REPLACED = {"metadata": {"model": "gpt-4-0314"}, **extra}
+llm = ChatOpenAI(**LLM_KWARGS)
+llm.invoke("hi", **RUN)
+llm.invoke("hi", **REPLACED)
+"#,
+    );
+    assert_eq!(model_values(&found), vec![(7, "model", "gpt-6-luna")]);
+    // What `**extra` holds may still be the call's own model; the run
+    // option's model it may replace is no gap. (A client built from a `**`
+    // dict has a `base_url_unresolved` route, as an SDK client does.)
+    let model_gaps: Vec<(u32, &str, Option<&str>)> = found
+        .gaps
+        .iter()
+        .filter(|g| g.kind == GapKind::UnresolvedModel)
+        .map(|g| (g.span.unwrap().line, g.reason.as_str(), g.key.as_deref()))
+        .collect();
+    assert_eq!(model_gaps, vec![(9, "splat", Some("model"))]);
+}
+
+#[test]
+fn a_langchain_copy_that_may_change_its_model_is_a_gap() {
+    // `copy` and `model_copy` set fields by their own names, without
+    // LangChain's aliases, and the copy is not followed: `update` is never
+    // a value, and one that may name the model is a gap.
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+
+llm = ChatOpenAI(model="gpt-6-luna")
+claude = ChatAnthropic(model="claude-sonnet-5-5")
+UPDATE = {"model_name": "gpt-4-0613"}
+legacy = llm.copy(update={"model": "gpt-3.5-turbo-0301"})
+older = claude.model_copy(update={"model_name": "claude-2.1"})
+named = llm.copy(update=UPDATE)
+unknown = llm.model_copy(update=choose())
+cooler = llm.copy(update={"temperature": 0})
+plain = llm.copy(deep=True)
+"#,
+    );
+    assert_eq!(
+        model_values(&found),
+        vec![
+            (5, "model", "gpt-6-luna"),
+            (6, "model", "claude-sonnet-5-5")
+        ]
+    );
+    for line in [8, 9, 10, 11] {
+        assert_eq!(
+            gaps_on(&found, line),
+            vec!["unresolved_model/langchain_copy".to_string()],
+            "line {line}"
+        );
+    }
+    let copied = found
+        .gaps
+        .iter()
+        .find(|g| g.reason == "langchain_copy")
+        .unwrap();
+    assert_eq!(copied.key.as_deref(), Some("model"));
+    for line in [12, 13] {
+        assert!(
+            gaps_on(&found, line).is_empty(),
+            "line {line}: {:?}",
+            found.gaps
+        );
+    }
+}
+
+#[test]
+fn langchain_calls_are_not_requests_and_name_langchain_in_their_gaps() {
+    // Every call on a chat model is recorded the same way, whatever its
+    // method is called.
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(model="gpt-6-luna")
+llm.invoke("hi")
+llm.stream("hi")
+llm.generate([["hi"]])
+"#,
+    );
+    for line in [4, 5, 6, 7] {
+        assert!(!call_on(&found, line).request, "line {line}");
+    }
+
+    // No model is LangChain's default, and a write of `model` elsewhere
+    // adds nothing to that gap; an Azure deployment gets none.
+    let found = usages(
+        "from langchain_openai import ChatOpenAI, AzureChatOpenAI\nllm = ChatOpenAI()\nazure = AzureChatOpenAI(azure_deployment=\"prod\")\nsettings.model = choose()\n",
+    );
+    assert_eq!(
+        gaps_on(&found, 2),
+        vec!["unresolved_model/missing_model".to_string()]
+    );
+    let missing = found
+        .gaps
+        .iter()
+        .find(|g| g.reason == "missing_model")
+        .unwrap();
+    assert!(
+        missing.detail.contains("LangChain's default model"),
+        "{}",
+        missing.detail
+    );
+    assert!(gaps_on(&found, 3).is_empty(), "{:?}", found.gaps);
+
+    // A replaced member of the SDK a chat model builds its client from.
+    for (patch, class, gapped) in [
+        ("openai.OpenAI = Recorder", "ChatOpenAI", true),
+        (
+            "openai.resources.chat.Completions.create = record",
+            "ChatOpenAI",
+            true,
+        ),
+        ("anthropic.Anthropic = Recorder", "ChatAnthropic", true),
+        ("anthropic.Anthropic = Recorder", "ChatOpenAI", false),
+    ] {
+        let source = format!(
+            "import openai, anthropic\nfrom langchain_openai import ChatOpenAI\nfrom langchain_anthropic import ChatAnthropic\n{patch}\nllm = {class}(model=\"m\")\nllm.invoke(\"hi\")\n"
+        );
+        let found = usages(&source);
+        let expected: Vec<String> = if gapped {
+            vec!["ambiguous_client/dynamic_feature".to_string()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(gaps_on(&found, 5), expected, "{patch} / {class}");
+        assert_eq!(gaps_on(&found, 6), expected, "{patch} / {class}");
+    }
+
+    // `model_kwargs` and `extra_body` are sent over the model field: a
+    // write whose value may hold a `model` may change it.
+    for write in [
+        "llm.model_kwargs = extra",
+        "llm.extra_body = {\"model\": \"m2\"}",
+        "llm.model_kwargs = {**BASE, \"seed\": 1}",
+        "args.model_kwargs = json.loads(args.model_kwargs)",
+        "llm.model_kwargs |= {\"seed\": 1}",
+        "KW = {\"seed\": 1}\nKW[\"model\"] = \"m2\"\nllm.model_kwargs = KW",
+        // A write through a borrowed `self`, whose value is not read.
+        "class Mixin:\n    def json_mode(self):\n        self.model_kwargs = {\"seed\": 1}\nclass Other:\n    go = Mixin.json_mode\nllm.model_kwargs = {\"seed\": 1}",
+    ] {
+        let source = format!(
+            "from langchain_openai import ChatOpenAI\nllm = ChatOpenAI(model=\"gpt-6-luna\")\n{write}\n"
+        );
+        let found = usages(&source);
+        assert_eq!(
+            gaps_on(&found, 2),
+            vec!["unresolved_model/dynamic_feature".to_string()],
+            "{write}"
+        );
+    }
+    // One of `None`, or of a dict the file reads with no `model` key
+    // (JSON mode, another class's `model_kwargs`), keeps the model.
+    for write in [
+        "llm.model_kwargs = {\"response_format\": {\"type\": \"json_object\"}}",
+        "embeddings.model_kwargs = {\"device\": \"cpu\"}",
+        "llm.model_kwargs = dict(response_format={\"type\": \"json_object\"})",
+        "setattr(llm, \"extra_body\", {\"top_k\": 4})",
+        "llm.extra_body = None",
+        "NO_BODY = None\nllm.extra_body = NO_BODY",
+        "class Bot:\n    def __init__(self, llm):\n        self.llm = llm\n        self.llm.model_kwargs = {\"response_format\": {\"type\": \"json_object\"}}",
+    ] {
+        let source = format!(
+            "from langchain_openai import ChatOpenAI\nllm = ChatOpenAI(model=\"gpt-6-luna\")\n{write}\n"
+        );
+        let found = usages(&source);
+        assert_eq!(value(call_on(&found, 2), "model"), Some("gpt-6-luna"));
+        assert!(gaps_on(&found, 2).is_empty(), "{write}: {:?}", found.gaps);
+    }
+}
+
+#[test]
+fn a_langchain_copy_reads_its_update_wherever_the_file_gives_it() {
+    // An `update` from a same-file `**` dict is read like one written at
+    // the call. One that may give `model_kwargs` or `extra_body`, which are
+    // sent over the model field, a value that may hold a `model` may change
+    // the model too. An `update` held in a name is passed on to `copy`, so
+    // rule 5 does not read it, unless it is `None`.
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+
+llm = ChatOpenAI(model="gpt-6-luna")
+claude = ChatAnthropic(model="claude-sonnet-5-5")
+ARGS = {"update": {"model_name": "gpt-3.5-turbo-0301"}}
+COOL_ARGS = {"update": {"temperature": 0}, "deep": True}
+COOL = {"temperature": 0}
+UPDATE = {"model_name": "gpt-4-0613"}
+NOTHING = None
+legacy = llm.copy(**ARGS)
+cool = llm.copy(**COOL_ARGS)
+cooler = llm.copy(update=COOL)
+named = llm.copy(update=UPDATE)
+same = llm.copy(update=NOTHING)
+kwargs = llm.copy(update={"model_kwargs": {"model": "gpt-3.5-turbo-0301"}})
+body = llm.model_copy(update={"extra_body": {"model": "gpt-3.5-turbo-0301"}})
+older = claude.model_copy(update={"model_kwargs": {"model": "claude-2.1"}})
+CHANGED = {"temperature": 0}
+CHANGED["model_name"] = "gpt-3.5-turbo-0301"
+changed = llm.copy(update=CHANGED)
+
+def build(**opts):
+    return llm.copy(**opts)
+json_llm = llm.copy(update={"model_kwargs": {"response_format": {"type": "json_object"}}})
+seeded = llm.model_copy(update={"extra_body": {"seed": 1}})
+unset = llm.copy(update={"extra_body": None, "temperature": 0})
+merged = llm.copy(update={"model_kwargs": {**BASE}})
+chosen = llm.model_copy(update={"extra_body": pick()})
+"#,
+    );
+    assert_eq!(
+        model_values(&found),
+        vec![
+            (5, "model", "gpt-6-luna"),
+            (6, "model", "claude-sonnet-5-5")
+        ]
+    );
+    for line in [12, 14, 15, 17, 18, 19, 22, 29, 30] {
+        assert_eq!(
+            gaps_on(&found, line),
+            vec!["unresolved_model/langchain_copy".to_string()],
+            "line {line}"
+        );
+    }
+    // The same rule as a write of `model_kwargs` or `extra_body`: a value
+    // with no `model` keeps the model.
+    for line in [13, 16, 26, 27, 28] {
+        assert!(
+            gaps_on(&found, line).is_empty(),
+            "line {line}: {:?}",
+            found.gaps
+        );
+    }
+    // An `update` an opaque `**` may hold keeps its `splat` gap.
+    assert_eq!(
+        gaps_on(&found, 25),
+        vec!["unresolved_model/splat".to_string()]
+    );
+}
+
+#[test]
+fn a_dict_given_as_the_update_of_another_copy_is_passed_on() {
+    // Only a LangChain chat model's `copy` is known to read `update`: any
+    // other may change the dict, which is then not read (rule 5).
+    for (setup, copy) in [
+        (
+            "class Settings:\n    def copy(self, update):\n        update[\"model\"] = \"gpt-4o\"\n        return self\n",
+            "Settings().copy(update=PARAMS)",
+        ),
+        ("from mylib import registry\n", "registry.copy(update=PARAMS)"),
+        (
+            "from mylib import registry\n",
+            "registry.model_copy(update=PARAMS)",
+        ),
+        ("import helpers\n", "helpers.copy(update=PARAMS)"),
+    ] {
+        let source = format!(
+            "from openai import OpenAI\n{setup}client = OpenAI()\nPARAMS = {{\"model\": \"gpt-3.5-turbo-0301\", \"temperature\": 0}}\n{copy}\nclient.chat.completions.create(**PARAMS, messages=[])\n"
+        );
+        let found = usages(&source);
+        let create = call(&found, "client.chat.completions.create");
+        assert_eq!(value(create, "model"), None, "{copy}");
+        assert_eq!(
+            gaps_on(&found, create.span.line),
+            vec!["unresolved_model/splat".to_string()],
+            "{copy}"
+        );
+    }
+}
+
+#[test]
+fn a_rewritten_langchain_field_leaves_only_the_models_it_replaces_unconfirmed() {
+    // LangChain sends the model field, then `model_kwargs` over it, then
+    // `extra_body` over the request body. A write of a field replaces the
+    // models given in it; one of `model_kwargs` or `extra_body` whose value
+    // may hold a key replaces it in the fields sent before; a write of the
+    // model field leaves the models sent over it.
+    let gap = |key: &str| ("dynamic_feature".to_string(), Some(key.to_string()));
+    let missing = ("missing_model".to_string(), Some("model".to_string()));
+    for (write, body, kwargs, only) in [
+        (
+            "args.model = args.model or \"default\"",
+            vec![gap("model")],
+            vec![gap("model")],
+            vec![missing.clone()],
+        ),
+        (
+            "def reset(x, m):\n    x.model_name = m",
+            vec![gap("model")],
+            vec![gap("model")],
+            vec![missing.clone()],
+        ),
+        (
+            "other.extra_body = {\"seed\": 1}",
+            vec![gap("extra_body.model")],
+            vec![],
+            vec![gap("extra_body.model"), missing.clone()],
+        ),
+        (
+            "other.extra_body = {\"model\": \"gpt-4o\"}",
+            vec![gap("extra_body.model"), gap("model")],
+            vec![gap("model"), gap("model_kwargs.model")],
+            vec![gap("extra_body.model"), missing.clone()],
+        ),
+        (
+            "other.model_kwargs = extra",
+            vec![gap("model")],
+            vec![gap("model"), gap("model_kwargs.model")],
+            vec![missing.clone()],
+        ),
+        (
+            "other.model_kwargs = {\"seed\": 1}",
+            vec![],
+            vec![gap("model_kwargs.model")],
+            vec![missing.clone()],
+        ),
+        (
+            "setattr(other, name, value)",
+            vec![gap("extra_body.model"), gap("model")],
+            vec![gap("model"), gap("model_kwargs.model")],
+            vec![gap("extra_body.model"), missing.clone()],
+        ),
+    ] {
+        let source = format!(
+            "from langchain_openai import ChatOpenAI\nbody = ChatOpenAI(model=\"gpt-4.1\", extra_body={{\"model\": \"gpt-4-0314\"}})\nkwargs = ChatOpenAI(model=\"gpt-6-luna\", model_kwargs={{\"model\": \"gpt-4-0613\"}})\nonly = ChatOpenAI(extra_body={{\"model\": \"gpt-3.5-turbo-0301\"}})\n{write}\n"
+        );
+        let found = usages(&source);
+        assert_eq!(
+            value(call_on(&found, 2), "extra_body.model"),
+            Some("gpt-4-0314")
+        );
+        assert_eq!(
+            value(call_on(&found, 3), "model_kwargs.model"),
+            Some("gpt-4-0613")
+        );
+        assert_eq!(
+            value(call_on(&found, 4), "extra_body.model"),
+            Some("gpt-3.5-turbo-0301")
+        );
+        let keyed = |line: u32| -> Vec<(String, Option<String>)> {
+            let mut gaps: Vec<(String, Option<String>)> = found
+                .gaps
+                .iter()
+                .filter(|g| g.span.unwrap().line == line && g.kind == GapKind::UnresolvedModel)
+                .map(|g| (g.reason.clone(), g.key.clone()))
+                .collect();
+            gaps.sort();
+            gaps
+        };
+        assert_eq!(keyed(2), body, "{write}");
+        assert_eq!(keyed(3), kwargs, "{write}");
+        assert_eq!(keyed(4), only, "{write}");
+    }
+}
+
+#[test]
+fn a_request_through_a_langchain_models_sdk_client_is_an_sdk_request() {
+    // Only calls on the chat model itself are LangChain's; one through the
+    // SDK client it holds is the SDK's own request, on the path it reaches
+    // there: an OpenAI class's `client` is `root_client.chat.completions`.
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI, AzureChatOpenAI
+from langchain_anthropic import ChatAnthropic
+
+llm = ChatOpenAI(model="gpt-6-luna")
+claude = ChatAnthropic(model="claude-sonnet-5-5")
+llm.root_client.chat.completions.create(model="gpt-4o", messages=[])
+llm.client.create(model="gpt-4o-mini", messages=[])
+claude._client.messages.create(model="claude-3-haiku-20240307", max_tokens=8, messages=[])
+llm.invoke("hi")
+llm.stream("hi")
+llm.root_client.chat.completions.create(messages=[])
+held = llm.async_client
+held.create(model="o1-mini", messages=[])
+azure = AzureChatOpenAI(azure_deployment="prod", api_version="2024-06-01")
+azure.client.with_raw_response.create(model="gpt-4o", messages=[])
+llm._client.create(model="gpt-4o", messages=[])
+claude.client.messages.create(model="claude-3-haiku-20240307", max_tokens=8, messages=[])
+"#,
+    );
+    // It is made with the SDK's package, under the chat model's routing.
+    for (line, model, package, member, routing) in [
+        (
+            7,
+            "gpt-4o",
+            "openai",
+            "chat.completions.create",
+            Routing::OpenaiDirect,
+        ),
+        (
+            8,
+            "gpt-4o-mini",
+            "openai",
+            "chat.completions.create",
+            Routing::OpenaiDirect,
+        ),
+        (
+            9,
+            "claude-3-haiku-20240307",
+            "anthropic",
+            "messages.create",
+            Routing::AnthropicDirect,
+        ),
+        (
+            14,
+            "o1-mini",
+            "openai",
+            "chat.completions.create",
+            Routing::OpenaiDirect,
+        ),
+        (
+            16,
+            "gpt-4o",
+            "openai",
+            "chat.completions.create",
+            Routing::AzureOpenai,
+        ),
+    ] {
+        let request = call_on(&found, line);
+        assert!(request.request, "line {line}");
+        assert_eq!(request.package, package, "line {line}");
+        assert_eq!(request.member, member, "line {line}");
+        assert_eq!(request.routing, routing, "line {line}");
+        assert_eq!(value(request, "model"), Some(model), "line {line}");
+        assert!(gaps_on(&found, line).is_empty(), "line {line}");
+    }
+    for line in [10, 11] {
+        assert!(!call_on(&found, line).request, "line {line}");
+        assert_eq!(call_on(&found, line).package, "langchain_openai");
+    }
+    // With no model, the SDK's or the server's default applies.
+    assert!(call_on(&found, 12).request);
+    let missing = found
+        .gaps
+        .iter()
+        .find(|g| g.span.unwrap().line == 12)
+        .unwrap();
+    assert_eq!(missing.reason, "missing_model");
+    assert!(!missing.detail.contains("LangChain"), "{}", missing.detail);
+    // A field the class holds no SDK client in stays a call on the chat
+    // model, whose model is read the same way.
+    for (line, package, member) in [
+        (17, "langchain_openai", "_client.create"),
+        (18, "langchain_anthropic", "client.messages.create"),
+    ] {
+        let call = call_on(&found, line);
+        assert!(!call.request, "line {line}");
+        assert_eq!(call.package, package, "line {line}");
+        assert_eq!(call.member, member, "line {line}");
+        assert!(value(call, "model").is_some(), "line {line}");
+    }
+}
+
+#[test]
+fn a_langchain_chat_model_whose_class_is_chosen_at_run_time_is_recorded() {
+    // Two chat classes, or a chat class and another value, under one name:
+    // the model is kept, and the route is ambiguous.
+    for (source, line) in [
+        (
+            "import os\n\nif os.getenv(\"USE_AZURE\"):\n    from langchain_openai import AzureChatOpenAI as Chat\nelse:\n    from langchain_openai import ChatOpenAI as Chat\n\nllm = Chat(model=\"gpt-3.5-turbo-0301\")\n",
+            8,
+        ),
+        (
+            "import os\nfrom langchain_openai import AzureChatOpenAI, ChatOpenAI\nChat = AzureChatOpenAI if os.getenv(\"USE_AZURE\") else ChatOpenAI\nllm = Chat(model=\"gpt-3.5-turbo-0301\")\n",
+            4,
+        ),
+        (
+            "try:\n    from langchain_openai import ChatOpenAI\nexcept ImportError:\n    from langchain_openai import AzureChatOpenAI as ChatOpenAI\n\nllm = ChatOpenAI(model=\"gpt-3.5-turbo-0301\")\n",
+            6,
+        ),
+        (
+            "try:\n    from langchain_openai import ChatOpenAI as Chat\nexcept ImportError:\n    from langchain_anthropic import ChatAnthropic as Chat\n\nllm = Chat(model=\"gpt-3.5-turbo-0301\")\n",
+            6,
+        ),
+        (
+            "try:\n    from langchain_openai import ChatOpenAI as Chat\nexcept ImportError:\n    from mylib import Chat\n\nllm = Chat(model=\"gpt-3.5-turbo-0301\")\n",
+            6,
+        ),
+        (
+            "from openai import OpenAI\nfrom langchain_openai import ChatOpenAI\nMaker = OpenAI if raw else ChatOpenAI\nllm = Maker(model=\"gpt-3.5-turbo-0301\")\n",
+            4,
+        ),
+    ] {
+        let found = usages(source);
+        let built = call_on(&found, line);
+        assert_eq!(built.routing, Routing::Unknown, "{source}");
+        assert!(built.package.starts_with("langchain"), "{source}");
+        assert_eq!(
+            value(built, "model"),
+            Some("gpt-3.5-turbo-0301"),
+            "{source}"
+        );
+        assert_eq!(
+            gaps_on(&found, line),
+            vec!["ambiguous_client/multiple_assignments".to_string()],
+            "{source}"
+        );
+        let routing = found.gaps.iter().find(|g| g.kind == GapKind::AmbiguousClient).unwrap();
+        assert!(
+            routing.detail.contains("bound to more than one class"),
+            "{}",
+            routing.detail
+        );
+    }
+    // One given no model may be the class that takes LangChain's default.
+    let found = usages(
+        "from langchain_openai import AzureChatOpenAI, ChatOpenAI\nChat = AzureChatOpenAI if azure else ChatOpenAI\nllm = Chat(temperature=0)\n",
+    );
+    let mut gaps = gaps_on(&found, 3);
+    gaps.sort();
+    assert_eq!(
+        gaps,
+        vec![
+            "ambiguous_client/multiple_assignments".to_string(),
+            "unresolved_model/missing_model".to_string()
+        ]
+    );
+}
+
+#[test]
+fn a_langchain_chat_model_imported_with_a_fallback_is_followed() {
+    // `try: from langchain_openai import ChatOpenAI` with the deprecated
+    // copy as its fallback, either way round: one chat model.
+    for (first, second, class, routing) in [
+        (
+            "langchain_openai",
+            "langchain_community.chat_models",
+            "ChatOpenAI",
+            Routing::OpenaiDirect,
+        ),
+        (
+            "langchain_community.chat_models",
+            "langchain_openai",
+            "ChatOpenAI",
+            Routing::OpenaiDirect,
+        ),
+        (
+            "langchain_openai",
+            "langchain.chat_models",
+            "ChatOpenAI",
+            Routing::OpenaiDirect,
+        ),
+        (
+            "langchain_anthropic",
+            "langchain_community.chat_models",
+            "ChatAnthropic",
+            Routing::AnthropicDirect,
+        ),
+        (
+            "langchain_openai",
+            "langchain_community.chat_models",
+            "AzureChatOpenAI",
+            Routing::AzureOpenai,
+        ),
+    ] {
+        let source = format!(
+            "try:\n    from {first} import {class}\nexcept ImportError:\n    from {second} import {class}\n\nllm = {class}(model=\"gpt-3.5-turbo-0301\")\nllm.invoke(\"hi\")\n"
+        );
+        let found = usages(&source);
+        let built = call_on(&found, 6);
+        assert_eq!(built.member, class, "{source}");
+        assert_eq!(built.routing, routing, "{source}");
+        assert_eq!(
+            value(built, "model"),
+            Some("gpt-3.5-turbo-0301"),
+            "{source}"
+        );
+        assert!(found.gaps.is_empty(), "{source}: {:?}", found.gaps);
+        assert_eq!(call(&found, "llm.invoke").routing, routing, "{source}");
+    }
+
+    // On the pre-1.0 SDK the deprecated copy routes through the
+    // module-level API, which this file configures: not confirmed.
+    let found = usages(
+        "import openai\ntry:\n    from langchain_openai import ChatOpenAI\nexcept ImportError:\n    from langchain_community.chat_models import ChatOpenAI\nopenai.api_base = \"http://localhost:4000/v1\"\nllm = ChatOpenAI(model=\"gpt-3.5-turbo-0301\")\n",
+    );
+    let built = call_on(&found, 7);
+    assert_eq!(value(built, "model"), Some("gpt-3.5-turbo-0301"));
+    assert_eq!(built.routing, Routing::Unknown);
+    assert_eq!(
+        gaps_on(&found, 7),
+        vec!["ambiguous_client/langchain_module_config".to_string()]
+    );
 }
 
 // ---------------------------------------------------------------------------
