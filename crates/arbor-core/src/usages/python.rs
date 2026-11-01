@@ -1981,6 +1981,15 @@ struct Assign<'t> {
     iter: Option<Node<'t>>,
 }
 
+/// The names and attributes a file assigns the Agents SDK's `Runner`
+/// (`runners`) or one of its run methods (`runs`), as written (see
+/// [`Ctx::runner_aliases`]).
+#[derive(Default)]
+struct RunnerAliases<'t> {
+    runners: HashSet<&'t str>,
+    runs: HashSet<&'t str>,
+}
+
 #[derive(Clone, Copy)]
 struct Param<'t> {
     annotation: Option<Node<'t>>,
@@ -8534,6 +8543,7 @@ impl<'t> Ctx<'t> {
         if !self.imports_agents() {
             return;
         }
+        let aliases = self.runner_aliases();
         for (call, scope) in self.calls.clone() {
             let Some(function) = call.child_by_field_name("function") else {
                 continue;
@@ -8549,7 +8559,7 @@ impl<'t> Ctx<'t> {
                 || args.splat;
             let what = if is_run && given {
                 Some("a `RunConfig` that gives every agent it runs its model")
-            } else if self.runs_agents(function, scope) && args.splat {
+            } else if self.runs_agents(function, scope, &aliases) && args.splat {
                 Some("a run given a `**` expansion, which may hold its `run_config`")
             } else {
                 let config = keyword_value(call, |n| self.text(n), |k| k == "run_config");
@@ -8568,32 +8578,89 @@ impl<'t> Ctx<'t> {
     }
 
     /// Whether `function` may be the Agents SDK's `Runner.run`,
-    /// `Runner.run_sync` or `Runner.run_streamed`: its receiver is named
-    /// like a runner (`Runner`, `agents.Runner`, `runner = Runner`,
-    /// `self.runner`) or is the SDK's `Runner` imported under another
-    /// name.
-    fn runs_agents(&self, function: Node<'t>, scope: usize) -> bool {
-        if function.kind() != "attribute" {
-            return false;
+    /// `Runner.run_sync` or `Runner.run_streamed`: one of them on a
+    /// receiver that may be the SDK's `Runner` ([`Ctx::may_be_runner`]), or
+    /// a name or attribute the file assigns one (`run = Runner.run`).
+    fn runs_agents(&self, function: Node<'t>, scope: usize, aliases: &RunnerAliases<'t>) -> bool {
+        if matches!(function.kind(), "identifier" | "attribute")
+            && aliases.runs.contains(self.text(function))
+        {
+            return true;
         }
-        let runs = function
-            .child_by_field_name("attribute")
-            .is_some_and(|attr| matches!(self.text(attr), "run" | "run_sync" | "run_streamed"));
-        let runner = function
-            .child_by_field_name("object")
-            .is_some_and(|object| {
-                let last = match object.kind() {
-                    "identifier" => Some(object),
-                    "attribute" => object.child_by_field_name("attribute"),
-                    _ => None,
-                };
-                last.is_some_and(|name| self.text(name).eq_ignore_ascii_case("runner"))
-                    || (object.kind() == "identifier"
-                        && self.import_target(object, scope).is_some_and(|target| {
-                            target.starts_with("agents.") && target.ends_with(".Runner")
-                        }))
-            });
-        runs && runner
+        function.kind() == "attribute"
+            && function
+                .child_by_field_name("attribute")
+                .is_some_and(|attr| matches!(self.text(attr), "run" | "run_sync" | "run_streamed"))
+            && function
+                .child_by_field_name("object")
+                .is_some_and(|object| self.may_be_runner(object, scope, aliases))
+    }
+
+    /// Whether `object` may be the Agents SDK's `Runner`: named like a
+    /// runner (`Runner`, `agents.Runner`, `runner`, `self.runner`), the
+    /// SDK's `Runner` imported under another name, or a name or attribute
+    /// the file assigns one of these (`r = Runner`, `self._runner =
+    /// Runner`).
+    fn may_be_runner(&self, object: Node<'t>, scope: usize, aliases: &RunnerAliases<'t>) -> bool {
+        let last = match object.kind() {
+            "identifier" => Some(object),
+            "attribute" => object.child_by_field_name("attribute"),
+            _ => return false,
+        };
+        last.is_some_and(|name| self.text(name).eq_ignore_ascii_case("runner"))
+            || aliases.runners.contains(self.text(object))
+            || (object.kind() == "identifier"
+                && self.import_target(object, scope).is_some_and(|target| {
+                    target.starts_with("agents.") && target.ends_with(".Runner")
+                }))
+    }
+
+    /// The names and attributes this file assigns the Agents SDK's
+    /// `Runner` (`r = Runner`, `self._runner = Runner`) or one of its run
+    /// methods (`run = Runner.run`), through chains of such assignments,
+    /// matched as written wherever they are used.
+    fn runner_aliases(&self) -> RunnerAliases<'t> {
+        let mut assigns = Vec::new();
+        let mut stack: Vec<Node<'t>> = self.root.into_iter().collect();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "assignment" {
+                if let (Some(left), Some(right)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    if matches!(left.kind(), "identifier" | "attribute") {
+                        assigns.push((left, right, self.scope_at(node.start_byte())));
+                    }
+                }
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        let mut aliases = RunnerAliases::default();
+        loop {
+            let mut grew = false;
+            for &(left, right, scope) in &assigns {
+                let target = self.text(left);
+                if self.may_be_runner(right, scope, &aliases) {
+                    grew |= aliases.runners.insert(target);
+                } else if self.runs_agents(right, scope, &aliases) {
+                    grew |= aliases.runs.insert(target);
+                }
+            }
+            if !grew {
+                return aliases;
+            }
+        }
+    }
+
+    /// The innermost scope whose node holds byte `at`.
+    fn scope_at(&self, at: usize) -> usize {
+        self.scopes
+            .iter()
+            .enumerate()
+            .filter(|(_, scope)| scope.start <= at && at < scope.end)
+            .max_by_key(|(_, scope)| scope.start)
+            .map_or(0, |(index, _)| index)
     }
 
     /// Whether a `run_config=` argument gives the run no model: `None`, or

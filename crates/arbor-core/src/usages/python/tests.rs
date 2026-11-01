@@ -8809,11 +8809,18 @@ expanded = OpenAIChatModel(**SETTINGS)
 }
 
 #[test]
-fn a_runner_named_any_way_given_an_expansion_leaves_agents_unconfirmed() {
+fn a_runner_or_its_run_method_through_an_alias_given_an_expansion_leaves_agents_unconfirmed() {
     for run in [
         "import agents\nasync def ask(q, **kw):\n    return await agents.Runner.run(agent, q, **kw)\n",
         "runner = Runner\nasync def ask(q, **kw):\n    return await runner.run(agent, q, **kw)\n",
         "class Bot:\n    def ask(self, q, **kw):\n        return self.runner.run_sync(agent, q, **kw)\n",
+        // Assigned the SDK's `Runner` or one of its run methods.
+        "r = Runner\nasync def ask(q, **kw):\n    return await r.run(agent, q, **kw)\n",
+        "run = Runner.run\nasync def ask(q, **kw):\n    return await run(agent, q, **kw)\n",
+        "agent_runner = Runner\ndef ask(q, **kw):\n    return agent_runner.run_sync(agent, q, **kw)\n",
+        "class Bot:\n    def __init__(self):\n        self._runner = Runner\n    async def ask(self, q, **kw):\n        return await self._runner.run(agent, q, **kw)\n",
+        "from agents import Runner as R\nfirst = R\nsecond = first\ndef ask(q, **kw):\n    return second.run_streamed(agent, q, **kw)\n",
+        "class Bot:\n    def __init__(self):\n        self._go = Runner.run_sync\n    def ask(self, q, **kw):\n        return self._go(agent, q, **kw)\n",
     ] {
         let source = format!(
             "from agents import Agent, Runner\nagent = Agent(name=\"a\", model=\"gpt-4o\")\n{run}"
@@ -8825,6 +8832,18 @@ fn a_runner_named_any_way_given_an_expansion_leaves_agents_unconfirmed() {
             found.gaps
         );
     }
+    // Another library's `run` given an expansion is no run of agents.
+    let found = usages(
+        r#"import asyncio, subprocess, uvicorn
+from agents import Agent
+
+agent = Agent(name="a", model="gpt-4o")
+subprocess.run(cmd, **kw)
+uvicorn.run(app, **cfg)
+asyncio.run(main(**kw))
+"#,
+    );
+    assert!(gaps_on(&found, 4).is_empty(), "{:?}", found.gaps);
 }
 
 #[test]

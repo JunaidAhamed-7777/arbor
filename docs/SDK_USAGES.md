@@ -612,12 +612,19 @@ the file may give a run one:
 
 - a `RunConfig` given a model (by keyword, by position, also under another
   name, or through an expansion);
-- a `run_config=` given anywhere that is not `None` or a same-file
-  `RunConfig` built without a model (a parameter, one from another module);
-- a `**` expansion given to `run`, `run_sync` or `run_streamed` on a
-  receiver named like a runner (`Runner`, `agents.Runner`, `runner = Runner`,
-  `self.runner`) or the SDK's `Runner` imported under another name, which may
-  hold a `run_config`.
+- a `run_config=` given anywhere that is not `None` or always a same-file
+  `RunConfig` built without a model: a parameter never is, even one whose
+  default is such a `RunConfig`, since a caller may pass another, and
+  neither is one from another module;
+- a `**` expansion, which may hold a `run_config`, given to `run`,
+  `run_sync` or `run_streamed` on the SDK's `Runner` (also imported under
+  another name, or `agents.Runner`), on a receiver named `runner` (`runner`,
+  `self.runner`), or on a name or attribute the file assigns one of these
+  (`r = Runner`, `self._runner = Runner`); or given to a name or attribute
+  the file assigns one of those methods (`run = Runner.run`). The file's
+  other `run` calls (`subprocess.run`, `uvicorn.run`) are not runs, and a
+  runner that reaches a call another way (a parameter not named `runner`,
+  `getattr`) is not seen.
 
 So do they in a file that writes `model` on another object (`agent.model =
 ...`). A run configured in another module is not seen. `Agent.clone(model=
