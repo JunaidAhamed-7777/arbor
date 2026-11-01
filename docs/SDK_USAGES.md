@@ -571,7 +571,10 @@ project root, holds an `agents.py` or a directory `agents` holding a Python
 file, `from agents import Agent` may load it instead: every Agents SDK
 record then routes `unknown`, and each call gets a `local_module` gap on its
 routing and, when it has values, on its model. The gap names the module
-nearest the file. The project root is the one `arbor` uses (the nearest
+in the file's own folder or the nearest folder above it; failing that, the
+package the scan is inside, or the first module the scanned tree holds.
+Folders are walked as the scanned path names them, and a link in it is also
+followed to find a package the scan is inside. The project root is the one `arbor` uses (the nearest
 folder above the scanned path with a root marker such as `.git` or
 `pyproject.toml`) for `arbor usages` and `arbor retirements`, and the MCP
 server's project for `find_api_usages`; a scan of part of the project still
@@ -621,39 +624,50 @@ the file may give a run one:
 - a `RunConfig` given a model (by keyword, by position, also under another
   name, or through an expansion);
 - a `run_config=` given anywhere that is not `None` or always a same-file
-  `RunConfig` built without a model: a parameter never is, even one whose
-  default is such a `RunConfig`, since a caller may pass another, and
-  neither is one from another module;
+  `RunConfig` built without a model: a parameter is not, even one whose
+  default is such a `RunConfig`, since a caller may pass another, unless
+  every caller is in this file (a private function that is not decorated,
+  passed or stored) and each passes such a `RunConfig` or nothing; one from
+  another module is not either;
 - a `**` expansion, which may hold a `run_config`, given to `run`,
   `run_sync` or `run_streamed` on the SDK's `Runner` (also imported under
   another name, or `agents.Runner`), on a receiver named `runner` (`runner`,
   `self.runner`), or on a name or attribute the file assigns one of these
-  (`r = Runner`, `self._runner = Runner`); or given to a name or attribute
-  the file assigns one of those methods (`run = Runner.run`). The file's
+  (`r = Runner`, `self._runner = Runner`, a class attribute `_runner =
+  Runner` read as `self._runner`, `cls._runner` or `Bot._runner`); or given
+  to a name or attribute the file assigns one of those methods (`run =
+  Runner.run`). An assignment counts through every target (`a = b =
+  Runner`, `r, other = Runner, None`, `(r := Runner)`) and any operand of
+  `or`, `and` or a conditional (`self._r = runner or Runner`). The file's
   other `run` calls (`subprocess.run`, `uvicorn.run`) are not runs, and a
   runner that reaches a call another way (a parameter not named `runner`,
-  `getattr`) is not seen.
+  `getattr`, a container) is not seen.
 
 So do they in a file that writes `model` on another object (`agent.model =
-...`). A run configured in another module is not seen.
+...`). A run configured in another module is not seen. `Agent.clone(model=
+...)` is not read.
 
 The SDK passes a model settings' `extra_body` to the OpenAI client, which
 merges it over the request body, so a `model` in it is the model sent
 (`openai_chatcompletions.py`, `openai_responses.py` and `litellm_model.py`
-in openai-agents). Every Agents SDK record, `RunConfig` included, keeps a
-`dynamic_feature` gap in a file that:
+in openai-agents). An agent given model settings this file does not read
+(a `model_settings=` that is not `None` or a `ModelSettings` built in the
+file, in place or assigned to the name given, or a `**` expansion that may
+hold one) keeps a `dynamic_feature` gap, and so does every model object in
+the file when the agent's model may be one (it is not a string given in
+place). Every Agents SDK record, `RunConfig` included, keeps one in a file
+that:
 
 - gives an `extra_body` that may name a `model` (a dict naming one, or one
   the file cannot read whole) to anything but a provider's own request
   (`ModelSettings(extra_body=...)`, `dataclasses.replace(settings,
   extra_body=...)`), or builds a `ModelSettings` from a `**` expansion;
-- passes a `model_settings=` that is not `None` or a `ModelSettings` built
-  in the file, in place or assigned to the name given (one from a
-  parameter, another module or a function's result);
-- uses `extra_body` on an object that may be model settings
-  (`agent.model_settings.extra_body = ...`), or writes `model_settings`
-  after an agent is built. `Agent.clone(model=
-...)` is not read.
+- gives anything but an agent such model settings (a run, whose settings
+  reach every agent it runs; `agent.clone(...)`);
+- uses `extra_body` on an object that may be model settings, by attribute
+  or by name (`agent.model_settings.extra_body = ...`, `setattr(settings,
+  "extra_body", ...)`, a clone's, which it shares), or writes
+  `model_settings` after an agent is built.
 
 **Claude Agent SDK.** The SDK runs the Claude Code CLI with the options'
 `model` and `fallback_model`. An alias (`"sonnet"`, `"opus"`, an agent
@@ -714,9 +728,10 @@ their environment after they are built), an alias the options are given
 (`"sonnet"`, `"opus"`, `"default"`...) and every model of an agent definition
 built inside them keep an `env_var` gap on their key; options given a full
 model ID do not. `query(...)` and `ClaudeSDKClient` are not read, and a
-`set_model(...)` call anywhere in the file, which changes the model a
-client's session sends, gives every options object and agent definition a
-`dynamic_feature` gap.
+`set_model` anywhere in the file (`client.set_model(...)`, or a reference
+called later: `{"/model": client.set_model}`, `getattr(client,
+"set_model")`), which changes the model a client's session sends, gives
+every options object and agent definition a `dynamic_feature` gap.
 
 **AgentScope.** Each model builds its provider's SDK client: OpenAI's for
 `OpenAIChatModel` and `OpenAIResponseModel`, Anthropic's for
@@ -735,16 +750,20 @@ expansion given to the model route `unknown` with an `endpoint_option` gap.
 So does a first positional argument that is neither a credential built in
 place (`OpenAICredential(...)`) nor a model name AgentScope 1 would take,
 such as a name holding a credential (`OpenAIChatModel(cred, model=...)`).
-AgentScope sends `generate_kwargs` (AgentScope 1) and `extra_body`
-(AgentScope 2) in its request over its own model: the `model` at their top
-level is read (not one nested deeper, as in `metadata`, and not
-`client_kwargs`', which configure the client), and one that may hold a
-`model` (a dict literal naming one, one the file cannot read whole, or a
-`**` expansion that may hold them) gives the model the class is built with
-a `reassigned` gap. A use of `generate_kwargs` or `extra_body` after a
-model is built (`model.generate_kwargs["model"] = ...`), on an AgentScope
-model or an object the file cannot identify, gives every AgentScope model
-in the file a `dynamic_feature` gap. A credential counts only
+AgentScope's OpenAI and Anthropic models send `generate_kwargs`
+(AgentScope 1, passed into the SDK call) and `extra_body` (AgentScope 2) in
+their request over their own model: the `model` at their top level, and the
+one in the SDK's own `extra_body` inside `generate_kwargs`, is read (not one
+nested elsewhere, as in `metadata`, and not `client_kwargs`', which
+configure the client), and one that may hold a `model` (a dict literal
+naming one, one the file cannot read whole, or a `**` expansion that may
+hold them) gives the model the class is built with a `reassigned` gap. A use
+of `generate_kwargs` or `extra_body` after a model is built, by attribute or
+by name (`model.generate_kwargs["model"] = ...`, `setattr(model,
+"extra_body", ...)`), on an AgentScope model or an object the file cannot
+identify, gives every such model in the file a `dynamic_feature` gap.
+`GeminiChatModel` puts `generate_kwargs` into Gemini's `config`, so a
+`model` there is not read. A credential counts only
 when an `agentscope` import binds its class
 (`from agentscope.credential import OpenAICredential`): another library's
 (`DefaultAzureCredential()`) is a credential this scan cannot read.

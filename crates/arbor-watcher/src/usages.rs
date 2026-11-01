@@ -209,9 +209,10 @@ pub fn scan_usages(root: &Path, options: &UsageScanOptions) -> std::io::Result<U
     // `agents` is the OpenAI Agents SDK's module, and also a common name for
     // a repository's own: with one in the tree, or a scan inside one,
     // `from agents import Agent` may load it instead.
-    let local_agents = enclosing_agents_package(root, prefix.as_deref())
-        .or_else(|| local_agents_module(&candidates, root, prefix.as_deref()))
-        .or_else(|| agents_links.into_iter().next());
+    let local_agents =
+        enclosing_agents_package(root, prefix.as_deref(), options.project_root.as_deref())
+            .or_else(|| local_agents_module(&candidates, root, prefix.as_deref()))
+            .or_else(|| agents_links.into_iter().next());
     // A file's own folder and those above it up to the project, nearest
     // first: a scan of part of the project may not hold the module.
     let stop = options
@@ -232,7 +233,8 @@ pub fn scan_usages(root: &Path, options: &UsageScanOptions) -> std::io::Result<U
             })
             .ok()
         });
-    let mut agents_folders: HashMap<PathBuf, Option<&'static str>> = HashMap::new();
+    let mut agents_folders: HashMap<PathBuf, (Option<PathBuf>, Option<&'static str>)> =
+        HashMap::new();
 
     let outcomes: Vec<(Candidate, Outcome)> = candidates
         .into_par_iter()
@@ -509,21 +511,44 @@ fn walk(root: &Path, follow_symlinks: bool, prefix: Option<&str>) -> (Vec<Candid
 /// `agents` holding an `__init__.py`, the root or one of its ancestors
 /// (at most 32 up), as a display path. Its own files' `from agents import
 /// Agent` then loads it.
-fn enclosing_agents_package(root: &Path, prefix: Option<&str>) -> Option<String> {
-    let root = std::fs::canonicalize(root).ok()?;
-    let (start, base) = if root.is_file() {
+fn enclosing_agents_package(
+    root: &Path,
+    prefix: Option<&str>,
+    project_root: Option<&Path>,
+) -> Option<String> {
+    let package = |dir: &Path| {
+        dir.file_name().is_some_and(|name| name == "agents") && dir.join("__init__.py").is_file()
+    };
+    // The path as named first, which the display path mirrors.
+    let named = lexical_absolute(root)?;
+    let (start, base) = if named.is_file() {
         let base = prefix
             .and_then(|p| p.rsplit_once('/'))
             .map_or("", |(dir, _)| dir);
-        (root.parent()?, base)
+        (named.parent()?, base)
     } else {
-        (root.as_path(), prefix.unwrap_or(""))
+        (named.as_path(), prefix.unwrap_or(""))
     };
-    let levels = start.ancestors().take(32).position(|dir| {
-        dir.file_name().is_some_and(|name| name == "agents") && dir.join("__init__.py").is_file()
-    })?;
-    // Up to the package's parent, then into it: `agents/bots/../../agents/`.
-    Some(display_up(base, levels + 1, "agents") + "/")
+    if let Some(levels) = start.ancestors().take(32).position(package) {
+        // Up to the package's parent, then into it: `agents/bots/../../agents/`.
+        return Some(display_up(base, levels + 1, "agents") + "/");
+    }
+    // Then where a link in it leads (`bots` linked to `agents/bots`), named
+    // from the project root when it is inside it.
+    let real = std::fs::canonicalize(root).ok()?;
+    let start = if real.is_file() {
+        real.parent()?
+    } else {
+        real.as_path()
+    };
+    let found = start.ancestors().take(32).find(|dir| package(dir))?;
+    let inside = project_root
+        .and_then(|project| std::fs::canonicalize(project).ok())
+        .and_then(|project| found.strip_prefix(project).ok().map(slash_path));
+    Some(match inside {
+        Some(path) if !path.is_empty() => path + "/",
+        _ => "agents/".to_string(),
+    })
 }
 
 /// The nearest module named like the OpenAI Agents SDK's `agents` that
@@ -535,7 +560,7 @@ fn enclosing_agents_package(root: &Path, prefix: Option<&str>) -> Option<String>
 fn nearby_agents_module(
     candidate: &Candidate,
     stop: Option<&Path>,
-    folders: &mut HashMap<PathBuf, Option<&'static str>>,
+    folders: &mut HashMap<PathBuf, (Option<PathBuf>, Option<&'static str>)>,
 ) -> Option<String> {
     let parent = candidate.path.parent()?;
     let own = if parent.as_os_str().is_empty() {
@@ -543,33 +568,54 @@ fn nearby_agents_module(
     } else {
         parent
     };
-    let own = std::fs::canonicalize(own).ok()?;
+    // Walked as named, which the display path mirrors; each folder's
+    // canonical path says whether it is in the project.
+    let own = lexical_absolute(own)?;
     let shown_dir = candidate
         .relative
         .rsplit_once('/')
         .map_or("", |(dir, _)| dir);
     for (levels, folder) in own.ancestors().take(32).enumerate() {
-        if levels > 0 && stop.is_none_or(|stop| !folder.starts_with(stop)) {
-            return None;
-        }
         if folder
             .file_name()
             .is_some_and(|name| name == "site-packages" || name == "dist-packages")
         {
             return None;
         }
-        let held = *folders
+        let (canonical, held) = folders
             .entry(folder.to_path_buf())
-            .or_insert_with(|| agents_module_in(folder));
+            .or_insert_with(|| (std::fs::canonicalize(folder).ok(), agents_module_in(folder)))
+            .clone();
+        let inside = |stop: &Path| canonical.as_deref().is_some_and(|c| c.starts_with(stop));
+        if levels > 0 && !stop.is_some_and(inside) {
+            return None;
+        }
         if let Some(name) = held {
             let shown = display_up(shown_dir, levels, name);
             return Some(if name == "agents" { shown + "/" } else { shown });
         }
-        if stop.is_some_and(|stop| folder == stop) {
+        if stop.is_some_and(|stop| canonical.as_deref() == Some(stop)) {
             return None;
         }
     }
     None
+}
+
+/// `path` made absolute, with `.` and `..` steps folded as written, the way
+/// display paths fold them.
+fn lexical_absolute(path: &Path) -> Option<PathBuf> {
+    let absolute = std::path::absolute(path).ok()?;
+    let mut folded = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                folded.pop();
+            }
+            other => folded.push(other.as_os_str()),
+        }
+    }
+    Some(folded)
 }
 
 /// The module named like the OpenAI Agents SDK's `agents` that `folder`
@@ -589,19 +635,21 @@ fn agents_module_in(folder: &Path) -> Option<&'static str> {
 /// folder `dir` (`""`: where the paths are relative to), with `..` steps
 /// folded: `display_up("app", 1, "agents")` is `agents`.
 fn display_up(dir: &str, levels: usize, name: &str) -> String {
-    let mut segments: Vec<&str> = Vec::new();
     let joined = if dir.is_empty() {
         format!("{}{name}", "../".repeat(levels))
     } else {
         format!("{dir}/{}{name}", "../".repeat(levels))
     };
-    for (i, segment) in joined.split('/').enumerate() {
+    // A leading `/`, or the `//` of a UNC or verbatim path, stays as
+    // written; an empty or `.` segment elsewhere goes.
+    let body = joined.trim_start_matches('/');
+    let lead = &joined[..joined.len() - body.len()];
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in body.split('/') {
         match segment {
-            // A leading `/` stays; an empty or `.` segment elsewhere goes.
-            "" if i > 0 => {}
-            "." => {}
+            "" | "." => {}
             ".." => match segments.last() {
-                Some(&last) if last != ".." && !last.is_empty() && !last.ends_with(':') => {
+                Some(&last) if last != ".." && !last.ends_with(':') => {
                     segments.pop();
                 }
                 _ => segments.push(".."),
@@ -609,10 +657,11 @@ fn display_up(dir: &str, levels: usize, name: &str) -> String {
             _ => segments.push(segment),
         }
     }
-    if segments.is_empty() {
+    let folded = segments.join("/");
+    if lead.is_empty() && folded.is_empty() {
         ".".to_string()
     } else {
-        segments.join("/")
+        format!("{lead}{folded}")
     }
 }
 
@@ -926,6 +975,39 @@ mod tests {
     }
 
     #[test]
+    fn a_linked_folder_is_walked_as_it_is_named() {
+        const AGENT: &str = "from agents import Agent\nbot = Agent(name=\"a\", model=\"gpt-4o\")\n";
+        let dir = tempdir().unwrap();
+        write(dir.path(), ".git/HEAD", "ref: refs/heads/main\n");
+        write(dir.path(), "agents/__init__.py", "class Agent:\n    pass\n");
+        write(dir.path(), "packages/real/main.py", AGENT);
+        let target = dir.path().join("packages/real");
+        let link = dir.path().join("app");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, &link);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&target, &link);
+        if linked.is_err() {
+            // Creating a link needs a privilege this machine does not grant.
+            return;
+        }
+        let options = UsageScanOptions {
+            display_root: Some("app".to_string()),
+            project_root: Some(dir.path().to_path_buf()),
+            ..UsageScanOptions::default()
+        };
+        let report = scan_usages(&link, &options).unwrap();
+        assert!(
+            report
+                .gaps
+                .iter()
+                .all(|g| g.reason == "local_module" && g.detail.contains("(`agents/`)")),
+            "{:?}",
+            report.gaps
+        );
+    }
+
+    #[test]
     fn a_display_path_folds_the_steps_up() {
         assert_eq!(display_up("app", 1, "agents"), "agents");
         assert_eq!(display_up("app/svc", 0, "agents.py"), "app/svc/agents.py");
@@ -935,6 +1017,14 @@ mod tests {
         assert_eq!(display_up("../app", 2, "agents"), "../../agents");
         assert_eq!(display_up("C:/proj/app", 1, "agents"), "C:/proj/agents");
         assert_eq!(display_up("/srv/app", 1, "agents"), "/srv/agents");
+        assert_eq!(
+            display_up("//host/share/app", 1, "agents"),
+            "//host/share/agents"
+        );
+        assert_eq!(
+            display_up("//?/C:/proj/app", 1, "agents"),
+            "//?/C:/proj/agents"
+        );
     }
 
     #[test]
