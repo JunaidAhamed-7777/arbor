@@ -574,18 +574,41 @@ nowhere (`def with_model(self, model): self.model = model`). A base class in
 another file is not read: like any write in another module, its methods may
 set the attribute unseen.
 
-Nor may the parameter reach a request changed. Where it can be read (the
-function, or the class and its same-file bases, whose methods its instances
-run), nothing computed from it may be sent as a model by another request or a
-call through another wrapper: not `RENAMED[model]` in one branch beside
-`model` in the other, not `DEPRECATED[self.model]` beside `self.model`, not
-through a variable, a dict spread with `**` or a raw HTTP body built from it.
-Nor may it be handed to a function, class or method of the file that sends a
-request (`_send(model)`), which may change it. Otherwise a call that passes a
-value the code maps would read as sending it. A read that sends nothing
-changed keeps it listed: a test (`model.startswith("o1")`), a price lookup,
-logging, or what the request returns. A helper in another module is not read,
-as for any value.
+Nor may the parameter reach a request as anything else, or be passed over
+for another request. Otherwise a call that passes a value the code maps,
+replaces or rejects would read as sending it. The check fails closed: where
+the parameter can be read (the function, or the class and its same-file
+bases, whose methods its instances run), any of these keeps it unlisted:
+
+- a value computed from it, through assignments or container updates
+  (`params.update(model=...)`), sent where a model may be by another request
+  or a call through another wrapper: `RENAMED[model]` in one branch beside
+  `model` in the other, `DEPRECATED[self.model]` beside `self.model`, a dict
+  spread with `**`, a raw HTTP body;
+- such a value written where the function no longer sees it: a global, a
+  `nonlocal`, an attribute of anything but `self` in a class, a container
+  that is not local;
+- it, such a value, or a class's `self` handed to any call but a request
+  (`_send(model)`, `legacy.send(prompt, model)`, `send_legacy(model)` from
+  another module, `_legacy(self, prompt)`, a lambda), unless the callee sends
+  nothing: one of the file's own functions, lambdas or methods with no
+  request and no call the scan cannot see into, directly or through the
+  file's other functions, a builtin (`print`, `len`...), logging, an
+  exception, a container or string method, a few standard functions
+  (`json.dumps`, `time.sleep`...), or a method of the value itself
+  (`model.startswith(...)`);
+- a call chosen by it (`HANDLERS[model](prompt)`);
+- a condition that reads it (`if`, `elif`, `while`, `match`, a conditional
+  expression, `and`/`or`, `assert`) guarding another request, a call to the
+  file's own code that may send one, or a `return`, `raise`, `break` or
+  `continue` in a branch that does not send the parameter: `if model in
+  RETIRED: return client.chat.completions.create(model=FALLBACK, ...)`, `if
+  model not in CHOICES: raise ...`.
+
+What the request returns does not count as computed from its model. A test
+whose every branch sends the parameter (`if "o1" in model:` choosing between
+two requests with `model=model`) keeps it listed, and so does a read that
+sends nothing: a price lookup, logging, `print`.
 
 The function or class must meet all of these:
 
@@ -686,8 +709,9 @@ gap with no key:
   attributes with run-time names;
 - a wrapper hands back a LangChain chat model it builds, and the file writes
   its model field (`llm.model_name = ...`), writes attributes with run-time
-  names, or makes a model configurable (`configurable_fields(model_name=...)`,
-  `configurable_alternatives(...)`);
+  names, makes a model configurable (`configurable_fields(model_name=...)`,
+  `configurable_alternatives(...)`), or uses any `.model_kwargs` or
+  `.extra_body`, whose entries LangChain sends over the model;
 - the request is LiteLLM's, and the file mentions `litellm.model_alias_map`.
 
 Writes in other files are not seen, as for any value.

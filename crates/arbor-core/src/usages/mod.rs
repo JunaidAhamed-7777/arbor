@@ -697,7 +697,9 @@ pub struct FileUsages {
     pub calls: Vec<SdkCall>,
     pub gaps: Vec<UsageGap>,
     /// The parser recovered from syntax errors: calls inside the broken
-    /// region may be missing. Set only for files that mention an SDK.
+    /// region may be missing. Set only for files the extractor reads: those
+    /// that mention an SDK, and in a repository scan those whose imports
+    /// name a wrapper in another file.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub syntax_errors: bool,
     /// Parameters of this file's module-level functions and classes that
