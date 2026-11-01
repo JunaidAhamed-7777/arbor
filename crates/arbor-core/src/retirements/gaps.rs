@@ -142,7 +142,7 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     (
         GapKind::UnresolvedModel,
         "request_body",
-        "the model is in an HTTP request body the scan cannot read as JSON",
+        "an HTTP request's model is in a body the scan cannot read as JSON, or it sends no body the scan reads",
     ),
     (
         GapKind::UnresolvedModel,
