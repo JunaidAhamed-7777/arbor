@@ -8692,6 +8692,32 @@ fn a_replaced_post_or_a_dynamic_file_leaves_the_route_unconfirmed() {
         ("del requests.post", "dynamic_feature"),
         ("setattr(requests, name, fake)", "dynamic_feature"),
         ("exec(code)", "dynamic_feature"),
+        // Below the module, which `post` hands its arguments to, through
+        // an alias, or through a test helper.
+        ("requests.Session.request = pin", "dynamic_feature"),
+        ("requests.sessions.Session.send = pin", "dynamic_feature"),
+        (
+            "from requests import Session; Session.request = pin",
+            "dynamic_feature",
+        ),
+        (
+            "setattr(requests.Session, \"request\", pin)",
+            "dynamic_feature",
+        ),
+        ("r = requests; r.post = fake", "dynamic_feature"),
+        ("r = requests; setattr(r, name, fake)", "dynamic_feature"),
+        (
+            "monkeypatch.setattr(requests, \"post\", fake)",
+            "dynamic_feature",
+        ),
+        (
+            "monkeypatch.setattr(\"requests.post\", fake)",
+            "dynamic_feature",
+        ),
+        (
+            "mock.patch(\"requests.post\", fake).start()",
+            "dynamic_feature",
+        ),
     ] {
         let source = format!(
             "import requests\n{setup}\nrequests.post(\"https://api.openai.com/v1/chat/completions\", json={{\"model\": \"gpt-4o\"}})\n"
@@ -8707,6 +8733,27 @@ fn a_replaced_post_or_a_dynamic_file_leaves_the_route_unconfirmed() {
 }
 
 #[test]
+fn a_write_elsewhere_leaves_a_raw_http_request_confirmed() {
+    for setup in [
+        "os.environ[\"X\"] = \"1\"",
+        "settings.timeout = 5",
+        "monkeypatch.setattr(os, \"getcwd\", fake)",
+        "mock.patch(\"os.getcwd\", fake).start()",
+    ] {
+        let source = format!(
+            "import os\nimport requests\n{setup}\nrequests.post(\"https://api.openai.com/v1/chat/completions\", json={{\"model\": \"gpt-4o\"}})\n"
+        );
+        let found = usages(&source);
+        assert!(gaps_on(&found, 4).is_empty(), "{setup}: {:?}", found.gaps);
+        assert_eq!(
+            value(call_on(&found, 4), "model"),
+            Some("gpt-4o"),
+            "{setup}"
+        );
+    }
+}
+
+#[test]
 fn a_dict_given_to_a_replaced_post_is_not_read() {
     // A replaced `post` may change the dict it is given, and so may any
     // code in a file that can rebind anything.
@@ -8714,6 +8761,8 @@ fn a_dict_given_to_a_replaced_post_is_not_read() {
         "requests.post = fake",
         "setattr(requests, \"post\", fake)",
         "exec(code)",
+        "requests.Session.request = pin",
+        "r = requests; r.post = fake",
     ] {
         let source = format!(
             "import requests\nfrom openai import OpenAI\nclient = OpenAI()\nbody = {{\"model\": \"gpt-4o\", \"messages\": []}}\n{setup}\nrequests.post(\"https://api.openai.com/v1/chat/completions\", json=body)\nclient.chat.completions.create(**body)\n"

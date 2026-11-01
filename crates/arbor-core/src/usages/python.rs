@@ -2278,9 +2278,9 @@ struct Ctx<'t> {
     /// = patched`, `openai.OpenAI = Sub`), by package: every route of that
     /// package is then a `dynamic_feature` gap.
     sdk_patched: HashMap<Pkg, Feature>,
-    /// `requests.post` or `httpx.post` replaced in this file (`requests.post
-    /// = fake`, or an attribute of either written with a run-time name):
-    /// every raw HTTP request is then a `dynamic_feature` gap.
+    /// An HTTP library patched in this file (see [`Ctx::note_http_patch`]):
+    /// every raw HTTP request is then a `dynamic_feature` gap, and a dict
+    /// given to one may be changed.
     http_patched: Option<Feature>,
     /// Names bound by `def` and `class` statements and class-body imports,
     /// where they bind: a name also assigned there gets an assignment of no
@@ -8139,25 +8139,129 @@ impl<'t> Ctx<'t> {
         HTTP_LIBRARIES.iter().copied().find(|lib| *lib == &*target)
     }
 
-    /// `requests.post = fake` (or `del`, `setattr`), or an attribute of the
-    /// module written with a run-time name: a raw HTTP request may then not
-    /// be sent the way it is written.
+    /// Whatever may make a raw HTTP request send something else, failing
+    /// closed: any attribute written (or deleted, or set with `setattr`) on
+    /// an HTTP library or anything in it (`requests.post = fake`,
+    /// `requests.Session.request = pin`, `Session.send = pin` after `from
+    /// requests import Session`), since `post` hands its arguments down to
+    /// them; `post`, or an attribute named at run time, written on an
+    /// object the scan cannot identify (`r = requests; r.post = fake`); and
+    /// a test helper aimed at one (`monkeypatch.setattr(requests, ...)`,
+    /// `mock.patch("requests.post")`).
     fn note_http_patch(&mut self) {
-        let written: Vec<(Node<'t>, usize)> = self
-            .config_assigns
-            .iter()
-            .filter(|assign| assign.attr == "post")
-            .map(|assign| (assign.object, assign.scope))
-            .chain(self.wild_attr_objects.iter().copied())
-            .collect();
-        for (object, scope) in written {
-            if self.http_patched.is_none() && self.http_module(object, scope).is_some() {
-                self.http_patched = Some(Self::feature(
-                    "an HTTP library's `post` replaced in this file",
-                    object,
+        let mut found = None;
+        for assign in &self.config_assigns {
+            if self.in_http_library(assign.object, assign.scope) {
+                found = Some(("an HTTP library patched in this file", assign.object));
+            } else if assign.attr == "post" && !self.identified(assign.object, assign.scope) {
+                found = Some((
+                    "`post` written on an object this scan cannot identify",
+                    assign.object,
                 ));
             }
+            if found.is_some() {
+                break;
+            }
         }
+        if found.is_none() {
+            found = self
+                .wild_attr_objects
+                .iter()
+                .find(|&&(object, scope)| {
+                    self.in_http_library(object, scope) || !self.identified(object, scope)
+                })
+                .map(|&(object, _)| {
+                    (
+                        "an attribute named at run time written on an HTTP library or an object this scan cannot identify",
+                        object,
+                    )
+                });
+        }
+        if found.is_none() {
+            found = self
+                .calls
+                .iter()
+                .find(|&&(call, scope)| self.patches_http(call, scope))
+                .map(|&(call, _)| ("an HTTP library patched by a test helper", call));
+        }
+        if let Some((what, node)) = found {
+            self.http_patched = Some(Self::feature(what, node));
+        }
+    }
+
+    /// Whether `object` is an HTTP library ([`HTTP_LIBRARIES`]) or something
+    /// in it: its root is a name bound by its import alone (see
+    /// [`Ctx::import_target`]) to the library or a path below it
+    /// (`requests.Session`, `Session` after `from requests import Session`).
+    fn in_http_library(&self, object: Node<'t>, scope: usize) -> bool {
+        let Some(target) = self
+            .object_root(object)
+            .and_then(|root| self.import_target(root, scope))
+        else {
+            return false;
+        };
+        HTTP_LIBRARIES.iter().any(|lib| {
+            target
+                .strip_prefix(lib)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+        })
+    }
+
+    /// Whether the scan knows what `object` is: its root is a name bound by
+    /// an import alone. An alias (`r = requests`), a parameter or `self`
+    /// is not known.
+    fn identified(&self, object: Node<'t>, scope: usize) -> bool {
+        self.object_root(object)
+            .is_some_and(|root| self.import_target(root, scope).is_some())
+    }
+
+    /// The name an attribute chain starts from (`requests` in
+    /// `requests.Session.request`), if it starts from one.
+    fn object_root(&self, object: Node<'t>) -> Option<Node<'t>> {
+        let mut root = object;
+        while root.kind() == "attribute" {
+            root = root.child_by_field_name("object")?;
+        }
+        (root.kind() == "identifier").then_some(root)
+    }
+
+    /// `monkeypatch.setattr(requests, "post", fake)`,
+    /// `monkeypatch.setattr("requests.post", fake)`,
+    /// `mock.patch("httpx.post")`, `patch.object(requests.Session, ...)`: a
+    /// call to a `setattr`, `patch` or `object` (of `patch`) whose first
+    /// argument is in an HTTP library or names one.
+    fn patches_http(&self, call: Node<'t>, scope: usize) -> bool {
+        let Some(function) = call.child_by_field_name("function") else {
+            return false;
+        };
+        let name = match function.kind() {
+            "identifier" => self.text(function),
+            "attribute" => function
+                .child_by_field_name("attribute")
+                .map_or("", |a| self.text(a)),
+            _ => return false,
+        };
+        let helper = match name {
+            "setattr" => function.kind() == "attribute",
+            "patch" => true,
+            "object" => function
+                .child_by_field_name("object")
+                .is_some_and(|o| self.text(o).ends_with("patch")),
+            _ => false,
+        };
+        let first = call
+            .child_by_field_name("arguments")
+            .and_then(|args| named_children(args).into_iter().next());
+        helper
+            && first.is_some_and(|arg| {
+                self.in_http_library(arg, scope)
+                    || self.literal(arg).is_ok_and(|path| {
+                        HTTP_LIBRARIES.iter().any(|lib| {
+                            path.strip_prefix(lib)
+                                .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+                        })
+                    })
+            })
     }
 
     /// The dict a `data=` or `content=` argument sends as JSON:
