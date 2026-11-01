@@ -117,7 +117,12 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     (
         GapKind::UnresolvedModel,
         "missing_model",
-        "no model is passed, so the SDK's or the server's default applies",
+        "no model is passed, so the SDK's, the server's or LangChain's default applies",
+    ),
+    (
+        GapKind::UnresolvedModel,
+        "langchain_copy",
+        "a copy of a LangChain chat model may be given another model, and calls on the copy are not followed",
     ),
     (
         GapKind::UnresolvedModel,
@@ -125,7 +130,11 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
         "the call passes more model values than the scan reads, so not all are listed",
     ),
     // The client the call goes through.
-    (GapKind::AmbiguousClient, "multiple_assignments", "the client is assigned more than one way"),
+    (
+        GapKind::AmbiguousClient,
+        "multiple_assignments",
+        "the client, or the class that builds it, is assigned more than one way",
+    ),
     (
         GapKind::AmbiguousClient,
         "in_file_callers",

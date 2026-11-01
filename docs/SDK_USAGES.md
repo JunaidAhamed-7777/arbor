@@ -248,8 +248,8 @@ The file must not do any of these:
 
 ## LangChain chat models
 
-LangChain's chat models call the OpenAI and Anthropic SDKs for you. The report
-follows these classes:
+LangChain's OpenAI and Anthropic chat models call those SDKs for you. The
+report follows these classes:
 
 | Class | Imported from | Routes like |
 |---|---|---|
@@ -259,17 +259,28 @@ follows these classes:
 | `ChatBedrock`, `ChatBedrockConverse` | `langchain_aws` | `boto3.client("bedrock-runtime")`: `bedrock` ([below](#amazon-bedrock-and-litellm)) |
 
 The partner packages (`langchain_openai`, `langchain_anthropic`,
-`langchain_aws`) are followed the way an SDK is: `from ... import`, `import
-langchain_openai` and a wildcard import. The deprecated
-`langchain_community.chat_models` and `langchain.chat_models` re-export other
-providers' models too, so they, and their submodules
-(`langchain_community.chat_models.openai`), are followed only through `from
-... import` of one of these classes; `import langchain_community.chat_models as
-cm` is not followed. No other LangChain name is tracked: other providers' chat
-models (`ChatOllama`, `ChatGoogleGenerativeAI`, `ChatVertexAI`, the deprecated
-`BedrockChat`), embeddings (`OpenAIEmbeddings`, `BedrockEmbeddings`),
-completion models (`langchain_openai.OpenAI`, `BedrockLLM`),
-`init_chat_model(...)` and LangChain's helpers report nothing.
+`langchain_aws`) are followed the way an SDK is: `from ... import`, `import langchain_openai` and a wildcard
+import. The deprecated `langchain_community.chat_models` and
+`langchain.chat_models` re-export other providers' models too, so they, and
+their submodules (`langchain_community.chat_models.openai`), are followed only
+through `from ... import` of one of these classes; `import
+langchain_community.chat_models as cm` is not followed. A name that more than
+one of these modules binds to the same class, as a `try`/`except ImportError`
+fallback from a partner package to a deprecated module does, is followed as
+that class; when one of them is the deprecated copy of an OpenAI class, the
+pre-1.0 rule below applies to it. A name bound to two different classes
+(`AzureChatOpenAI` or `ChatOpenAI`, chosen by a branch, a conditional
+expression or an import fallback), or to one of them and another value
+that may build a request (`None`, the usual optional-dependency fallback,
+does not), builds a chat model whose class is decided at run time: the
+constructor is recorded with its values, routes `unknown` and gets a
+`multiple_assignments` gap, under the first class that takes a model. When a
+fallback binds the partner `ChatOpenAI` and its deprecated copy, the record
+names the deprecated package, so the pre-1.0 rule applies to it. No other LangChain name is tracked: other
+providers' chat models (`ChatOllama`, `ChatGoogleGenerativeAI`, `ChatVertexAI`,
+the deprecated `BedrockChat`), embeddings (`OpenAIEmbeddings`,
+`BedrockEmbeddings`), completion models (`langchain_openai.OpenAI`,
+`BedrockLLM`), `init_chat_model(...)` and LangChain's helpers report nothing.
 
 - **The constructor binds the model.** `ChatOpenAI(model="gpt-4o")` is a
   construction and a call (`request: false`) whose `model` or `model_name`
@@ -288,14 +299,36 @@ completion models (`langchain_openai.OpenAI`, `BedrockLLM`),
 
   The classes are pydantic models that take keyword arguments only, so a
   positional argument is not read. A built model's requests send its model
-  field, read when they are sent, unless the call passes its own (`model`;
-  `model_id` or `modelId` on a Bedrock model; see the calls below). So a
-  write of either of its names (`model` or `model_name`; `model_id` or
-  `model`) on any object other than `self` or a same-file class
-  (`llm.model_name = ...`, `settings.model = ...`), or of an attribute with
-  a run-time name, gives the LangChain chat model values in the file a
-  `dynamic_feature` gap. So does making the model configurable at run time
-  (`configurable_fields(model_name=...)`, `configurable_alternatives(...)`).
+  field, read when they are sent, unless the call passes its own `model`
+  (`model_id` or `modelId` on a Bedrock model; see the calls below). LangChain sends `model_kwargs` over its own
+  parameters and `extra_body` over the request body, so a `model` in either
+  is sent over the field, and one in `extra_body` over one in
+  `model_kwargs`. A write, on any object other than `self` or a same-file
+  class, gives a value of a LangChain chat model in the file a
+  `dynamic_feature` gap when it may replace that value:
+  - a write of `model` or `model_name` (or `model_id`), with any value
+    (`llm.model_name = ...`, `settings.model = ...`), replaces the model
+    field under either of its names (`model_id` or `model` on a Bedrock
+    model). A `model` given in `model_kwargs` or
+    `extra_body` is sent over the field, so the write gives it no gap;
+  - a write of `model_kwargs` or `extra_body`, with any value
+    (`llm.extra_body = {"seed": 1}`), replaces what the constructor gives in
+    that field (`extra_body.model`);
+  - a write of `model_kwargs` or `extra_body` whose value may hold a key
+    replaces what is sent before it under that key: with a `model`, the
+    model field, and for `extra_body`, what `model_kwargs` gives under the
+    same key (`model_kwargs.model`). A value may hold any key unless it is
+    `None` (written there, or through a name assigned once, to `None`) or a
+    dict literal written there that cannot hold that key (no entry for it,
+    no `**` expansion and no computed key):
+    `llm.model_kwargs = {"response_format": ...}` keeps the model field.
+
+  An attribute written with a run-time name, and a model made configurable
+  at run time (`configurable_fields(model_name=...)`,
+  `configurable_alternatives(...)`), give every value the gap. A chat model
+  built with no model field already has its `missing_model` gap. A change
+  made in place (`llm.model_kwargs["model"] = ...`,
+  `llm.model_kwargs.update(...)`) is not seen.
 - **The route.** A chat model routes like the SDK client it builds, under the
   client rules in [Routes](#routes). Its endpoint is `base_url` or LangChain's
   own name for it (`openai_api_base`, `anthropic_api_url`), routed by host.
@@ -313,17 +346,33 @@ completion models (`langchain_openai.OpenAI`, `BedrockLLM`),
   client it holds (`llm.client`, `root_client`, `_client` and their async
   versions) is a `dynamic_feature` gap. Passing one of those to the
   constructor (`ChatOpenAI(client=OpenAI(base_url=...).chat.completions)`)
-  routes it `unknown` with a `given_client` gap.
+  routes it `unknown` with a `given_client` gap. A member of the SDK it builds
+  its client from replaced in the file (`openai.OpenAI = Recorder`) is a
+  `dynamic_feature` gap, as it is for that SDK's own clients.
 - **The pre-1.0 SDK.** The deprecated `ChatOpenAI` also runs on `openai<1.0`,
   where a chat model given no endpoint sends its requests through the
   module-level API. In a file that configures the module-level API (any
   routing setting, anywhere in the file), such a model routes `unknown` with a
   `langchain_module_config` gap. `langchain_openai` needs `openai>=1`, so this
   does not apply to it.
-- **Calls on a chat model** (`llm.invoke(...)`,
+- **Calls on a chat model** (`llm.invoke(...)`, `llm.stream(...)`,
   `llm.with_structured_output(...)`) are recorded with its routing, as calls on
-  a client are. What such a call returns, including a copy
-  (`llm.copy(update=...)`, which may change any field), is not followed.
+  a client are, and all with `request: false`, whatever the method is called.
+  What such a call returns is not followed, including a copy
+  (`llm.copy(update=...)`, `llm.model_copy(update=...)`). A copy's `update`
+  gives no value: pydantic sets those fields by their own names, not
+  LangChain's aliases (`model_name` on the OpenAI classes, `model` on
+  `ChatAnthropic`). An `update` that may set the model the copy sends is a
+  `langchain_copy` gap: one that names `model` or `model_name`, one that
+  gives `model_kwargs` or `extra_body` a value that may hold a `model` (the
+  rule for a write of those fields, above), or one the file cannot read as a
+  dict. The `update` is read where the call writes it, or as the `update`
+  entry of a same-file dict expanded with `**` (`llm.copy(**COPY_ARGS)`). A
+  name given as the `update` (`llm.copy(update=UPDATE)`) is passed on to
+  `copy`, so rule 5 does not read it: it is a gap unless it is assigned
+  once, to `None`. `update=None`, and a dict that sets none of those
+  (`llm.copy(update={"model_kwargs": {"response_format": ...}})`), are no
+  gap.
   LangChain sends a call's keyword arguments over the model's own parameters,
   so a call may pass its own `model` (`llm.invoke(q, model=...)`,
   `llm.bind(model=...)`), which is sent in place of the field: a literal is
@@ -331,7 +380,23 @@ completion models (`langchain_openai.OpenAI`, `BedrockLLM`),
   the file cannot read is a `splat` gap on `model`, as for an SDK request.
   LangChain's run options (`config`, `configurable`, `metadata`, `tags`,
   `callbacks`, `run_name`) and a call's positional input never reach the
-  provider's request, so a `model` key inside them is not read.
+  provider's request, so a `model` key inside them is not read, whether they
+  are written at the call or come from a same-file dict expanded with `**`.
+  A call through the SDK client a chat model holds is a call on that client,
+  not on the chat model: a request there is an SDK request (`request: true`)
+  of the SDK's package (`openai`, `anthropic`) with the chat model's routing,
+  read like any other, and its member is the path on that client. The OpenAI
+  classes hold the OpenAI client in `root_client` and `root_async_client`
+  (`langchain_openai` only) and its `chat.completions` resource in `client`
+  and `async_client`, so `llm.client.create(...)` is
+  `chat.completions.create`. `ChatAnthropic` holds the Anthropic client in
+  `_client` and `_async_client`, and the deprecated one in `client` and
+  `async_client` (`claude._client.messages.create(...)` is
+  `messages.create`). `ChatBedrock` and `ChatBedrockConverse` hold the
+  boto3 `bedrock-runtime` client in `client`, so
+  `llm.client.converse(modelId=...)` is a Bedrock request. A call through any
+  other field
+  (`llm._client.create(...)` on `ChatOpenAI`) stays a call on the chat model.
   On a Bedrock model, the Converse API sends a `model_id=` (or `modelId=`)
   given to the call instead of the model's own
   (`llm.invoke(q, model_id=...)`), so it is read there, and a `**` expansion
@@ -343,7 +408,9 @@ completion models (`langchain_openai.OpenAI`, `BedrockLLM`),
 
 `arbor retirements` checks only the model of these calls: LangChain takes its
 own arguments and builds the request, so the SDK's argument rules do not
-describe them (see [RETIREMENTS.md](RETIREMENTS.md)).
+describe them (see [RETIREMENTS.md](RETIREMENTS.md)). A request through the
+SDK client a chat model holds is checked like the same SDK request, on the
+member it reaches there.
 
 ## Amazon Bedrock and LiteLLM
 
