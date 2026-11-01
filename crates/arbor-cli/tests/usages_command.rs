@@ -272,3 +272,25 @@ fn a_single_file_can_be_scanned() {
     assert_eq!(report["usages"].as_array().unwrap().len(), 3);
     assert_eq!(report["usages"][0]["file"], "app.py");
 }
+
+#[test]
+fn a_wrapper_call_names_each_request_line_once() {
+    let dir = tempfile::tempdir().unwrap();
+    // Two model keys on one request, and two requests: each line once, in
+    // order.
+    fs::write(
+        dir.path().join("llm.py"),
+        "from openai import OpenAI\nclient = OpenAI()\ndef both(model):\n    return client.chat.completions.create(model=model, engine=model)\ndef ask(model):\n    if model:\n        return client.completions.create(model=model)\n    return client.chat.completions.create(model=model)\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("app.py"),
+        "from .llm import ask, both\nboth(model=\"gpt-4o\")\nask(model=\"gpt-4o\")\n",
+    )
+    .unwrap();
+    let output = arbor(dir.path(), &["usages"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("via llm.py:4\n"), "{stdout}");
+    assert!(stdout.contains("via llm.py:7,8\n"), "{stdout}");
+}
