@@ -99,7 +99,12 @@ on the schedule its router prefix names (`anthropic/claude-3-5-sonnet-20241022` 
 Anthropic's), else by its shape (`gpt-4o` on OpenAI's), with only the checks about the
 model, since LiteLLM takes OpenAI-style arguments and translates them for each provider.
 A Gemini model with no prefix (`gemini-2.5-flash`) is looked up on Google Cloud's (Vertex
-AI) schedule, where LiteLLM sends it; `gemini/gemini-2.5-flash` reaches the Gemini API.
+AI) schedule, where LiteLLM sends it; `gemini/gemini-2.5-flash` reaches the Gemini API, and
+a call that picks its provider itself (`custom_llm_provider`) is looked up on neither.
+A LiteLLM call the usage scan puts a routing gap on (a provider it picks itself, a
+replaced `litellm.completion`) is listed with *routing not confirmed*, and a model
+LiteLLM may not send (one next to a `deployment_id` or a `prompt_id`, a fallback that
+names its own deployment) is *confirm first*.
 Calls on Amazon Bedrock (a `boto3` `bedrock-runtime` client, LangChain's `ChatBedrock` and
 `ChatBedrockConverse`) are not checked: AWS keeps Bedrock's model schedule, which the data
 does not hold, so nothing is looked up for them, whatever their routing or model ID

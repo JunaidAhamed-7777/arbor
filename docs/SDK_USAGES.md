@@ -478,9 +478,9 @@ session given `botocore_session` or a `**` expansion are not followed.
 **LiteLLM.** `litellm.completion(...)` and `litellm.acompletion(...)`,
 however they are imported (`from litellm import completion`,
 `litellm.main.completion`). The model is `model`, by keyword or as the first
-positional argument, read under the value rules, and so is a
-`deployment_id`; `completion` takes no `engine` or `model_name`, so those are
-not read. A `fallbacks=[{"model": ...}]` entry is a nested value, while
+positional argument (also next to a `deployment_id`), read under the value
+rules, and so is a `deployment_id`; `completion` takes no `engine` or
+`model_name`, so those are not read. A `fallbacks=[{"model": ...}]` entry is a nested value, while
 plain-string fallbacks (`fallbacks=["gpt-4o-mini"]`) and
 `litellm.model_fallbacks` are not read.
 No other LiteLLM function is followed
@@ -492,9 +492,12 @@ not a gap.
   the model string (`anthropic/...`, `azure/...`, `bedrock/...`) and its
   arguments and configuration (`custom_llm_provider=`, `api_base=`, the
   environment, `litellm.api_base`), so the report does not say which
-  provider's API the call reaches. Replacing `litellm.completion` is a
-  `dynamic_feature` gap on the route; a setting
-  (`litellm.drop_params = True`) changes nothing.
+  provider's API the call reaches. A call given `custom_llm_provider` or
+  `azure=True`, by keyword or in a same-file dict expanded with `**`, picks
+  its provider before the model's name does: an `ambiguous_client` gap,
+  `litellm_provider`. Replacing `litellm.completion` is a `dynamic_feature`
+  gap on the route; a setting (`litellm.drop_params = True`) changes
+  nothing.
 - **Remapped models.** LiteLLM may send a model name it is given to another
   model, and these gaps hold no key, so they cover every model value of the
   call, nested fallbacks included:
@@ -503,24 +506,33 @@ not a gap.
   - a `model_list` passed to the call, by keyword or in a same-file dict
     expanded with `**`, maps it to a deployment: a `model_list` gap, and the
     list's entries are not read as models;
-  - a `**` expansion the file cannot read may hold a `model_list`: a
-    `splat` gap.
+  - a `prompt_id`, by keyword or in a same-file dict, runs the prompt hooks
+    of a prompt-management integration registered elsewhere, whose
+    template may name the model: a `prompt_id` gap;
+  - a `**` expansion the file cannot read may hold a `model_list`, a
+    `deployment_id` or a `prompt_id`: a `splat` gap.
 
   A `deployment_id`, by keyword or in a same-file dict expanded with `**`,
-  replaces the `model` (`completion` sets `model = deployment_id` and sends it
-  to Azure): the `model` keeps a `reassigned` gap, and the deployment is the
-  value sent.
+  is sent to Azure in place of the `model` and of every fallback's model
+  (`completion` sets `model = deployment_id`, and each fallback attempt gets
+  the call's arguments): each of those values keeps a `deployment_id` gap,
+  and the deployment is the value sent. A fallback dict that names its own
+  `deployment_id` gives that fallback's model the same gap, and one that
+  names its own `custom_llm_provider` a `litellm_provider` gap.
 
 `arbor retirements` does not check Bedrock calls: AWS keeps Bedrock's model
 schedule, which the bundled data does not hold, so nothing is looked up for a
 `boto3` Bedrock call or a LangChain Bedrock model's, whatever its routing
 (`bedrock`, `custom_base_url` for a gateway, `unknown`) and its model ID, and
 none is listed or counted. LiteLLM calls are routed: counted, and listed with
-`--include-routed`. A LiteLLM model is looked up on the schedule its router prefix names (`openai/`,
-`anthropic/`, `gemini/`, `vertex_ai/`), else by its shape, except that a
-Gemini model with no prefix (`gemini-2.5-flash`) is looked up on Vertex AI's
-schedule, where LiteLLM sends it; only `gemini/<model>` reaches the Gemini
-API. As for LangChain, only the checks about the model apply (see
+`--include-routed`, or with their routing not confirmed when the call has a
+routing gap. A LiteLLM model is looked up on the schedule its router prefix
+names (`openai/`, `anthropic/`, `gemini/`, `vertex_ai/`), else by its shape,
+except that a Gemini model with no prefix (`gemini-2.5-flash`) is looked up on
+Vertex AI's schedule, where LiteLLM sends it (only `gemini/<model>` reaches
+the Gemini API), and on neither Google schedule when the call picks its
+provider itself (`custom_llm_provider`) or has another routing gap. As for
+LangChain, only the checks about the model apply (see
 [RETIREMENTS.md](RETIREMENTS.md)).
 
 ## Dynamic features
