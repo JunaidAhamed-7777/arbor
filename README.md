@@ -88,7 +88,7 @@ account, API key or telemetry.
 | **GitHub Action `mode: retirements`** | The same check in CI: a job summary of the affected calls it finds, and warnings on the most urgent lines. It warns by default and fails the build only when you set `retirements-fail-on`, or when the check cannot run. |
 | **`arbor usages` and `find_api_usages`** | The OpenAI, Anthropic and Gemini SDK calls Arbor finds, with their file and line, client routing (direct, Azure, custom `base_url`, Bedrock, Vertex) and model IDs, for people and agents. A value is confirmed only inside a small supported grammar; everything else carries a typed gap. [What a report confirms](docs/SDK_USAGES.md) |
 
-v3.1.0 reads Python only; TypeScript and JavaScript are listed under
+v3.1.0 and v3.1.1 read Python only; TypeScript and JavaScript are listed under
 Unreleased in the [changelog](CHANGELOG.md). [Release notes](docs/RELEASE_NOTES_v3.1.0.md)
 
 </details>
