@@ -3150,10 +3150,6 @@ fn a_request_given_middleware_or_another_url_may_go_elsewhere() {
         format!("client.messages.create({params}, {{ middleware: [{fallback}, viaGateway] }});"),
         format!("client.messages.create({params}, {{ defaultBaseURL: \"https://gateway.example.com\" }});"),
         format!("client.messages.create({params}, {{ path: \"https://gateway.example.com/v1/messages\" }});"),
-        // Options this file does not show may hold any of them.
-        format!("client.messages.create({params}, requestOptions);"),
-        format!("client.messages.create({params}, {{ ...requestOptions, timeout: 1000 }});"),
-        format!("client.messages.create({params}, {{ [key]: [viaGateway] }});"),
     ] {
         let found = usages(&format!(
             "{anthropic}\n{gateway}const client = new Anthropic();\n{request}"
@@ -3173,11 +3169,37 @@ fn a_request_given_middleware_or_another_url_may_go_elsewhere() {
         assert_eq!(value(c, "model"), Some("claude-3-5-sonnet-20241022"));
         assert_eq!(routing_of(&found, "client"), Routing::AnthropicDirect);
     }
+    // Options this file does not show may hold any of them, and a `body`
+    // that replaces the one written.
+    for request in [
+        format!("client.messages.create({params}, requestOptions);"),
+        format!("client.messages.create({params}, {{ ...requestOptions, timeout: 1000 }});"),
+        format!("client.messages.create({params}, {{ [key]: [viaGateway] }});"),
+    ] {
+        let found = usages(&format!(
+            "{anthropic}\n{gateway}const client = new Anthropic();\n{request}"
+        ));
+        let c = call(&found, "client.messages.create");
+        assert_eq!(c.routing, Routing::Unknown, "{request}");
+        assert_eq!(
+            gaps_at(&found, c),
+            vec!["unresolved_model/splat", "ambiguous_client/endpoint_option"],
+            "{request}"
+        );
+        assert_eq!(value(c, "model"), None);
+        assert_eq!(routing_of(&found, "client"), Routing::AnthropicDirect);
+    }
     // OpenAI's request options take a `path` and a `defaultBaseURL` too.
-    for options in [
-        "{ path: \"https://gateway.example.com/v1/chat/completions\" }",
-        "{ defaultBaseURL: \"https://gateway.example.com/v1\" }",
-        "requestOptions",
+    for (options, body) in [
+        (
+            "{ path: \"https://gateway.example.com/v1/chat/completions\" }",
+            false,
+        ),
+        (
+            "{ defaultBaseURL: \"https://gateway.example.com/v1\" }",
+            false,
+        ),
+        ("requestOptions", true),
     ] {
         let (routing, gaps) = route(
             &format!(
@@ -3187,7 +3209,11 @@ client.chat.completions.create({{ model: \"gpt-4o\", messages: [] }}, {options})
             "chat.completions.create",
         );
         assert_eq!(routing, Routing::Unknown, "{options}");
-        assert_eq!(gaps, vec!["ambiguous_client/endpoint_option"], "{options}");
+        let mut expected = vec!["ambiguous_client/endpoint_option"];
+        if body {
+            expected.insert(0, "unresolved_model/splat");
+        }
+        assert_eq!(gaps, expected, "{options}");
     }
     let (routing, gaps) = route(
         &format!(
@@ -3272,7 +3298,7 @@ client.chat.completions.create({{ model: \"gpt-4o\", messages: [] }}, requestOpt
         "chat.completions.create",
     );
     assert_eq!(routing, Routing::CustomBaseUrl);
-    assert!(gaps.is_empty(), "{gaps:?}");
+    assert_eq!(gaps, vec!["unresolved_model/splat"]);
 }
 
 #[test]
@@ -3355,33 +3381,39 @@ export const supportBot = new SupportBot();
         assert_eq!(model.as_deref(), Some("claude-3-5-sonnet-20241022"));
         assert!(gaps.is_empty(), "{source}: {gaps:?}");
     }
-    // A value that may hold one, or one the file cannot read.
-    for (fields, body, options) in [
+    // A value that may hold one, or one the file cannot read, which may
+    // also hold a `body` that replaces the one written.
+    for (fields, body, options, read) in [
         (
             "  private readonly requestOptions = { middleware: [viaGateway] };",
             "",
             "this.requestOptions",
+            true,
         ),
         (
             "  static readonly OPTIONS = { path: \"https://gateway.example.com/v1/messages\" };",
             "",
             "SupportBot.OPTIONS",
+            true,
         ),
-        ("", "", "signal ? { middleware: [viaGateway] } : undefined"),
+        ("", "", "signal ? { middleware: [viaGateway] } : undefined", true),
         (
             "",
             "",
             "{ maxRetries: 0, ...(signal ? { defaultBaseURL: \"https://gateway.example.com\" } : {}) }",
+            true,
         ),
         (
             "",
             "    let opts: any = { timeout: 30_000 };\n    if (slow) opts = { path: \"https://gateway.example.com/v1/messages\" };",
             "opts",
+            true,
         ),
         (
             "",
             "    let opts: any = { timeout: 1 };\n    if (slow) opts = { ...opts, middleware: [viaGateway] };",
             "opts",
+            true,
         ),
         // Written by the file through the property, or given to a call
         // that may write it.
@@ -3389,25 +3421,37 @@ export const supportBot = new SupportBot();
             "  private readonly requestOptions: any = { timeout: 60_000 };\n  useGateway() { this.requestOptions.middleware = [viaGateway]; }",
             "",
             "this.requestOptions",
+            false,
         ),
         (
             "  private readonly requestOptions: any = { timeout: 60_000 };\n  useGateway() { const o = this.requestOptions; o.middleware = [viaGateway]; }",
             "",
             "this.requestOptions",
+            false,
         ),
         (
             "",
             "    const opts = { timeout: 1 };\n    configure(opts);",
             "opts",
+            false,
         ),
-        ("", "", "signal ? { signal } : extraOptions"),
-        ("", "", "{ ...(signal ? { signal } : defaults()) }"),
+        ("", "", "signal ? { signal } : extraOptions", false),
+        ("", "", "{ ...(signal ? { signal } : defaults()) }", false),
     ] {
         let source = bot(fields, body, options);
         let (routing, model, gaps) = reply(&source);
         assert_eq!(routing, Routing::Unknown, "{source}");
-        assert_eq!(model.as_deref(), Some("claude-3-5-sonnet-20241022"));
-        assert_eq!(gaps, vec!["ambiguous_client/endpoint_option"], "{source}");
+        if read {
+            assert_eq!(model.as_deref(), Some("claude-3-5-sonnet-20241022"));
+            assert_eq!(gaps, vec!["ambiguous_client/endpoint_option"], "{source}");
+        } else {
+            assert_eq!(model, None, "{source}");
+            assert_eq!(
+                gaps,
+                vec!["unresolved_model/splat", "ambiguous_client/endpoint_option"],
+                "{source}"
+            );
+        }
     }
     // Names that hold each other: each holds what the other may.
     for order in [["a", "b"], ["b", "a"]] {
@@ -3443,7 +3487,10 @@ setTimeout(new Bot().reply);",
         "messages.create",
     );
     assert_eq!(routing, Routing::Unknown);
-    assert_eq!(gaps, vec!["ambiguous_client/endpoint_option"]);
+    assert_eq!(
+        gaps,
+        vec!["unresolved_model/splat", "ambiguous_client/endpoint_option"]
+    );
     // As for the client it reads through `this`, a subclass in another
     // module is taken not to replace an exported class's options.
     let source = bot(
@@ -4085,8 +4132,11 @@ client.messages.create({ model: \"claude-3-5-sonnet-20241022\", max_tokens: 10, 
 const client = new Anthropic();
 client.messages.create({{ model: \"claude-3-5-sonnet-20241022\", max_tokens: 10, messages: [] }}, {request});"
         ));
-        let gap = &found.gaps[0];
-        assert_eq!(gap.reason, "endpoint_option");
+        let gap = found
+            .gaps
+            .iter()
+            .find(|g| g.reason == "endpoint_option")
+            .unwrap_or_else(|| panic!("{:?}", found.gaps));
         assert_eq!(
             gap.detail,
             format!(
@@ -4309,7 +4359,12 @@ export class Summarizer {{
 "
         )
     };
-    let gapped = vec!["ambiguous_client/endpoint_option".to_string()];
+    // Options the file cannot read may also hold a `body` that replaces
+    // the one written.
+    let gapped = vec![
+        "unresolved_model/splat".to_string(),
+        "ambiguous_client/endpoint_option".to_string(),
+    ];
     for (method, after) in [
         (
             "setOption(key: string, value: unknown) { (this.requestOptions as any)[key] = value; }",
@@ -4521,7 +4576,10 @@ export async function POST(req: Request) {{
             create_route(&source),
             (
                 Routing::Unknown,
-                vec!["ambiguous_client/endpoint_option".to_string()]
+                vec![
+                    "unresolved_model/splat".to_string(),
+                    "ambiguous_client/endpoint_option".to_string()
+                ]
             ),
             "{writes}"
         );
@@ -4578,23 +4636,29 @@ fn request_options_reached_through_a_conditional_or_a_same_file_function_are_rea
             "{source}"
         );
     }
-    for body in [
+    // Options the file cannot read may also hold a `body` that replaces the
+    // one written.
+    for (body, read) in [
         // Another module may call it, or pass another value.
-        format!("export function complete(prompt: string, options?: OpenAI.RequestOptions) {{\n  return {create}, options);\n}}"),
-        format!("function complete(prompt: string, options?: OpenAI.RequestOptions) {{\n  return {create}, options);\n}}\nexport const ask = complete;"),
-        format!("function complete(prompt: string, options?: any) {{\n  return {create}, options);\n}}\nexport const ask = (p: string, o: any) => complete(p, o);"),
-        format!("function complete(prompt: string, options?: any) {{\n  return {create}, options);\n}}\nexport const ask = (p: string) => complete(p, {{ path: \"https://gateway.example.com/v1/chat/completions\" }});"),
+        (format!("export function complete(prompt: string, options?: OpenAI.RequestOptions) {{\n  return {create}, options);\n}}"), false),
+        (format!("function complete(prompt: string, options?: OpenAI.RequestOptions) {{\n  return {create}, options);\n}}\nexport const ask = complete;"), false),
+        (format!("function complete(prompt: string, options?: any) {{\n  return {create}, options);\n}}\nexport const ask = (p: string, o: any) => complete(p, o);"), false),
+        (format!("function complete(prompt: string, options?: any) {{\n  return {create}, options);\n}}\nexport const ask = (p: string) => complete(p, {{ path: \"https://gateway.example.com/v1/chat/completions\" }});"), true),
         // The helper returns something it cannot read, or may be replaced.
-        format!("function requestOptions(o: any) {{ return {{ ...o }}; }}\nexport async function POST(o: any) {{\n  return {create}, requestOptions(o));\n}}"),
-        format!("let requestOptions = () => ({{ timeout: 1 }});\nexport function swap(f: any) {{ requestOptions = f; }}\nexport async function POST() {{\n  return {create}, requestOptions());\n}}"),
-        format!("function requestOptions() {{ return {{ fetch: proxy }}; }}\nexport async function POST() {{\n  return {create}, requestOptions());\n}}"),
+        (format!("function requestOptions(o: any) {{ return {{ ...o }}; }}\nexport async function POST(o: any) {{\n  return {create}, requestOptions(o));\n}}"), false),
+        (format!("let requestOptions = () => ({{ timeout: 1 }});\nexport function swap(f: any) {{ requestOptions = f; }}\nexport async function POST() {{\n  return {create}, requestOptions());\n}}"), false),
+        (format!("function requestOptions() {{ return {{ fetch: proxy }}; }}\nexport async function POST() {{\n  return {create}, requestOptions());\n}}"), true),
         // The name used as a side is passed elsewhere too.
-        format!("const base: any = {{ timeout: 30_000 }};\nconfigure(base);\nexport async function ask(signal?: AbortSignal) {{\n  return {create}, signal ? {{ ...base, signal }} : base);\n}}"),
+        (format!("const base: any = {{ timeout: 30_000 }};\nconfigure(base);\nexport async function ask(signal?: AbortSignal) {{\n  return {create}, signal ? {{ ...base, signal }} : base);\n}}"), false),
     ] {
         let source = file(&body);
         let (routing, gaps) = create_route(&source);
         assert_eq!(routing, Routing::Unknown, "{source}");
-        assert_eq!(gaps, vec!["ambiguous_client/endpoint_option"], "{source}");
+        let mut expected = vec!["ambiguous_client/endpoint_option"];
+        if !read {
+            expected.insert(0, "unresolved_model/splat");
+        }
+        assert_eq!(gaps, expected, "{source}");
     }
 }
 
@@ -4754,7 +4818,7 @@ new Bot().run(\"ask\");
         .unwrap_or_else(|| panic!("{:?}", found.gaps));
     assert_eq!(
         client.detail,
-        "the receiver of `this.client.messages.create` is read through `this` in a method that may run with another object as `this` (a computed member run with another `this` at line 9), so it may be another object's"
+        "the receiver of `this.client.messages.create` is read through `this` in a method that may run with another object as `this` (a computed member run with another `this` at line 9), so it may be another object's property"
     );
     assert!(gaps_at(&found, c).contains(&"ambiguous_client/multiple_assignments".to_string()));
     // A method name read without being called, named at its first read.
@@ -4810,7 +4874,885 @@ export class Svc {{
         create_route(&source),
         (
             Routing::Unknown,
-            vec!["ambiguous_client/endpoint_option".to_string()]
+            vec![
+                "unresolved_model/splat".to_string(),
+                "ambiguous_client/endpoint_option".to_string()
+            ]
         )
     );
+}
+
+/// The model value, its origin and the gaps of the only Anthropic
+/// `messages.create` call in `source`.
+fn messages_row(source: &str) -> (Option<String>, Option<ValueOrigin>, Vec<String>) {
+    let found = usages(source);
+    let c = found
+        .calls
+        .iter()
+        .find(|c| c.member == "messages.create")
+        .unwrap_or_else(|| panic!("no create call: {:?} {:?}", found.calls, found.gaps));
+    (
+        value(c, "model").map(str::to_string),
+        c.values.iter().find(|v| v.key == "model").map(|v| v.origin),
+        gaps_at(&found, c),
+    )
+}
+
+const ANTHROPIC: &str =
+    "import Anthropic from \"@anthropic-ai/sdk\";\nconst client = new Anthropic();\n";
+
+/// A class whose method sends its class property as the model.
+const ANTHROPIC_BOT: &str = "class Bot {
+  private model = \"claude-3-5-sonnet-20241022\";
+  ask() { return client.messages.create({ model: this.model, max_tokens: 10, messages: [] }); }
+";
+
+#[test]
+fn a_member_read_under_a_run_time_name_may_be_any_method() {
+    // `this[m]` read rather than called right there is Python's
+    // `getattr(self, m)`: the method it reads may be called from anywhere,
+    // and with another `this`. So is the same read on a name holding an
+    // instance, on the class (its static methods) and on its prototype,
+    // and `Reflect.get` with a run-time name.
+    for run in [
+        "run(m: \"ask\") { const f = this[m]; return f.call({ model: \"claude-sonnet-5-5\" }); }\n}\nnew Bot().run(\"ask\");",
+        "run(m: \"ask\") { return Reflect.apply(this[m], { model: \"claude-sonnet-5-5\" }, []); }\n}\nnew Bot().run(\"ask\");",
+        "run(m: \"ask\") { const f = (this as any)[m]; return f.call({ model: \"claude-sonnet-5-5\" }); }\n}\nnew Bot().run(\"ask\");",
+        "run(m: \"ask\") { return Reflect.get(this, m).call({ model: \"claude-sonnet-5-5\" }); }\n}\nnew Bot().run(\"ask\");",
+        "}\nconst bot = new Bot();\nexport function run(m: string) { const f = (bot as any)[m]; return f.call({ model: \"claude-sonnet-5-5\" }); }",
+        "}\nexport function run(m: string) { const f = (Bot.prototype as any)[m]; return f.call({ model: \"claude-sonnet-5-5\" }); }",
+        "}\nfunction pick(b: Bot, m: string) { return (b as any)[m]; }\nexport const run = (m: string) => pick(new Bot(), m).call({ model: \"claude-sonnet-5-5\" });",
+        "me() { return this; }\n}\nconst b = new Bot().me();\nexport function run(m: string) { const f = (b as any)[m]; return f.call({ model: \"claude-sonnet-5-5\" }); }",
+        "}\nexport function run(m: string) { for (const b of [new Bot()]) { const f = (b as any)[m]; return f.call({ model: \"claude-sonnet-5-5\" }); } }",
+    ] {
+        let source = format!("{ANTHROPIC}{ANTHROPIC_BOT}  {run}\n");
+        let (value, origin, gaps) = messages_row(&source);
+        assert_eq!(value.as_deref(), Some("claude-3-5-sonnet-20241022"), "{source}");
+        assert_eq!(origin, Some(ValueOrigin::ClassConstant), "{source}");
+        assert_eq!(gaps, vec!["unresolved_model/attribute"], "{source}");
+    }
+    // A static method read off the class.
+    let (_, _, gaps) = messages_row(&format!(
+        "{ANTHROPIC}class Bot {{
+  static model = \"claude-3-5-sonnet-20241022\";
+  static ask() {{ return client.messages.create({{ model: this.model, max_tokens: 10, messages: [] }}); }}
+}}
+export function run(m: string) {{ const f = (Bot as any)[m]; return f.call({{ model: \"claude-sonnet-5-5\" }}); }}
+"
+    ));
+    assert!(
+        gaps.contains(&"unresolved_model/attribute".to_string()),
+        "{gaps:?}"
+    );
+    // A private method's parameter default: its calls are not all seen.
+    let dispatcher = |route: &str| {
+        format!(
+            "class Svc {{
+  private summarize(model = \"gpt-4o\") {{
+    return client.chat.completions.create({{ model, messages: [] }});
+  }}
+  run(task: \"summarize\", model: string) {{ {route} }}
+}}
+new Svc().run(\"summarize\", \"gpt-5.5\");"
+        )
+    };
+    for route in [
+        "const handler = this[task]; return handler.call(this, model);",
+        "const handler = (this as any)[`${task}`]; if (typeof handler !== \"function\") throw new Error(task); return handler.call(this, model);",
+        "return Reflect.apply(this[task], this, [model]);",
+        "return Reflect.get(this, task).call(this, model);",
+        "return Reflect.get(this, \"summarize\").call(this, model);",
+        "return (0, this[task])(model);",
+        "return [this[task]][0](model);",
+        "return Function.prototype.call.call(this[task], this, model);",
+        "if (typeof this[task] !== \"function\") return null; return this.summarize();",
+    ] {
+        let (value, origin, gaps) = model_row(&dispatcher(route));
+        assert_eq!(value.as_deref(), Some("gpt-4o"), "{route}");
+        assert_eq!(origin, Some(ValueOrigin::ParameterDefault), "{route}");
+        assert_eq!(gaps, vec!["unresolved_model/unseen_callers"], "{route}");
+    }
+    // The `unseen_callers` detail names the read and its line.
+    let found = usages(&with_client(&dispatcher(
+        "const handler = this[task]; return handler.call(this, model);",
+    )));
+    let gap = found
+        .gaps
+        .iter()
+        .find(|g| g.reason == "unseen_callers")
+        .unwrap_or_else(|| panic!("{:?}", found.gaps));
+    assert!(
+        gap.detail
+            .contains("a member read under a name known only at run time at line 7"),
+        "{}",
+        gap.detail
+    );
+    // An object literal looked up by key is no instance, and neither is
+    // an object literal's own `this`; `#name` is out of reach of a key.
+    for elsewhere in [
+        "const MODELS: Record<string, string> = { fast: \"gpt-4o-mini\" };\nexport const pick = (k: string) => MODELS[k];",
+        "export const store = { items: {} as any, get(k: string) { return this.items[k] ?? this[k as \"items\"]; } };",
+        "export function row(r: any, k: string) { return r[k]; }",
+    ] {
+        let (value, gaps) = model_of(&format!(
+            "class Bot {{ private model = \"gpt-4\"; ask() {{ return client.chat.completions.create({{ model: this.model, messages: [] }}); }} }}
+new Bot().ask();
+{elsewhere}"
+        ));
+        assert_eq!(value.as_deref(), Some("gpt-4"), "{elsewhere}");
+        assert!(gaps.is_empty(), "{elsewhere}: {gaps:?}");
+    }
+    let (value, gaps) = model_of(
+        "class Bot {
+  private model = \"gpt-4\";
+  #ask() { return client.chat.completions.create({ model: this.model, messages: [] }); }
+  run() { return this.#ask(); }
+  pick(m: string) { const f = (this as any)[m]; return f.call({ model: \"gpt-5.5\" }); }
+}
+new Bot().run();",
+    );
+    assert_eq!(value.as_deref(), Some("gpt-4"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn a_body_in_request_options_replaces_the_model_written() {
+    // Both SDKs send `{ body, ...options }`: a `body` in the request
+    // options replaces the one written, so its model is only a candidate.
+    let found = usages(&with_client(
+        "client.chat.completions.create({ model: \"gpt-4o\", messages: [] }, { body: { model: \"gpt-5.5\", messages: [] } });",
+    ));
+    let c = call(&found, "client.chat.completions.create");
+    assert_eq!(value(c, "model"), None);
+    assert_eq!(value(c, "body.model"), Some("gpt-5.5"));
+    let gap = found
+        .gaps
+        .iter()
+        .find(|g| g.reason == "splat")
+        .unwrap_or_else(|| panic!("{:?}", found.gaps));
+    assert_eq!(gap.key.as_deref(), Some("model"));
+    assert_eq!(
+        gap.values
+            .iter()
+            .map(|v| v.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["gpt-4o"]
+    );
+    assert!(
+        gap.detail.contains(
+            "is written in the request body, which request options that may hold a `body` replace"
+        ),
+        "{}",
+        gap.detail
+    );
+    for request in [
+        format!("{ANTHROPIC}client.messages.create(\n  {{ model: \"claude-3-5-sonnet-20241022\", max_tokens: 10, messages: [] }},\n  {{ body: {{ model: \"claude-sonnet-5-5\", max_tokens: 10, messages: [] }} }},\n);"),
+        format!("{ANTHROPIC}const opts = {{ timeout: 1, body: {{ model: \"claude-sonnet-5-5\" }} }};\nclient.messages.create({{ model: \"claude-3-5-sonnet-20241022\", max_tokens: 10, messages: [] }}, opts);"),
+        format!("{ANTHROPIC}export class Bot {{\n  private opts = {{ body: {{ model: \"claude-sonnet-5-5\" }} }};\n  ask() {{ return client.messages.create({{ model: \"claude-3-5-sonnet-20241022\", max_tokens: 10, messages: [] }}, this.opts); }}\n}}"),
+        "import { AnthropicVertex } from \"@anthropic-ai/vertex-sdk\";\nconst client = new AnthropicVertex();\nexport const ask = (o: any) => client.messages.create({ model: \"claude-3-5-sonnet-20241022\", max_tokens: 10, messages: [] }, o);".to_string(),
+    ] {
+        let (value, _, gaps) = messages_row(&request);
+        assert_eq!(value, None, "{request}");
+        assert!(
+            gaps.contains(&"unresolved_model/splat".to_string()),
+            "{request}: {gaps:?}"
+        );
+    }
+    // Every argument written may be replaced: the call's `splat` says so.
+    assert!(c.splat);
+    // A value that already has a gap keeps it, with the body's next to it;
+    // one that is not found keeps its own.
+    let found = usages(&with_client(
+        "export class Bot {
+  private model = \"gpt-4-0613\";
+  ask(o: any) { return client.chat.completions.create({ model: this.model, messages: [] }, o); }
+}",
+    ));
+    let c = call(&found, "client.chat.completions.create");
+    assert_eq!(value(c, "model"), Some("gpt-4-0613"));
+    let reasons: Vec<&str> = found
+        .gaps
+        .iter()
+        .filter(|g| g.key.as_deref() == Some("model"))
+        .map(|g| g.reason.as_str())
+        .collect();
+    assert_eq!(reasons, vec!["subclass_override", "splat"]);
+    let splat = found
+        .gaps
+        .iter()
+        .find(|g| g.reason == "splat")
+        .unwrap_or_else(|| panic!("{:?}", found.gaps));
+    assert!(
+        splat
+            .detail
+            .ends_with("its value is captured with origin `class_constant`"),
+        "{}",
+        splat.detail
+    );
+    let found = usages(&with_client(
+        "import { CONFIG } from \"./config\";
+export const ask = (o: any) => client.chat.completions.create({ model: CONFIG.model, messages: [] }, o);",
+    ));
+    let reasons: Vec<&str> = found
+        .gaps
+        .iter()
+        .filter(|g| g.key.as_deref() == Some("model"))
+        .map(|g| g.reason.as_str())
+        .collect();
+    assert_eq!(reasons, vec!["attribute"]);
+    assert!(call(&found, "client.chat.completions.create").splat);
+    // A model nested in the body is replaced too.
+    let found = usages(&format!(
+        "{ANTHROPIC}client.messages.batches.create({{ requests: [{{ custom_id: \"a\", params: {{ model: \"claude-3-5-sonnet-20241022\", max_tokens: 1, messages: [] }} }}] }}, {{ body: {{}} }});"
+    ));
+    assert!(
+        found
+            .gaps
+            .iter()
+            .any(|g| g.reason == "splat" && g.key.as_deref() == Some("requests.params.model")),
+        "{:?}",
+        found.gaps
+    );
+    // Options that set only how the request is sent keep it.
+    for options in [
+        "{ headers: { \"x-a\": \"1\" }, timeout: 1000, maxRetries: 1 }",
+        "{ signal: AbortSignal.timeout(1000) }",
+        "undefined",
+    ] {
+        let (value, gaps) = model(&with_client(&format!(
+            "client.chat.completions.create({{ model: \"gpt-4o\", messages: [] }}, {options});"
+        )));
+        assert_eq!(value.as_deref(), Some("gpt-4o"), "{options}");
+        assert!(gaps.is_empty(), "{options}: {gaps:?}");
+    }
+}
+
+#[test]
+fn a_method_run_on_an_object_that_borrows_its_class_reads_that_object() {
+    // A `Proxy` of an instance, an object made from an instance or the
+    // class's prototype, and a method taken from the prototype's
+    // descriptor all run the class's methods with another `this`.
+    for (after, gap) in [
+        (
+            "const p = new Proxy(new Bot(), { get(t: any, k) { return k === \"model\" ? \"claude-sonnet-5-5\" : t[k]; } });\np.ask();",
+            "attribute",
+        ),
+        (
+            "const o = Object.create(new Bot(), { model: { value: \"claude-sonnet-5-5\" } });\no.ask();",
+            "attribute",
+        ),
+        (
+            "const o: any = { model: \"claude-sonnet-5-5\", __proto__: Bot.prototype };\no.ask();",
+            "attribute",
+        ),
+        (
+            "const o: any = Object.setPrototypeOf({ model: \"claude-sonnet-5-5\" }, Bot.prototype);\no.ask();",
+            "attribute",
+        ),
+        (
+            "Object.getOwnPropertyDescriptor(Bot.prototype, \"ask\")!.value.call({ model: \"claude-sonnet-5-5\" });",
+            "attribute",
+        ),
+        (
+            "const o: any = { model: \"claude-sonnet-5-5\", __proto__: new Bot() };\no.ask();",
+            "attribute",
+        ),
+        (
+            "const bot = new Bot();\nconst o: any = Object.setPrototypeOf({ model: \"claude-sonnet-5-5\" }, bot);\no.ask();",
+            "attribute",
+        ),
+        (
+            "class Spy extends Bot {}\nconst o: any = Object.setPrototypeOf({ model: \"claude-sonnet-5-5\" }, Spy.prototype);\no.ask();",
+            "attribute",
+        ),
+        // A name that holds an instance, made a prototype every way the
+        // instance itself can be.
+        (
+            "const bot = new Bot();\n({ model: \"claude-sonnet-5-5\", __proto__: bot } as any).ask();",
+            "attribute",
+        ),
+        (
+            "const bot = new Bot();\nconst o: any = { model: \"claude-sonnet-5-5\" };\no.__proto__ = bot;\no.ask();",
+            "attribute",
+        ),
+        (
+            "const bot = new Bot();\nconst o: any = { model: \"claude-sonnet-5-5\" };\no[\"__proto__\"] = bot;\no.ask();",
+            "attribute",
+        ),
+        (
+            "const bot = new Bot();\nconst o: any = { model: \"claude-sonnet-5-5\" };\nReflect.set(o, \"__proto__\", bot);\no.ask();",
+            "attribute",
+        ),
+        (
+            "const o: any = { model: \"claude-sonnet-5-5\" };\nReflect.set(o, \"__proto__\", new Bot());\no.ask();",
+            "attribute",
+        ),
+    ] {
+        let source = format!("{ANTHROPIC}{ANTHROPIC_BOT}}}\n{after}\n");
+        let (value, _, gaps) = messages_row(&source);
+        if gap == "attribute" {
+            assert_eq!(value.as_deref(), Some("claude-3-5-sonnet-20241022"), "{source}");
+        }
+        assert_eq!(gaps, vec![format!("unresolved_model/{gap}")], "{source}");
+    }
+    // `Reflect.construct(Bot, [])` builds an instance (passing the class
+    // also lets another module extend it).
+    let (_, _, gaps) = messages_row(&format!(
+        "{ANTHROPIC}{ANTHROPIC_BOT}}}\nconst s = Reflect.construct(Bot, []);\nconst p = new Proxy(s, {{ get: (t: any, k) => (k === \"model\" ? \"claude-sonnet-5-5\" : t[k]) }});\np.ask();\n"
+    ));
+    assert!(
+        gaps.contains(&"unresolved_model/attribute".to_string()),
+        "{gaps:?}"
+    );
+    // A `Proxy` of the class itself runs its static methods with the proxy
+    // as `this`.
+    let (_, _, gaps) = messages_row(&format!(
+        "{ANTHROPIC}class Bot {{
+  static model = \"claude-3-5-sonnet-20241022\";
+  static ask() {{ return client.messages.create({{ model: this.model, max_tokens: 10, messages: [] }}); }}
+}}
+const P = new Proxy(Bot, {{ get: (t: any, k) => (k === \"model\" ? \"claude-sonnet-5-5\" : t[k]) }});
+P.ask();
+"
+    ));
+    assert!(
+        gaps.contains(&"unresolved_model/attribute".to_string()),
+        "{gaps:?}"
+    );
+    // The gap names the use and its line, and the value keeps its origin.
+    let found = usages(&format!(
+        "{ANTHROPIC}{ANTHROPIC_BOT}}}\nconst o: any = Object.setPrototypeOf({{ model: \"claude-sonnet-5-5\" }}, Bot.prototype);\no.ask();\n"
+    ));
+    let gap = found
+        .gaps
+        .iter()
+        .find(|g| g.reason == "attribute")
+        .unwrap_or_else(|| panic!("{:?}", found.gaps));
+    assert_eq!(
+        gap.detail,
+        "`model` for `client.messages.create` is `this.model`, read in a method that may run with another object as `this` (the class's prototype used as a value at line 7), so it may be that object's property; its value is captured with origin `class_constant`"
+    );
+    // The prototype compared, or a method read by name off it, is no
+    // object that borrows it; `Object.create`'s descriptors give only the
+    // new object its properties, and a prototype that is no instance
+    // lends no method.
+    for after in [
+        "new Bot().ask();\nexport const make = (proto: object) => Object.create(proto, { model: { value: \"claude-sonnet-5-5\" } });",
+        "new Bot().ask();\nconst base = { kind: \"a\" };\nexport const o = Object.create(base, { model: { value: \"x\", enumerable: true } });",
+        "new Bot().ask();\nconst o: any = {};\nconst p: any = { model: \"x\" };\no.__proto__ = p;\nReflect.set(o, \"__proto__\", p);",
+        "new Bot().ask();\nexport const isBot = (x: object) => Object.getPrototypeOf(x) === Bot.prototype;",
+        "new Bot().ask();\nconsole.log(Bot.prototype.ask.length);",
+        "new Bot().ask();\nexport const plain = Object.create(null, { x: { value: 1 } });",
+    ] {
+        let source = format!("{ANTHROPIC}{ANTHROPIC_BOT}}}\n{after}\n");
+        let (value, _, gaps) = messages_row(&source);
+        assert_eq!(value.as_deref(), Some("claude-3-5-sonnet-20241022"), "{source}");
+        assert!(gaps.is_empty(), "{source}: {gaps:?}");
+    }
+}
+
+#[test]
+fn class_held_request_options_reached_without_their_name_are_not_read() {
+    // A class property's object reached through a member read under a
+    // run-time name, through the instance's own entries, or through an
+    // instance handed to code that may change it.
+    let summarizer = |method: &str, after: &str| {
+        format!(
+            "{OPENAI}const client = new OpenAI();
+export class Summarizer {{
+  private requestOptions = {{ timeout: 30_000, maxRetries: 2 }};
+  {method}
+  summarize(text: string) {{
+    return client.chat.completions.create(
+      {{ model: \"gpt-4-0613\", messages: [{{ role: \"user\", content: text }}] }},
+      this.requestOptions,
+    );
+  }}
+}}
+{after}
+"
+        )
+    };
+    let gapped = vec![
+        "unresolved_model/splat".to_string(),
+        "ambiguous_client/endpoint_option".to_string(),
+    ];
+    for (method, after) in [
+        (
+            "configure(section: string, path: string) { const target = (this as any)[section]; target.path = path; }",
+            "",
+        ),
+        (
+            "",
+            "function override(obj: any, section: string, url: string) { obj[section].path = url; }\nconst s = new Summarizer();\noverride(s, \"requestOptions\", \"https://gateway.example.com/v1/chat/completions\");",
+        ),
+        (
+            "route(url: string) { for (const v of Object.values(this)) (v as any).path = url; }",
+            "",
+        ),
+        (
+            "route(url: string) { for (const k in this) { const v: any = (this as any)[k]; if (v && typeof v === \"object\") v.path = url; } }",
+            "",
+        ),
+        // A same-file merge that walks the instance's keys.
+        (
+            "constructor(extra: any) { deepMerge(this, extra); }",
+            "function deepMerge(target: any, source: any) { for (const k of Object.keys(source)) { if (typeof source[k] === \"object\") deepMerge(target[k], source[k]); else target[k] = source[k]; } }",
+        ),
+        (
+            "route(url: string) { const { ...all } = this as any; for (const v of Object.values(all)) (v as any).path = url; }",
+            "",
+        ),
+        (
+            "route(url: string) { let all: any; ({ ...all } = this as any); for (const v of Object.values(all)) (v as any).path = url; }",
+            "",
+        ),
+        (
+            "route(url: string) { const copy: any = { ...this }; for (const v of Object.values(copy)) (v as any).path = url; }",
+            "",
+        ),
+        (
+            "route(url: string) { const copy: any = Object.assign({}, this); for (const v of Object.values(copy)) (v as any).path = url; }",
+            "",
+        ),
+        (
+            "route(url: string) { for (const d of Object.values(Object.getOwnPropertyDescriptors(this))) d.value.path = url; }",
+            "",
+        ),
+        // A same-file function that reads its argument's properties
+        // without naming them.
+        (
+            "route(url: string) { walk(this, url); }",
+            "function walk({ ...all }: any, url: string) { for (const v of Object.values(all)) (v as any).path = url; }",
+        ),
+        (
+            "route(url: string) { walk(this, url); }",
+            "function walk() { for (const v of Object.values(arguments[0])) (v as any).path = arguments[1]; }",
+        ),
+        (
+            "route(url: string) { return new Walker(this, url); }",
+            "class Walker { constructor({ ...all }: any, url: string) { for (const v of Object.values(all)) (v as any).path = url; } }",
+        ),
+        (
+            "configure(section: string, path: string) { Reflect.get(this, section).path = path; }",
+            "",
+        ),
+        (
+            "",
+            "const s = Reflect.construct(Summarizer, []);\nexport function set(k: string, u: string) { (s as any)[k].path = u; }",
+        ),
+        // Through a name that holds one.
+        (
+            "",
+            "const s = new Summarizer();\nfor (const v of Object.values(s)) (v as any).path = \"https://gateway.example.com/v1/chat/completions\";",
+        ),
+    ] {
+        let source = summarizer(method, after);
+        assert_eq!(
+            create_route(&source),
+            (Routing::Unknown, gapped.clone()),
+            "{source}"
+        );
+    }
+    // Options held in a static property, read by class name: a member of
+    // the class read under a run-time name may be them.
+    for configure in [
+        "const target = (Svc as any)[section]; target.path = url;",
+        "(Svc as any)[section].path = url;",
+        "Object.values(Svc).forEach((v: any) => { v.path = url; });",
+    ] {
+        let source = format!(
+            "{OPENAI}const client = new OpenAI();
+export class Svc {{
+  static OPTIONS = {{ timeout: 30_000 }};
+  ask() {{ return client.chat.completions.create({{ model: \"gpt-4-0613\", messages: [] }}, Svc.OPTIONS); }}
+}}
+export function configure(section: string, url: string) {{ {configure} }}
+"
+        );
+        assert_eq!(
+            create_route(&source),
+            (Routing::Unknown, gapped.clone()),
+            "{source}"
+        );
+    }
+    // Uses that keep it: its own method bound to it, a builtin that only
+    // reads it, a method that returns it to its caller, an export, a
+    // same-file function that reads it by name, a test, and the instance
+    // stored, returned or passed to another module's code, which does not
+    // write what its properties hold (Outside the file).
+    for (method, after) in [
+        ("constructor(extra: any) { deepMerge(this, extra); }", ""),
+        (
+            "",
+            "export const s = new Summarizer();\ndeepMerge(s, JSON.parse(process.env.OVERRIDES ?? \"{}\"));",
+        ),
+        ("register() { registry.push(this); }", ""),
+        (
+            "withTimeout(ms: number) { this.ms = ms; return this; }\n  private ms = 0;",
+            "register(new Summarizer().withTimeout(1));",
+        ),
+        ("self() { return Promise.resolve(this); }", ""),
+        ("async self() { return this; }", ""),
+        ("constructor() { makeAutoObservable(this); autoBind(this); bus.emit(\"ready\", this); }", ""),
+        (
+            "private static instance?: Summarizer;\n  static get() { if (!Summarizer.instance) Summarizer.instance = new Summarizer(); return Summarizer.instance; }",
+            "",
+        ),
+        ("", "export function createSession() { return new Summarizer(); }"),
+        ("", "const jobs = [\"a\", \"b\"].map(() => new Summarizer());\nconst queue: Summarizer[] = [];\nqueue.push(jobs[0]);\nconst sessions = new Map<string, Summarizer>();\nsessions.set(\"x\", jobs[1]);"),
+        ("", "class Controller { constructor(private svc: Summarizer) {} }\nexport const c = new Controller(new Summarizer());"),
+        ("", "const svc = new Summarizer();\napp.locals.chat = svc;\ncontainer.register(\"chat\", svc);\nexpect(svc).toBeDefined();\nvi.spyOn(svc, \"summarize\");"),
+        ("", "const summarizer = new Summarizer();\nmodule.exports = { summarizer, other: new Summarizer() };"),
+        ("", "const summarizer = new Summarizer();\nexport default { summarizer };\nexport const services = { summarizer: new Summarizer() };"),
+        // `this` in a plain function forwarded by a helper.
+        (
+            "",
+            "export function debounce(fn: any, ms: number) { let t: any; return function (this: unknown, ...args: any[]) { clearTimeout(t); t = setTimeout(() => fn.apply(this, args), ms); }; }\nexport function once(fn: any) { let v: any; return function (this: unknown) { v ??= fn.apply(this, arguments); return v; }; }",
+        ),
+        ("", "function show(...items: any[]) { return items.length; }\nshow(new Summarizer());"),
+        ("constructor() { this.summarize = this.summarize.bind(this); }", ""),
+        ("log() { console.log(this); return JSON.stringify(this); }", ""),
+        ("withTimeout(ms: number) { this.ms = ms; return this; }\n  private ms = 0;", "export const s = new Summarizer().withTimeout(1);"),
+        ("", "export default new Summarizer();"),
+        (
+            "",
+            "function describe(s: Summarizer) { return s.summarize.name; }\ndescribe(new Summarizer());",
+        ),
+        ("is(other: unknown) { return other === this || !this; }", ""),
+        ("keys() { return Object.keys(this); }", ""),
+        // Another class's instances handed out reach no property of this
+        // one.
+        (
+            "",
+            "class Route { constructor(public path: string) {} }\nexport const routes = [new Route(\"/x\")];\nregister(new Route(\"/y\"));\nfunction prefixed(r: Route) { r.path = \"/api\" + r.path; return r; }\nprefixed(new Route(\"/z\"));",
+        ),
+    ] {
+        let source = summarizer(method, after);
+        assert_eq!(
+            create_route(&source),
+            (Routing::OpenaiDirect, vec![]),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn request_options_only_read_keep_the_route() {
+    // A test, a condition, the left side of `&&`, a destructuring, a
+    // `for...in`, a cast, an alias that is only read, and a same-file
+    // function's parameter that is only read change nothing the options
+    // hold.
+    let class = |method: &str, options: &str| {
+        format!(
+            "{OPENAI}const client = new OpenAI();
+export class Svc {{
+  private opts = {{ timeout: 30_000, maxRetries: 2 }};
+  private slow = {{ timeout: 120_000 }};
+  {method}
+  ask(q: string, slow?: boolean) {{
+    return client.chat.completions.create({{ model: \"gpt-4-0613\", messages: [{{ role: \"user\", content: q }}] }}, {options});
+  }}
+}}
+"
+        )
+    };
+    for (method, options) in [
+        ("check() { if (this.opts && this.opts.timeout > 0) console.log(\"timeout set\"); }", "this.opts"),
+        ("timeout() { return (this.opts && this.opts.timeout) || 60_000; }", "this.opts"),
+        ("retries() { while (this.opts && \"maxRetries\" in this.opts) return 1; }", "this.opts"),
+        ("pick() { return this.opts && this.opts.timeout ? this.opts.timeout : 1000; }", "this.opts"),
+        ("check() { if (this.opts || this.slow) console.log(\"set\"); }", "this.opts"),
+        ("fields() { const { timeout, maxRetries } = this.opts; return timeout + maxRetries; }", "this.opts"),
+        ("fields() { const { timeout = 0 } = this.opts; return timeout; }", "this.opts"),
+        ("keys() { const out: string[] = []; for (const k in this.opts) out.push(k); return out; }", "this.opts"),
+        ("own() { const { opts } = this; return opts.timeout; }", "this.opts"),
+        (
+            "relay() { return this.send(this.opts); }\n  private send(o: OpenAI.RequestOptions) { return client.chat.completions.create({ model: \"gpt-4-0613\", messages: [] }, o); }",
+            "this.opts",
+        ),
+        ("", "this.opts as OpenAI.RequestOptions"),
+        ("", "this.opts!"),
+        ("", "(this.opts)"),
+    ] {
+        let source = class(method, options);
+        assert_eq!(
+            create_route(&source),
+            (Routing::OpenaiDirect, vec![]),
+            "{source}"
+        );
+    }
+    // An alias that is only read, also through a conditional.
+    let source = class("", "this.opts").replace(
+        "    return client",
+        "    const options = slow ? this.slow : this.opts;\n    return client",
+    );
+    let source = source.replace("}, this.opts);", "}, options);");
+    assert_eq!(
+        create_route(&source),
+        (Routing::OpenaiDirect, vec![]),
+        "{source}"
+    );
+    // The same for names, through a wrapper whose calls are all seen.
+    let file = |body: &str| format!("{OPENAI}const client = new OpenAI();\n{body}\n");
+    let create = "client.chat.completions.create({ model: \"gpt-4-0613\", messages: [] }";
+    for body in [
+        format!("const opts = {{ timeout: 1 }};\nif (opts && opts.timeout > 0) console.log(\"t\");\nexport const ask = () => {create}, opts);"),
+        format!("const opts = {{ timeout: 1 }};\nif (opts) console.log(\"t\");\nexport const ask = () => {create}, opts);"),
+        format!("const opts = {{ timeout: 1 }};\nif (opts || process.env.DEBUG) console.log(\"t\");\nexport const ask = () => {create}, opts);"),
+        format!("const OPTS = {{ timeout: 1 }};\nconst {{ timeout }} = OPTS;\nconsole.log(timeout);\nexport const ask = () => {create}, OPTS);"),
+        format!("const OPTS = {{ timeout: 1 }};\nconst opts = OPTS;\nexport const ask = () => {create}, opts);"),
+        format!("const DEFAULTS = {{ timeout: 1 }};\nfunction chat(q: string, opts = DEFAULTS) {{ return {create}, opts); }}\nexport const ask = (q: string) => chat(q);"),
+        format!("const LONG = {{ timeout: 120_000 }};\nfunction chat(q: string, opts?: OpenAI.RequestOptions) {{ return {create}, opts); }}\nexport const ask = (q: string) => chat(q, LONG);"),
+        format!("function ask(text: string, opts?: {{ timeout?: number }}) {{\n  if (opts) console.log(\"timeout\", opts.timeout);\n  return {create}, opts);\n}}\nask(\"hi\", {{ timeout: 5000 }});\nask(\"hi\");"),
+        format!("export async function POST() {{\n  const options = {{ timeout: 1 }};\n  return {create}, options as OpenAI.RequestOptions);\n}}"),
+        format!("export async function POST(req: Request) {{\n  const options = {{ timeout: 1 }};\n  (options as any).signal = req.signal;\n  return {create}, options);\n}}"),
+    ] {
+        let source = file(&body);
+        assert_eq!(
+            create_route(&source),
+            (Routing::OpenaiDirect, vec![]),
+            "{source}"
+        );
+    }
+    // An alias or a parameter that hands it out does not.
+    for body in [
+        format!("const OPTS: any = {{ timeout: 1 }};\nconst opts = OPTS;\nopts.path = \"https://gateway.example.com/v1/chat/completions\";\nexport const ask = () => {create}, OPTS);"),
+        format!("const OPTS: any = {{ timeout: 1 }};\nfunction tweak(o: any) {{ o.path = \"https://gateway.example.com/v1/chat/completions\"; }}\ntweak(OPTS);\nexport const ask = () => {create}, OPTS);"),
+        format!("const OPTS: any = {{ timeout: 1 }};\nexport function tweak(o: any) {{ return o; }}\ntweak(OPTS);\nexport const ask = () => {create}, OPTS);"),
+        format!("const OPTS = {{ timeout: 1 }};\n(OPTS as any).path = \"https://gateway.example.com/v1/chat/completions\";\nexport const ask = () => {create}, OPTS);"),
+        format!("const OPTS: any = {{ timeout: 1 }};\nconst {{ ...copy }} = OPTS;\nexport const ask = () => {create}, OPTS);\nexport {{ OPTS as shared }};"),
+    ] {
+        let source = file(&body);
+        let (routing, gaps) = create_route(&source);
+        if body.contains("...copy") {
+            // A rest copy shares no own key: still read.
+            assert_eq!((routing, gaps), (Routing::OpenaiDirect, vec![]), "{source}");
+            continue;
+        }
+        assert_eq!(routing, Routing::Unknown, "{source}");
+        assert!(
+            gaps.contains(&"ambiguous_client/endpoint_option".to_string()),
+            "{source}: {gaps:?}"
+        );
+    }
+}
+
+#[test]
+fn a_global_object_name_given_an_unknown_value_may_be_the_global_object() {
+    let request = "client.chat.completions.create({ model: \"gpt-4-0613\", messages: [] });";
+    for setup in [
+        "let root: any = {};\n[root] = [globalThis];\nexport function install(name: string, v: unknown) { root[name] = v; }",
+        "let root: any = {};\n({ root } = { root: globalThis });\nexport function install(name: string, v: unknown) { root[name] = v; }",
+    ] {
+        let source = format!("{OPENAI}const client = new OpenAI();\n{setup}\n{request}");
+        assert_eq!(
+            create_route(&source),
+            (
+                Routing::Unknown,
+                vec!["ambiguous_client/global_fetch".to_string()]
+            ),
+            "{setup}"
+        );
+    }
+    // The keys of a literal through `Object.getOwnPropertyNames`, which
+    // reads it.
+    let source = format!(
+        "{OPENAI}const client = new OpenAI();
+const o = {{ TextEncoder: 1 }};
+for (const k of Object.getOwnPropertyNames(o)) (globalThis as any)[k] = 1;
+{request}"
+    );
+    assert_eq!(create_route(&source), (Routing::OpenaiDirect, vec![]));
+}
+
+#[test]
+fn long_chains_of_aliases_and_wrappers_of_request_options_are_linear() {
+    // Names bound to one another, and options passed down wrappers whose
+    // calls are all seen, each passed to a request: each name is read
+    // once, and past the bound every name read may hand them out.
+    let n = 4_000;
+    let mut source = with_client("const o0: any = { timeout: 1 };");
+    for i in 1..n {
+        source.push_str(&format!("const o{i} = o{};\n", i - 1));
+    }
+    for i in 0..n {
+        source.push_str(&format!(
+            "export const r{i} = () => client.chat.completions.create({{ model: \"gpt-4-0613\", messages: [] }}, o{i});\n"
+        ));
+    }
+    let found = usages_within(&source, 10);
+    assert!(!found.calls.is_empty());
+    let mut source = with_client("");
+    for i in 0..n - 1 {
+        source.push_str(&format!(
+            "function f{i}(o: any) {{ client.chat.completions.create({{ model: \"gpt-4-0613\", messages: [] }}, o); return f{}(o); }}\n",
+            i + 1
+        ));
+    }
+    source.push_str(&format!("function f{}(o: any) {{ return o; }}\n", n - 1));
+    for i in 0..n {
+        source.push_str(&format!(
+            "export const r{i} = () => f{i}({{ timeout: {i} }});\n"
+        ));
+    }
+    let found = usages_within(&source, 10);
+    assert!(!found.calls.is_empty());
+}
+
+#[test]
+fn a_tagged_template_passes_its_substitutions_to_its_tag() {
+    // `` tag`${x}` `` calls `tag` with `x`: a substitution there is an
+    // argument, not a read. In a template that is not tagged it is read.
+    let models = |use_: &str| {
+        with_client(&format!(
+            "const MODELS = {{ fast: \"gpt-4-0613\" }};\nfunction tag(_s: TemplateStringsArray, m: any) {{ m.fast = \"gpt-5.5\"; return \"\"; }}\n{use_};\nclient.chat.completions.create({{ model: MODELS.fast, messages: [] }});"
+        ))
+    };
+    let (value, gaps) = model(&models("tag`${MODELS}`"));
+    assert_eq!(value, None);
+    assert_eq!(gaps, vec!["unresolved_model/attribute"]);
+    let (value, gaps) = model(&models("console.log(`${MODELS}`)"));
+    assert_eq!(value.as_deref(), Some("gpt-4-0613"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+    // An enum given to a tag may be written.
+    let (value, gaps) = model(&with_client(
+        "enum Model { Fast = \"gpt-4-0613\" }\nfunction tag(_s: TemplateStringsArray, m: any) { m.Fast = \"gpt-5.5\"; return \"\"; }\ntag`${Model}`;\nclient.chat.completions.create({ model: Model.Fast, messages: [] });",
+    ));
+    assert_eq!(value, None);
+    assert_eq!(gaps, vec!["unresolved_model/reassigned"]);
+    // Request options given to a tag may be given a `path`, held in a
+    // name or in a class property.
+    for body in [
+        "const OPTS: any = { timeout: 5 };\nfunction tag(_s: TemplateStringsArray, o: any) { o.path = \"https://gateway.example.com/v1/chat/completions\"; return \"\"; }\ntag`${OPTS}`;\nexport const ask = () => client.chat.completions.create({ model: \"gpt-4-0613\", messages: [] }, OPTS);",
+        "function tag(_s: TemplateStringsArray, o: any) { o.path = \"https://gateway.example.com/v1/chat/completions\"; return \"\"; }\nexport class Svc {\n  private opts: any = { timeout: 5 };\n  log() { return tag`${this.opts}`; }\n  ask() { return client.chat.completions.create({ model: \"gpt-4-0613\", messages: [] }, this.opts); }\n}",
+    ] {
+        let source = with_client(body);
+        let (routing, gaps) = create_route(&source);
+        assert_eq!(routing, Routing::Unknown, "{source}");
+        assert!(
+            gaps.contains(&"ambiguous_client/endpoint_option".to_string()),
+            "{source}: {gaps:?}"
+        );
+    }
+    // A class's prototype given to a tag may be another object's.
+    let (_, _, gaps) = messages_row(&format!(
+        "{ANTHROPIC}{ANTHROPIC_BOT}}}\nfunction tag(_s: TemplateStringsArray, p: any) {{ return Object.setPrototypeOf({{ model: \"claude-sonnet-5-5\" }}, p).ask(); }}\ntag`${{Bot.prototype}}`;\n"
+    ));
+    assert_eq!(gaps, vec!["unresolved_model/attribute"]);
+}
+
+#[test]
+fn reflect_get_reads_off_the_values_a_computed_member_reads_off() {
+    // `Reflect.get(x, k)` with a run-time `k` counts as `x[k]` does: off
+    // `this`, an instance or a name that may hold one, a method may be read
+    // to run anywhere. A `Proxy` handler's target or a lazily built client
+    // is none of them.
+    let bot = |after: &str| format!("{ANTHROPIC}{ANTHROPIC_BOT}}}\n{after}\n");
+    for after in [
+        "const bot = new Bot();\nexport function run(m: string) { const f = Reflect.get(bot, m); return f.call({ model: \"claude-sonnet-5-5\" }); }",
+        "export function run(m: string) { const f = Reflect.get(Bot.prototype, m); return f.call({ model: \"claude-sonnet-5-5\" }); }",
+    ] {
+        let source = bot(after);
+        let (value, _, gaps) = messages_row(&source);
+        assert_eq!(value.as_deref(), Some("claude-3-5-sonnet-20241022"), "{source}");
+        assert_eq!(gaps, vec!["unresolved_model/attribute"], "{source}");
+    }
+    for after in [
+        "new Bot().ask();\nexport const env = new Proxy(process.env, { get(target, prop) { const v = Reflect.get(target, prop); if (v === undefined) throw new Error(String(prop)); return v; } });",
+        "new Bot().ask();\nlet lazy: any;\nexport const shared = new Proxy({} as any, { get(_t, prop, recv) { lazy ??= new Anthropic(); return Reflect.get(lazy, prop, recv); } });",
+        "new Bot().ask();\nexport function run(o: any, m: string) { return Reflect.get(o, m); }",
+    ] {
+        let source = bot(after);
+        let (value, _, gaps) = messages_row(&source);
+        assert_eq!(value.as_deref(), Some("claude-3-5-sonnet-20241022"), "{source}");
+        assert!(gaps.is_empty(), "{source}: {gaps:?}");
+    }
+    // Request options a class holds stay read beside such a handler.
+    let source = with_client(
+        "export const env = new Proxy(process.env, { get(target, prop) { return Reflect.get(target, prop); } });\nexport class Summarizer {\n  private requestOptions = { timeout: 30_000 };\n  run(text: string) { return client.chat.completions.create({ model: \"gpt-4-0613\", messages: [{ role: \"user\", content: text }] }, this.requestOptions); }\n}\nexport const s = new Summarizer();",
+    );
+    assert_eq!(create_route(&source), (Routing::OpenaiDirect, vec![]));
+}
+
+#[test]
+fn names_past_256_are_answered_exactly() {
+    // Whether a name hands request options out, and whether it may hold an
+    // instance, is answered for every name it reaches, however many.
+    let mut source = with_client(
+        "const o0: any = { timeout: 1 };\nexport const ask = () => client.chat.completions.create({ model: \"gpt-4-0613\", messages: [] }, o0);\n",
+    );
+    for i in 1..300 {
+        source.push_str(&format!("const o{i} = o{};\n", i - 1));
+    }
+    source.push_str("console.log(o299.timeout);\n");
+    assert_eq!(create_route(&source), (Routing::OpenaiDirect, vec![]));
+    // One of them that hands them out does, however far.
+    let handed = source.replace(
+        "console.log(o299.timeout);",
+        "o299.path = \"https://gateway.example.com/v1/chat/completions\";",
+    );
+    let (routing, gaps) = create_route(&handed);
+    assert_eq!(routing, Routing::Unknown);
+    assert!(
+        gaps.contains(&"ambiguous_client/endpoint_option".to_string()),
+        "{gaps:?}"
+    );
+    let mut source =
+        format!("{ANTHROPIC}{ANTHROPIC_BOT}}}\nnew Bot().ask();\nconst a0: any = {{}};\n");
+    for i in 1..300 {
+        source.push_str(&format!("const a{i} = a{};\n", i - 1));
+    }
+    source.push_str(
+        "export function run(m: string) { const f = a299[m]; return f.call({ model: \"x\" }); }\n",
+    );
+    let (value, _, gaps) = messages_row(&source);
+    assert_eq!(value.as_deref(), Some("claude-3-5-sonnet-20241022"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+    // An instance at the end of the chain is one.
+    let source = source.replace("const a0: any = {};", "const a0: any = new Bot();");
+    let (_, _, gaps) = messages_row(&source);
+    assert_eq!(gaps, vec!["unresolved_model/attribute"]);
+}
+
+#[test]
+fn whether_names_hold_an_instance_is_read_once_per_file() {
+    // Many reads under a run-time key, each off a parameter passed down a
+    // long chain of functions to an instance: the chain is read once, not
+    // once per read.
+    let (chain, roots) = (1_500, 1_500);
+    let mut source = with_client(
+        "class Bot { private opts = { timeout: 1 }; run() { return client.chat.completions.create({ model: \"gpt-4-0613\", messages: [] }, this.opts); } }\n",
+    );
+    source.push_str("function g0(p: any) {");
+    for i in 0..roots {
+        source.push_str(&format!(" f{i}(p, \"a\");"));
+    }
+    source.push_str(" }\n");
+    for j in 1..chain {
+        source.push_str(&format!("function g{j}(p: any) {{ g{}(p); }}\n", j - 1));
+    }
+    source.push_str(&format!("g{}(new Bot());\n", chain - 1));
+    for i in 0..roots {
+        source.push_str(&format!(
+            "function f{i}(x: any, k: string) {{ if (x[k]) return 1; return 0; }}\n"
+        ));
+    }
+    let found = usages_within(&source, 10);
+    assert_eq!(found.calls.len(), 1);
+    // A method's parameter is read through the calls of its name, which
+    // every class with a method of that name shares.
+    let mut source = with_client(
+        "class Bot { private opts = { timeout: 1 }; run() { return client.chat.completions.create({ model: \"gpt-4-0613\", messages: [] }, this.opts); } }\nconst bot = new Bot();\n",
+    );
+    for i in 0..16_000 {
+        source.push_str(&format!(
+            "class C{i} {{ m(x: any, k: string) {{ return x[k]; }} }}\n"
+        ));
+    }
+    for i in 0..1_000 {
+        source.push_str(&format!("new C{i}().m(bot, \"k\");\n"));
+    }
+    let found = usages_within(&source, 10);
+    assert_eq!(found.calls.len(), 1);
 }

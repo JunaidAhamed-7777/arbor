@@ -1016,8 +1016,13 @@ enum Hook {
 
 /// Keys of an options object that may send a request to another endpoint:
 /// a custom `fetch` and Anthropic's `middleware` (a client's or one
-/// request's), and one request's `path` and `defaultBaseURL`.
-const HOOK_KEYS: &[&str] = &["fetch", "middleware", "path", "defaultBaseURL"];
+/// request's), and one request's `path` and `defaultBaseURL`; and one
+/// request's `body`, which replaces the body the request is given.
+const HOOK_KEYS: &[&str] = &["fetch", "middleware", "path", "defaultBaseURL", "body"];
+
+/// The shape of a value a request's options may replace with their own
+/// `body` ([`Ctx::body_replaced`]).
+const REQUEST_BODY: &str = "a request body its options may replace";
 
 /// Steps one read of an options object for [`HOOK_KEYS`] takes (each
 /// expression, entry and name it follows), and how deep it follows them:
@@ -1572,6 +1577,10 @@ type EnumMembers<'t> = Rc<HashMap<&'t str, Option<Node<'t>>>>;
 /// reached through with the origin a value read from it has.
 type ObjectRef<'t> = (Node<'t>, usize, Option<(String, ValueOrigin)>);
 
+/// Calls a value is passed to: the call, its scope, and the argument's
+/// position when no spread comes before it.
+type PassedTo<'t> = Vec<(Node<'t>, usize, Option<u32>)>;
+
 /// What uses of a name do.
 #[derive(Debug, Default, Clone)]
 struct Uses<'t> {
@@ -1581,13 +1590,25 @@ struct Uses<'t> {
     /// `new X(...)`, the same way.
     news: Vec<(Node<'t>, usize)>,
     /// Uses that let the value reach code this file does not analyze:
-    /// stored, returned, captured by another expression...
+    /// stored, returned, captured by another expression, bound to another
+    /// name...
     escapes: bool,
-    /// Calls the value is passed to as an argument. Passing an object to an
-    /// SDK request or a read-only builtin (`JSON.stringify`) hands it to
-    /// nothing that writes it; anything else is an escape. At most
-    /// [`MAX_WRITES_READ`] are kept; `passed_cut` is set past that.
-    passed_to: Vec<(Node<'t>, usize)>,
+    /// The same, other than binding it to another name (`bound_to`).
+    escapes_unbound: bool,
+    /// Names the value is bound to (`const o = OPTS`, `o = OPTS`, a
+    /// parameter's default): it is handed out where one of them is
+    /// ([`Ctx::hands_out`]). At most [`MAX_WRITES_READ`]; `bound_cut` is
+    /// set past that.
+    bound_to: Vec<usize>,
+    bound_cut: bool,
+    /// The value itself is spread into a literal (`{ ...x }`).
+    spread: bool,
+    /// Calls the value is passed to as an argument, with its position
+    /// when no spread comes before it. Passing an object to an SDK request
+    /// or a read-only builtin (`JSON.stringify`) hands it to nothing that
+    /// writes it; anything else is an escape. At most [`MAX_WRITES_READ`]
+    /// are kept; `passed_cut` is set past that.
+    passed_to: PassedTo<'t>,
     passed_cut: bool,
     /// A property is written or deleted (`x.k = v`, `delete x.k`,
     /// `Object.assign(x, ...)`).
@@ -1674,8 +1695,13 @@ enum RefKind<'t> {
     Spread(Option<Node<'t>>),
     /// `typeof x`, `x instanceof C`, `x === y`: nothing escapes.
     Harmless,
-    /// An argument of a call (`f(x)`).
-    Arg(Node<'t>),
+    /// An argument of a call (`f(x)`), and its position when no spread
+    /// comes before it.
+    Arg(Node<'t>, Option<u32>),
+    /// The value of a declaration (`const o = x`), of `=` (`o = x`) or of a
+    /// parameter's default (`function f(o = x)`): the name it is bound to,
+    /// looked up from where the value is.
+    Bound(Node<'t>),
     /// A plain assignment of the name (or one that is not one expression).
     Write(Write<'t>),
     /// Anything else: passed, stored, returned...
@@ -1687,8 +1713,9 @@ enum RefKind<'t> {
 enum ChainUse<'t> {
     /// The chain's value is read.
     Read,
-    /// The chain's value is an argument of a call (`f(x.a)`).
-    Arg(Node<'t>),
+    /// The chain's value is an argument of a call (`f(x.a)`), and its
+    /// position when no spread comes before it.
+    Arg(Node<'t>, Option<u32>),
     /// The chain's value is spread into an object or array literal, and
     /// the call the literal is an argument of, if any.
     Spread(Option<Node<'t>>),
@@ -1700,6 +1727,98 @@ enum ChainUse<'t> {
         value: Option<Node<'t>>,
         scope: usize,
     },
+}
+
+/// The parameter a call's argument is bound to ([`Ctx::param_of`]).
+#[derive(Debug, Clone, Copy)]
+enum Param {
+    /// A name: its binding.
+    Name(usize),
+    /// An object pattern, which only reads the argument's properties.
+    Pattern,
+}
+
+/// What a use does with a value that may be a class property's object or a
+/// class instance ([`Ctx::step_use`], [`Ctx::whole_use`]).
+#[derive(Debug, Clone, Copy)]
+enum Handed<'t> {
+    /// Nothing that changes what it holds: a read, a test, a destructuring,
+    /// an export.
+    No,
+    /// It may reach code that changes what it holds: stored, written into
+    /// under a key of [`HOOK_KEYS`] or one known only at run time, a member
+    /// of it called...
+    Yes,
+    /// It is passed to a call, in a scope, at a position when no spread
+    /// comes before it.
+    Passed(Node<'t>, usize, Option<u32>),
+    /// It is bound to a name, looked up from the scope.
+    Bound(Node<'t>, usize),
+    /// It is returned.
+    Returned,
+}
+
+/// What may be a class instance, or a same-file class itself
+/// ([`Ctx::settle_instances`]).
+#[derive(Debug, Clone, Copy)]
+enum InstRoot<'t> {
+    /// `this` or `super`.
+    This,
+    /// A name: one that may hold an instance or a class.
+    Name(Node<'t>),
+    /// `new X(...)`: an instance when `X` is a same-file class.
+    New(Node<'t>),
+    /// The result of a call of a method of that name: an instance when a
+    /// method of that name returns `this`.
+    Fluent(&'t str),
+    /// `C.prototype`, by the name `C`.
+    Prototype(Node<'t>),
+}
+
+/// Which same-file class a value may be an instance of, or the class
+/// itself ([`Ctx::instance_of`]): none, one, or one the file cannot tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Inst {
+    None,
+    One(usize),
+    Any,
+}
+
+impl Inst {
+    /// A value that may be either.
+    fn join(self, other: Inst) -> Inst {
+        match (self, other) {
+            (Inst::None, x) | (x, Inst::None) => x,
+            (Inst::One(a), Inst::One(b)) if a == b => Inst::One(a),
+            _ => Inst::Any,
+        }
+    }
+}
+
+/// What [`Ctx::instance_of`] reads: a binding, or the arguments at one
+/// position of every call of a method of that name, which every method of
+/// that name in the file is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum InstNode<'t> {
+    Binding(usize),
+    MethodArgs(&'t str, usize),
+}
+
+/// A use of what may be a class instance or a same-file class.
+#[derive(Debug, Clone, Copy)]
+struct InstUse<'t> {
+    root: InstRoot<'t>,
+    scope: usize,
+    /// What the use does with the value, or with the member read.
+    handed: Handed<'t>,
+    /// A member read under a key known only at run time (`this[k]`):
+    /// whether it is called right there (`this[k](...)`). `None` for a use
+    /// of the whole value.
+    computed: Option<bool>,
+    /// The whole value is made another object's prototype (`{ __proto__:
+    /// bot }`).
+    proto: bool,
+    line: u32,
 }
 
 /// A function, arrow function, method or constructor.
@@ -1729,6 +1848,9 @@ struct Method<'t> {
     ctor: bool,
     /// Callable only inside its class: `private` or `#name`.
     private: bool,
+    /// A method that is neither async nor a generator: `return this` in it
+    /// gives its caller the object itself ([`Ctx::fluent`]).
+    sync: bool,
 }
 
 struct Class<'t> {
@@ -1761,6 +1883,14 @@ struct Class<'t> {
     /// An instance built without naming the class (`new this()`,
     /// `new this.constructor()`): its constructor's calls are not all seen.
     self_constructed: Option<Feature>,
+    /// Its prototype used as a value (`Object.create(Bot.prototype)`), or
+    /// an instance made another object's prototype or a `Proxy`'s target:
+    /// its methods may run with another object as `this`.
+    borrowed: Option<Feature>,
+    /// The file may reach the object a property of an instance (or of the
+    /// class itself) holds without naming the property: handed out, read
+    /// under a run-time key ([`Ctx::settle_instances`]).
+    props_wild: Option<Feature>,
     ctor: Option<usize>,
     /// A class expression's own name, visible only inside it.
     inner: Option<usize>,
@@ -1839,20 +1969,24 @@ struct Frame<'t> {
     /// Inside wrappers that keep its value (`(x)`, `x!`, `x as T`, `x
     /// satisfies T`, `<T>x`): where the outermost one's value goes.
     wrapped: Option<Context<'t>>,
-    /// A branch of a conditional or an operand of `??`, `||` or `&&`
-    /// (`create(body, signal ? { ...base, signal } : base)`), also inside
-    /// wrappers: where the outermost such expression's value goes, which
-    /// is where this value may go.
+    /// A branch of a conditional, an operand of `??` or `||`, or the right
+    /// side of `&&` (`create(body, signal ? { ...base, signal } : base)`),
+    /// also inside wrappers: where the outermost such expression's value
+    /// goes, which is where this value may go.
     flow: Option<Context<'t>>,
+    /// An argument of a call: its position, when no spread comes before
+    /// it.
+    index: Option<u32>,
 }
 
-/// Where a node's value goes: its parent, the field it is in there, and
-/// the parent's parent.
+/// Where a node's value goes: its parent, the field it is in there, the
+/// parent's parent, and its position among a call's arguments.
 #[derive(Debug, Clone, Copy)]
 struct Context<'t> {
     parent: Option<Node<'t>>,
     field: Option<&'static str>,
     grand: Option<Node<'t>>,
+    index: Option<u32>,
 }
 
 impl<'t> Frame<'t> {
@@ -1862,6 +1996,7 @@ impl<'t> Frame<'t> {
             parent: self.parent,
             field: self.field,
             grand: self.grand,
+            index: self.index,
         })
     }
 }
@@ -1923,18 +2058,64 @@ struct Ctx<'t> {
     /// Member names whose value, read off any object (`this.opts`,
     /// `svc.opts`, `Svc.OPTS`), may reach code that changes what it holds,
     /// so that a class property of that name is not read for request
-    /// options ([`Ctx::hook_prop`]): the value aliased, returned, stored,
-    /// wrapped or passed through a conditional, written into under a key
-    /// of [`HOOK_KEYS`] or one known only at run time (`(this.opts as
-    /// any)[k] = v`), a member of it called, or the name a key of an
-    /// object pattern (`const { opts } = this`).
+    /// options ([`Ctx::hook_prop`]): the value returned, stored, written
+    /// into under a key of [`HOOK_KEYS`] or one known only at run time
+    /// (`(this.opts as any)[k] = v`), a member of it called, or the target
+    /// of an assignment pattern's key (`({ opts: o.x } = this)`).
     prop_handed: HashSet<&'t str>,
-    /// Calls such a value is passed to (`f(this.opts)`), by member name, at
-    /// most [`MAX_WRITES_READ`] each (past that the name is handed out):
-    /// any but an SDK request or a read-only builtin may change it.
-    prop_passed: HashMap<&'t str, Vec<(Node<'t>, usize)>>,
+    /// Calls such a value is passed to (`f(this.opts)`), by member name,
+    /// with the argument's position, at most [`MAX_WRITES_READ`] each (past
+    /// that the name is handed out): any but an SDK request, a read-only
+    /// builtin or a same-file function whose parameter there hands nothing
+    /// out ([`Ctx::param_of`]) may change it.
+    prop_passed: HashMap<&'t str, PassedTo<'t>>,
+    /// Names such a value is bound to (`const o = this.opts`, `const {
+    /// opts } = this`), looked up from the scope, at most
+    /// [`MAX_WRITES_READ`] each: it is handed out where one of them is.
+    prop_bound: HashMap<&'t str, Vec<(Node<'t>, usize)>>,
     /// [`Ctx::prop_passed_harmless`], by member name.
     prop_passed_memo: HashMap<&'t str, bool>,
+    /// Uses of what may be a class instance or a same-file class: a member
+    /// read under a key known only at run time (`this[k]`, `bot[k]`,
+    /// `Bot.prototype[k]`), or the whole value used other than to read a
+    /// member ([`Ctx::settle_instances`]).
+    instance_uses: Vec<InstUse<'t>>,
+    /// Names of class methods that return `this` (`withModel(m) { ...;
+    /// return this; }`): a call of one gives what may be an instance.
+    fluent: HashSet<&'t str>,
+    /// What is done with the result of each call written `Reflect.get(...)`,
+    /// by node ([`Ctx::result_handed`]).
+    reflect_gets: HashMap<usize, Handed<'t>>,
+    /// The file may reach a class property's object without naming the
+    /// property (`this[k].path = p`, `Object.values(this)`, `{ ...this }`,
+    /// [`Ctx::instance_handed`]) on an instance of a class it cannot tell
+    /// ([`Class::props_wild`] for one it can): no class property is read
+    /// for request options ([`Ctx::hook_prop`]).
+    props_wild: Option<Feature>,
+    /// `C.prototype` used as a value other than to read, call or write a
+    /// member by name, with its scope and line.
+    prototype_uses: Vec<(Node<'t>, usize, u32)>,
+    /// An instance of a class the file cannot tell made another object's
+    /// prototype or a `Proxy`'s target: any class's methods may run with
+    /// another object as `this`.
+    any_borrowed: Option<Feature>,
+    /// [`Ctx::instance_of`], by node.
+    instance_memo: HashMap<InstNode<'t>, Inst>,
+    /// [`Ctx::hands_out`], by binding: decided ones only.
+    hands_memo: HashMap<usize, bool>,
+    /// The binding of each parameter that is a plain name, by function and
+    /// position; a parameter that is an object pattern is listed in
+    /// `param_patterns`.
+    param_slots: HashMap<(usize, usize), usize>,
+    param_patterns: HashSet<(usize, usize)>,
+    /// Functions whose `arguments` object is used: what they are passed
+    /// may be read through it.
+    arguments_funcs: HashSet<usize>,
+    /// Class methods by class, staticness and name; `None` for a name
+    /// defined more than once.
+    class_methods: HashMap<(usize, bool, &'t str), Option<usize>>,
+    /// [`Callers::complete`], by function.
+    complete_memo: HashMap<usize, bool>,
     /// SDK imports found in the walk: the binding, written specifier, the
     /// imported name and its span, recorded once names are bound.
     pending_imports: Vec<(usize, String, Option<String>, Node<'t>)>,
@@ -2108,7 +2289,21 @@ impl<'t> Ctx<'t> {
             method_refs_wild: None,
             prop_handed: HashSet::new(),
             prop_passed: HashMap::new(),
+            prop_bound: HashMap::new(),
             prop_passed_memo: HashMap::new(),
+            instance_uses: Vec::new(),
+            fluent: HashSet::new(),
+            reflect_gets: HashMap::new(),
+            props_wild: None,
+            prototype_uses: Vec::new(),
+            any_borrowed: None,
+            instance_memo: HashMap::new(),
+            hands_memo: HashMap::new(),
+            param_slots: HashMap::new(),
+            param_patterns: HashSet::new(),
+            arguments_funcs: HashSet::new(),
+            class_methods: HashMap::new(),
+            complete_memo: HashMap::new(),
             pending_imports: Vec::new(),
             outside_writes: HashMap::new(),
             outside_wild: None,
@@ -2288,6 +2483,7 @@ impl<'t> Ctx<'t> {
             class: None,
             wrapped: None,
             flow: None,
+            index: None,
         }];
         while let Some(frame) = stack.pop() {
             self.visit(frame, &mut stack);
@@ -2339,33 +2535,44 @@ impl<'t> Ctx<'t> {
                 "ternary_expression" if field != Some("condition") => {
                     Some(f.flow.unwrap_or_else(|| f.context()))
                 }
+                // The left side of `&&` is only tested ([`reads_only`]).
+                "binary_expression" if operator(f.node) == Some("&&") && field == Some("left") => {
+                    None
+                }
                 "binary_expression" if matches!(operator(f.node), Some("??" | "||" | "&&")) => {
                     Some(f.flow.unwrap_or_else(|| f.context()))
                 }
                 _ => None,
             },
+            index: None,
         }
     }
 
     /// What passing a value where `dest` says (the destination of a
     /// conditional or logical operator it is part of, [`Frame::flow`]) does
-    /// with it: an argument of a call, a spread into a literal, or anything
-    /// else, which may store or hand it out.
+    /// with it: a read ([`reads_only`]), an argument of a call, a spread
+    /// into a literal, a value bound to a name, or anything else, which may
+    /// store or hand it out.
     fn flow_use(&self, dest: Context<'t>) -> RefKind<'t> {
+        if reads_only(dest) {
+            return RefKind::Harmless;
+        }
         let grand = dest.grand.map(|g| g.kind());
         match dest.parent.map(|p| p.kind()) {
             Some("arguments") if matches!(grand, Some("call_expression" | "new_expression")) => {
-                dest.grand.map_or(RefKind::Escape, RefKind::Arg)
+                dest.grand
+                    .map_or(RefKind::Escape, |call| RefKind::Arg(call, dest.index))
             }
             Some("spread_element") if matches!(grand, Some("object" | "array")) => RefKind::Spread(
                 dest.grand
                     .and_then(|g| self.literal_calls.get(&g.id()).copied()),
             ),
-            _ => RefKind::Escape,
+            _ => bound_target(dest).map_or(RefKind::Escape, RefKind::Bound),
         }
     }
 
-    /// Pushes the named children of `f`'s node, in `scope`.
+    /// Pushes the named children of `f`'s node, in `scope`. A call's
+    /// arguments know their position, up to the first spread.
     fn push_children(&mut self, stack: &mut Vec<Frame<'t>>, f: &Frame<'t>, scope: usize) {
         let mut kids = std::mem::take(&mut self.kids);
         kids.clear();
@@ -2381,8 +2588,25 @@ impl<'t> Ctx<'t> {
                 }
             }
         }
-        for (child, field) in kids.drain(..).rev() {
-            stack.push(self.child(f, child, scope, field));
+        let mut indexes: Vec<Option<u32>> = Vec::new();
+        if f.node.kind() == "arguments" {
+            let mut next = Some(0u32);
+            for (child, _) in &kids {
+                if child.kind() == "comment" {
+                    indexes.push(None);
+                    continue;
+                }
+                if child.kind() == "spread_element" {
+                    next = None;
+                }
+                indexes.push(next);
+                next = next.map(|i| i.saturating_add(1));
+            }
+        }
+        for (at, (child, field)) in kids.drain(..).enumerate().rev() {
+            let mut frame = self.child(f, child, scope, field);
+            frame.index = indexes.get(at).copied().flatten();
+            stack.push(frame);
         }
         self.kids = kids;
     }
@@ -2446,7 +2670,6 @@ impl<'t> Ctx<'t> {
             | "false"
             | "null"
             | "undefined"
-            | "this"
             | "super"
             | "import"
             | "meta_property"
@@ -2470,6 +2693,7 @@ impl<'t> Ctx<'t> {
             | "accessibility_modifier"
             | "override_modifier"
             | "import_alias" => {}
+            "this" => self.this_use(&f),
             "import_statement" => self.import_statement(node, f.scope),
             "export_statement" => self.export_statement(&f, stack),
             "lexical_declaration" | "variable_declaration" => self.declaration(&f, stack),
@@ -2506,6 +2730,18 @@ impl<'t> Ctx<'t> {
                 self.calls.push((node, f.scope));
                 self.test_block(node);
                 self.mark_call_literals(node);
+                // `Reflect.get(this, k)`: what is done with the member read.
+                if self.reflect_get_shaped(node) {
+                    let handed = self.result_handed(f.context(), f.flow, f.scope);
+                    self.reflect_gets.insert(node.id(), handed);
+                }
+                // `svc.withModel(m)`: an instance, if a method of that name
+                // returns `this`.
+                if let Some(name) = self.method_name(node) {
+                    let (handed, proto) = self.whole_use(f.context(), f.flow, f.scope);
+                    let line = self.line(node);
+                    self.note_instance_use(InstRoot::Fluent(name), f.scope, handed, proto, line);
+                }
                 // `(f)(...)` calls `f` itself, and `(eval)(...)` is a direct
                 // eval.
                 let callee = node
@@ -2532,6 +2768,17 @@ impl<'t> Ctx<'t> {
                 self.calls.push((node, f.scope));
                 self.note_self_construction(node, f.scope);
                 self.mark_call_literals(node);
+                if let Some(constructor) = node.child_by_field_name("constructor") {
+                    let (handed, proto) = self.whole_use(f.context(), f.flow, f.scope);
+                    let line = self.line(node);
+                    self.note_instance_use(
+                        InstRoot::New(constructor),
+                        f.scope,
+                        handed,
+                        proto,
+                        line,
+                    );
+                }
                 self.push_children(stack, &f, f.scope);
             }
             // A call whose result is dropped hands nothing back.
@@ -2655,20 +2902,19 @@ impl<'t> Ctx<'t> {
             vec![(pattern, Vec::new(), None)];
         while let Some((node, path, fallback)) = work.pop() {
             match node.kind() {
-                "identifier" => declared.push(self.declare(
-                    scope,
-                    node,
-                    decl,
-                    init,
-                    init_scope,
-                    path.into(),
-                    fallback,
-                    exported,
-                )),
-                "shorthand_property_identifier_pattern" => {
-                    self.pattern_key(node);
+                "identifier" | "shorthand_property_identifier_pattern" => {
                     let mut path = path;
-                    path.push(Step::Key(self.text(node)));
+                    if node.kind() == "shorthand_property_identifier_pattern" {
+                        self.pattern_key(node, false);
+                        path.push(Step::Key(self.text(node)));
+                    }
+                    // `const { opts } = this`, `const { opts: o } = svc`:
+                    // the name holds what that property holds.
+                    if let Some(Step::Key(key)) = path.last().copied() {
+                        if self.note_prop_bound(key, node, scope) {
+                            self.prop_handed.insert(key);
+                        }
+                    }
                     declared.push(self.declare(
                         scope,
                         node,
@@ -2688,7 +2934,7 @@ impl<'t> Ctx<'t> {
                             "pair_pattern" => {
                                 let key = child.child_by_field_name("key");
                                 if let Some(key) = key {
-                                    self.pattern_key(key);
+                                    self.pattern_key(key, false);
                                 }
                                 let step = key.map_or(Step::Other, |k| self.key_step(k));
                                 if let Some(key) =
@@ -2781,7 +3027,11 @@ impl<'t> Ctx<'t> {
     /// literal may read any member, of whatever object the pattern
     /// destructures, as Python's `getattr(obj, name)` with a run-time name
     /// counts file-wide (`const { [key]: _, ...rest } = record` too).
-    fn pattern_key(&mut self, key: Node<'t>) {
+    /// `handed` says whether the value read is handed to code that may
+    /// change it: a declaration binds it to a name
+    /// ([`Ctx::note_prop_bound`]), an assignment pattern may store it
+    /// anywhere.
+    fn pattern_key(&mut self, key: Node<'t>, handed: bool) {
         let name = match key.kind() {
             "shorthand_property_identifier_pattern" => Some(self.text(key)),
             "computed_property_name" => key.named_child(0).and_then(|k| static_key(k, self.src)),
@@ -2797,8 +3047,11 @@ impl<'t> Ctx<'t> {
                     what: "a key of an object pattern",
                     line,
                 });
-                // `const { opts } = this` hands out what `this.opts` holds.
-                self.prop_handed.insert(name);
+                // `({ opts: target.o } = this)` hands out what `this.opts`
+                // holds.
+                if handed {
+                    self.prop_handed.insert(name);
+                }
             }
             None => {
                 let line = self.line(key);
@@ -2818,7 +3071,7 @@ impl<'t> Ctx<'t> {
             match node.kind() {
                 "identifier" | "shorthand_property_identifier_pattern" => {
                     if node.kind() == "shorthand_property_identifier_pattern" {
-                        self.pattern_key(node);
+                        self.pattern_key(node, true);
                     }
                     self.add_ref(
                         f.scope,
@@ -2841,7 +3094,7 @@ impl<'t> Ctx<'t> {
                 }
                 "pair_pattern" => {
                     if let Some(key) = node.child_by_field_name("key") {
-                        self.pattern_key(key);
+                        self.pattern_key(key, true);
                         if key.kind() == "computed_property_name" {
                             stack.push(self.child(f, key, f.scope, None));
                         }
@@ -2919,41 +3172,59 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    /// An identifier used as a value.
+    /// An identifier used as a value, past the wrappers that keep it
+    /// (`opts as RequestOptions`, `opts!`, `(opts)`, the parentheses of an
+    /// `if` condition).
     fn name_use(&mut self, f: &Frame<'t>) {
         let node = f.node;
-        let parent = f.parent;
-        let grand = f.grand.map(|g| g.kind());
+        // `{ __proto__: bot }`, `o.__proto__ = bot`: another object borrows
+        // what `bot` may be an instance of; `({ a, ...rest } = bot)` reads
+        // any of its properties.
+        let dest = f.flow.unwrap_or_else(|| f.context());
+        let proto = self.proto_value(dest);
+        if proto || self.walking_pattern(dest) {
+            let line = self.line(node);
+            self.instance_uses.push(InstUse {
+                root: InstRoot::Name(node),
+                scope: f.scope,
+                handed: Handed::Yes,
+                computed: (!proto).then_some(false),
+                proto,
+                line,
+            });
+        }
         // `create(body, signal ? { ...base, signal } : base)` passes `base`.
         if let Some(dest) = f.flow {
             let kind = self.flow_use(dest);
             self.add_ref(f.scope, node, kind);
             return;
         }
-        let kind = match (parent.map(|p| p.kind()), f.field) {
+        let context = f.context();
+        let parent = context.parent;
+        let grand = context.grand.map(|g| g.kind());
+        let kind = match (parent.map(|p| p.kind()), context.field) {
             (Some("call_expression"), Some("function")) => RefKind::Call(parent.unwrap_or(node)),
             (Some("new_expression"), Some("constructor")) => RefKind::New(parent.unwrap_or(node)),
             (Some("arguments"), _)
                 if matches!(grand, Some("call_expression" | "new_expression")) =>
             {
-                f.grand.map_or(RefKind::Escape, RefKind::Arg)
+                context
+                    .grand
+                    .map_or(RefKind::Escape, |call| RefKind::Arg(call, context.index))
             }
             (Some("spread_element"), _) if matches!(grand, Some("object" | "array")) => {
                 RefKind::Spread(
-                    f.grand
+                    context
+                        .grand
                         .and_then(|g| self.literal_calls.get(&g.id()).copied()),
                 )
             }
             (Some("extends_clause"), _) => RefKind::Extends,
             (Some("export_statement"), _) | (Some("export_specifier"), _) => RefKind::Export,
+            // `delete x` too.
             (Some("unary_expression"), _) => RefKind::Harmless,
-            (Some("binary_expression"), _)
-                if !matches!(parent.and_then(operator), Some("??" | "||" | "&&")) =>
-            {
-                RefKind::Harmless
-            }
-            (Some("ternary_expression"), Some("condition")) => RefKind::Harmless,
-            _ => RefKind::Escape,
+            _ if reads_only(context) => RefKind::Harmless,
+            _ => bound_target(context).map_or(RefKind::Escape, RefKind::Bound),
         };
         self.add_ref(f.scope, node, kind);
     }
@@ -3261,6 +3532,37 @@ impl<'t> Ctx<'t> {
                             .push((*binding, module.to_string(), imported, node));
                     }
                 }
+                // `const { a, b: { c }, ...rest } = OPTS` reads `OPTS.a`,
+                // `OPTS.b.c` and the rest of its properties, each bound to
+                // a name, and writes none of them. A rest element or a key
+                // known only at run time reads any property, as `OPTS[k]`
+                // does.
+                let source = unwrap_expression(value);
+                if name.kind() == "object_pattern" && source.kind() == "identifier" {
+                    if !names_every_key(name, self.src) {
+                        let line = self.line(source);
+                        self.instance_uses.push(InstUse {
+                            root: InstRoot::Name(source),
+                            scope: f.scope,
+                            handed: Handed::Yes,
+                            computed: Some(false),
+                            proto: false,
+                            line,
+                        });
+                    }
+                    for binding in &declared {
+                        let path = Rc::clone(&self.bindings[*binding].path);
+                        self.add_ref(
+                            f.scope,
+                            source,
+                            RefKind::Member {
+                                path,
+                                does: ChainUse::Read,
+                            },
+                        );
+                    }
+                    continue;
+                }
                 stack.push(self.child(&frame, value, f.scope, Some("value")));
             }
         }
@@ -3427,25 +3729,32 @@ impl<'t> Ctx<'t> {
         }
         let frame = self.child(f, node, scope, None);
         for (index, param) in params.iter().enumerate() {
-            let (pattern, default, annotation) = match param.kind() {
+            let (pattern, default, annotation, field) = match param.kind() {
                 "required_parameter" | "optional_parameter" => (
                     param.child_by_field_name("pattern"),
                     param.child_by_field_name("value"),
                     param.child_by_field_name("type"),
+                    "value",
                 ),
                 "assignment_pattern" => (
                     param.child_by_field_name("left"),
                     param.child_by_field_name("right"),
                     None,
+                    "right",
                 ),
-                _ => (Some(*param), None, None),
+                _ => (Some(*param), None, None, "value"),
             };
+            // A default is bound to its parameter.
             if let Some(default) = default {
-                stack.push(self.child(&frame, default, scope, Some("value")));
+                let param_frame = self.child(&frame, *param, scope, None);
+                stack.push(self.child(&param_frame, default, scope, Some(field)));
             }
             let Some(pattern) = pattern else {
                 continue;
             };
+            if pattern.kind() == "object_pattern" {
+                self.param_patterns.insert((func, index));
+            }
             let declared = self.declare_pattern(
                 pattern,
                 scope,
@@ -3456,6 +3765,9 @@ impl<'t> Ctx<'t> {
                 &frame,
                 stack,
             );
+            if let ([binding], "identifier") = (declared.as_slice(), pattern.kind()) {
+                self.param_slots.insert((func, index), *binding);
+            }
             for binding in declared {
                 let b = &mut self.bindings[binding];
                 if b.decl == Decl::Param && b.param.is_none() {
@@ -3513,6 +3825,12 @@ impl<'t> Ctx<'t> {
                 } else {
                     This::Instance(class)
                 };
+                if let (Some(n), false) = (name, ctor) {
+                    self.class_methods
+                        .entry((class, is_static, n))
+                        .and_modify(|f| *f = None)
+                        .or_insert(Some(func));
+                }
                 (
                     this,
                     Some(Method {
@@ -3520,6 +3838,7 @@ impl<'t> Ctx<'t> {
                         name: name.unwrap_or(""),
                         ctor,
                         private,
+                        sync: !has_token(node, "async") && !has_token(node, "*"),
                     }),
                 )
             }
@@ -3619,6 +3938,8 @@ impl<'t> Ctx<'t> {
             wild: None,
             static_wild: None,
             self_constructed: None,
+            borrowed: None,
+            props_wild: None,
             ctor: None,
             inner: None,
         });
@@ -3852,6 +4173,9 @@ impl<'t> Ctx<'t> {
                         name,
                         ctor: false,
                         private,
+                        // An arrow function's `this` is not the object it is
+                        // called on.
+                        sync: false,
                     },
                 );
             }
@@ -4110,7 +4434,9 @@ impl<'t> Ctx<'t> {
             ("unary_expression", _) if is_delete(parent) => write(None),
             ("call_expression", Some("function")) => ChainUse::Call,
             ("arguments", _) if matches!(grand, Some("call_expression" | "new_expression")) => {
-                context.grand.map_or(ChainUse::Read, ChainUse::Arg)
+                context
+                    .grand
+                    .map_or(ChainUse::Read, |call| ChainUse::Arg(call, context.index))
             }
             ("spread_element", _) if matches!(grand, Some("object" | "array")) => ChainUse::Spread(
                 context
@@ -4204,10 +4530,12 @@ impl<'t> Ctx<'t> {
                 }
             }
         }
+        // `(opts as any).signal`: parentheses and casts keep the name.
+        let named_root = unwrap_expression(root);
         match root.kind() {
-            "identifier" => self.add_ref(
+            _ if named_root.kind() == "identifier" => self.add_ref(
                 f.scope,
-                root,
+                named_root,
                 RefKind::Member {
                     path: Rc::clone(&path),
                     does,
@@ -4224,6 +4552,7 @@ impl<'t> Ctx<'t> {
                         parent: Some(object_of),
                         field: Some("object"),
                         grand: None,
+                        index: None,
                     });
                 }
                 stack.push(object);
@@ -4284,7 +4613,7 @@ impl<'t> Ctx<'t> {
                         }
                     }
                 }
-                ChainUse::Read | ChainUse::Arg(_) | ChainUse::Spread(_) => {
+                ChainUse::Read | ChainUse::Arg(..) | ChainUse::Spread(_) => {
                     self.method_refs.entry(last).or_insert(Feature {
                         what: "a method read without being called",
                         line,
@@ -4294,8 +4623,59 @@ impl<'t> Ctx<'t> {
             }
         }
         self.note_prop_uses(&path, does, context, f.flow, f.scope);
+        // A member read under a key known only at run time off what may be
+        // a class instance, the class itself or its prototype (`this[k]`,
+        // `(bot as any)[k]`, `Bot.prototype[k]`, `new Bot()[k]`) may read
+        // any method or property: decided once names are bound
+        // ([`Ctx::settle_instances`]). Written (`this[k] = v`), it is not
+        // read.
+        let base = unwrap_expression(root);
+        let computed = match (path.first(), path.get(1)) {
+            (Some(Step::Other), _) => self.instance_root(base).map(|r| (r, 0)),
+            (Some(Step::Key("prototype")), Some(Step::Other)) if base.kind() == "identifier" => {
+                Some((InstRoot::Prototype(base), 1))
+            }
+            _ => None,
+        };
+        if let Some((at_root, at)) = computed {
+            let last = at + 1 == path.len();
+            if !(last && matches!(does, ChainUse::Write { .. })) {
+                let called = last && matches!(does, ChainUse::Call);
+                let handed = if called {
+                    Handed::No
+                } else {
+                    self.step_use(&path, at, does, context, f.flow, f.scope)
+                };
+                self.instance_uses.push(InstUse {
+                    root: at_root,
+                    scope: f.scope,
+                    handed,
+                    computed: Some(called),
+                    proto: false,
+                    line,
+                });
+            }
+        }
+        // `C.prototype` used as a value other than to read, call or write a
+        // member by name (`Object.create(Bot.prototype)`, `{ __proto__:
+        // Bot.prototype }`): `C`'s methods may run with another `this`.
+        if path.as_ref() == [Step::Key("prototype")] && base.kind() == "identifier" {
+            let dest = f.flow.unwrap_or(context);
+            let member_of = dest.field == Some("object")
+                && dest.parent.is_some_and(|p| {
+                    matches!(p.kind(), "member_expression" | "subscript_expression")
+                });
+            let used = match does {
+                ChainUse::Read => !reads_only(dest) && !member_of,
+                ChainUse::Arg(..) | ChainUse::Spread(_) => true,
+                ChainUse::Call | ChainUse::Write { .. } => false,
+            };
+            if used {
+                self.prototype_uses.push((base, f.scope, line));
+            }
+        }
         let rooted = matches!(root.kind(), "identifier" | "this");
-        if rooted && !path.is_empty() && matches!(does, ChainUse::Read | ChainUse::Arg(_)) {
+        if rooted && !path.is_empty() && matches!(does, ChainUse::Read | ChainUse::Arg(..)) {
             self.member_values.push((top, f.scope));
         }
         if let ChainUse::Write { value, scope } = does {
@@ -4331,12 +4711,8 @@ impl<'t> Ctx<'t> {
 
     /// Records, for each member name on a chain, whether the value read
     /// there may reach code that changes what it holds
-    /// ([`Ctx::prop_handed`], [`Ctx::prop_passed`]). Reading on past it
-    /// (`x.opts.timeout`, `x.opts.headers.y = v`) writes nothing on it; a
-    /// write on it under a static key other than [`HOOK_KEYS`]
-    /// (`this.opts.signal = s`), a spread of it, a replacement of the
-    /// property (read where it is written) and a use that only reads it
-    /// (`!x.opts`, `x.opts === y`, a condition) change nothing it holds.
+    /// ([`Ctx::prop_handed`], [`Ctx::prop_passed`], [`Ctx::prop_bound`]),
+    /// as [`Ctx::step_use`] says.
     fn note_prop_uses(
         &mut self,
         path: &[Step<'t>],
@@ -4349,33 +4725,20 @@ impl<'t> Ctx<'t> {
             let Step::Key(name) = *step else {
                 continue;
             };
-            let handed = match path.get(at + 1) {
-                // `x.opts.__proto__.path = p` writes what it inherits.
-                Some(next) if at + 2 < path.len() => {
-                    matches!(does, ChainUse::Write { .. }) && *next == Step::Key("__proto__")
+            let handed = match self.step_use(path, at, does, context, flow, scope) {
+                Handed::No => false,
+                Handed::Yes | Handed::Returned => true,
+                Handed::Passed(call, call_scope, index) => {
+                    let passed = self.prop_passed.entry(name).or_default();
+                    let room = passed.len() < MAX_WRITES_READ;
+                    if room {
+                        passed.push((call, call_scope, index));
+                    }
+                    !room
                 }
-                Some(next) => match does {
-                    ChainUse::Write { .. } => match next {
-                        Step::Key(key) => HOOK_KEYS.contains(key) || *key == "__proto__",
-                        _ => true,
-                    },
-                    // `x.opts.set(k, v)` may write it through `this`.
-                    ChainUse::Call => true,
-                    ChainUse::Read | ChainUse::Arg(_) | ChainUse::Spread(_) => false,
-                },
-                // `signal ? this.opts : undefined` goes where the
-                // conditional's value goes.
-                None => match flow.map(|dest| self.flow_use(dest)) {
-                    Some(RefKind::Arg(call)) => self.note_prop_passed(name, call, scope),
-                    Some(RefKind::Spread(_)) => false,
-                    Some(_) => true,
-                    None => match does {
-                        ChainUse::Arg(call) => self.note_prop_passed(name, call, scope),
-                        ChainUse::Spread(_) | ChainUse::Write { .. } => false,
-                        ChainUse::Call => true,
-                        ChainUse::Read => !reads_only(context),
-                    },
-                },
+                Handed::Bound(target, target_scope) => {
+                    self.note_prop_bound(name, target, target_scope)
+                }
             };
             if handed {
                 self.prop_handed.insert(name);
@@ -4383,31 +4746,354 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// Records a name a member's value is bound to (`const o =
+    /// this.opts`, `const { opts } = this`); past [`MAX_WRITES_READ`] of
+    /// them, the value counts as handed out.
+    fn note_prop_bound(&mut self, name: &'t str, target: Node<'t>, scope: usize) -> bool {
+        let bound = self.prop_bound.entry(name).or_default();
+        let room = bound.len() < MAX_WRITES_READ;
+        if room {
+            bound.push((target, scope));
+        }
+        !room
+    }
+
+    /// What a chain does with the value at `path[at]`. Reading on past it
+    /// (`x.opts.timeout`, `x.opts.headers.y = v`) writes nothing on it; a
+    /// write on it under a static key other than [`HOOK_KEYS`]
+    /// (`this.opts.signal = s`), a spread of it, a replacement of the
+    /// property (read where it is written), a destructuring of it and a
+    /// use that only reads it (`!x.opts`, `x.opts === y`, `x.opts && ...`,
+    /// a condition, [`reads_only`]) change nothing it holds; passing it or
+    /// binding it to a name hands it on to what that call or name does
+    /// with it; anything else may hand it out.
+    fn step_use(
+        &self,
+        path: &[Step<'t>],
+        at: usize,
+        does: ChainUse<'t>,
+        context: Context<'t>,
+        flow: Option<Context<'t>>,
+        scope: usize,
+    ) -> Handed<'t> {
+        match path.get(at + 1) {
+            // `x.opts.__proto__.path = p` writes what it inherits.
+            Some(next) if at + 2 < path.len() => {
+                if matches!(does, ChainUse::Write { .. }) && *next == Step::Key("__proto__") {
+                    Handed::Yes
+                } else {
+                    Handed::No
+                }
+            }
+            Some(next) => match does {
+                ChainUse::Write { .. } => match next {
+                    Step::Key(key) if !HOOK_KEYS.contains(key) && *key != "__proto__" => Handed::No,
+                    _ => Handed::Yes,
+                },
+                // `x.opts.set(k, v)` may write it through `this`.
+                ChainUse::Call => Handed::Yes,
+                ChainUse::Read | ChainUse::Arg(..) | ChainUse::Spread(_) => Handed::No,
+            },
+            // `signal ? this.opts : undefined` goes where the conditional's
+            // value goes.
+            None => match flow {
+                Some(dest) => self.value_handed(dest, scope),
+                None => match does {
+                    ChainUse::Arg(call, index) => Handed::Passed(call, scope, index),
+                    ChainUse::Spread(_) | ChainUse::Write { .. } => Handed::No,
+                    ChainUse::Call => Handed::Yes,
+                    ChainUse::Read => self.value_handed(context, scope),
+                },
+            },
+        }
+    }
+
+    /// What a value used where `context` says does with what it holds
+    /// ([`Ctx::step_use`]): a read, a destructuring that names every key
+    /// and a spread into a literal hand nothing out.
+    fn value_handed(&self, context: Context<'t>, scope: usize) -> Handed<'t> {
+        if reads_only(context) {
+            return Handed::No;
+        }
+        if let Some(pattern) = destructured_by(context) {
+            return if names_every_key(pattern, self.src) {
+                Handed::No
+            } else {
+                Handed::Yes
+            };
+        }
+        let grand = context.grand.map(|g| g.kind());
+        match context.parent.map(|p| p.kind()) {
+            Some("arguments") if matches!(grand, Some("call_expression" | "new_expression")) => {
+                match context.grand {
+                    Some(call) => Handed::Passed(call, scope, context.index),
+                    None => Handed::Yes,
+                }
+            }
+            Some("spread_element") if matches!(grand, Some("object" | "array")) => Handed::No,
+            Some("return_statement") => Handed::Returned,
+            _ => match bound_target(context) {
+                Some(target) => Handed::Bound(target, scope),
+                None => Handed::Yes,
+            },
+        }
+    }
+
+    /// What a use of a whole value that may be a class instance (`this`,
+    /// `new Svc()`, `svc.fluent()`) does with it, and whether it makes it
+    /// another object's prototype ([`Ctx::proto_value`]). Only a use that
+    /// may reach what its properties hold without naming them hands it
+    /// out: a spread (`{ ...this }`), or a destructuring with a rest
+    /// element or a run-time key. A call it is passed to is decided once
+    /// names are bound ([`Ctx::instance_handed`]), and `return this` may
+    /// make a method fluent ([`Ctx::this_use`]). Stored, exported or bound
+    /// to a name, it reaches nothing the file shows: a name given it is
+    /// decided by its own uses, and other modules do not write its
+    /// properties' objects. A member read off it is decided where its
+    /// chain is.
+    fn whole_use(
+        &self,
+        context: Context<'t>,
+        flow: Option<Context<'t>>,
+        scope: usize,
+    ) -> (Handed<'t>, bool) {
+        let context = flow.unwrap_or(context);
+        if self.proto_value(context) {
+            return (Handed::Yes, true);
+        }
+        if context.parent.is_some_and(|p| p.kind() == "spread_element")
+            || self.walking_pattern(context)
+        {
+            return (Handed::Yes, false);
+        }
+        if let Some(pattern) = destructured_by(context) {
+            let walks = !names_every_key(pattern, self.src);
+            return (if walks { Handed::Yes } else { Handed::No }, false);
+        }
+        let handed = match self.value_handed(context, scope) {
+            handed @ (Handed::Passed(..) | Handed::Returned) => handed,
+            _ => Handed::No,
+        };
+        (handed, false)
+    }
+
+    /// Whether a value used where `context` says is made another object's
+    /// prototype: the value of `__proto__` in an object literal (`{
+    /// __proto__: bot }`) or assigned to one (`x.__proto__ = bot`,
+    /// `x["__proto__"] = bot`).
+    fn proto_value(&self, context: Context<'t>) -> bool {
+        let Some(parent) = context.parent else {
+            return false;
+        };
+        match (parent.kind(), context.field) {
+            ("pair", Some("value")) => parent
+                .child_by_field_name("key")
+                .is_some_and(|key| self.member_name(key) == Some("__proto__")),
+            ("assignment_expression", Some("right")) => parent
+                .child_by_field_name("left")
+                .map(unwrap_expression)
+                .is_some_and(|left| match left.kind() {
+                    "member_expression" => left
+                        .child_by_field_name("property")
+                        .is_some_and(|p| self.text(p) == "__proto__"),
+                    "subscript_expression" => {
+                        left.child_by_field_name("index")
+                            .and_then(|i| static_key(unwrap_expression(i), self.src))
+                            == Some("__proto__")
+                    }
+                    _ => false,
+                }),
+            _ => false,
+        }
+    }
+
+    /// Whether a value used where `context` says is destructured by an
+    /// assignment pattern with a rest element or a run-time key (`({ a,
+    /// ...rest } = bot)`), which reads any of its properties.
+    fn walking_pattern(&self, context: Context<'t>) -> bool {
+        let Some(parent) = context.parent else {
+            return false;
+        };
+        parent.kind() == "assignment_expression"
+            && context.field == Some("right")
+            && parent.child_by_field_name("left").is_some_and(|left| {
+                left.kind() == "object_pattern" && !names_every_key(left, self.src)
+            })
+    }
+
+    /// Whether a call is written `Reflect.get(...)`; whether `Reflect` is
+    /// the global one is decided once names are bound.
+    fn reflect_get_shaped(&self, call: Node<'t>) -> bool {
+        call.child_by_field_name("function")
+            .filter(|f| f.kind() == "member_expression")
+            .is_some_and(|f| {
+                f.child_by_field_name("object")
+                    .is_some_and(|o| o.kind() == "identifier" && self.text(o) == "Reflect")
+                    && f.child_by_field_name("property")
+                        .is_some_and(|p| self.text(p) == "get")
+            })
+    }
+
+    /// What is done with a call's result, read as a member under a
+    /// run-time key is ([`Ctx::step_use`]): called right there it is only
+    /// run, and a member read or written off it may change what it holds.
+    fn result_handed(
+        &self,
+        context: Context<'t>,
+        flow: Option<Context<'t>>,
+        scope: usize,
+    ) -> Handed<'t> {
+        let dest = flow.unwrap_or(context);
+        match (dest.parent.map(|p| p.kind()), dest.field) {
+            (Some("call_expression"), Some("function")) => Handed::No,
+            (Some("member_expression" | "subscript_expression"), Some("object")) => Handed::Yes,
+            _ => self.value_handed(dest, scope),
+        }
+    }
+
+    /// `this` used as a value ([`Ctx::settle_instances`]); a member read
+    /// off it is decided where its chain is. `return this` in a class
+    /// method that is neither async nor a generator gives its caller the
+    /// object ([`Ctx::fluent`]), and in a constructor changes nothing.
+    fn this_use(&mut self, f: &Frame<'t>) {
+        let (handed, proto) = self.whole_use(f.context(), f.flow, f.scope);
+        let handed = match handed {
+            Handed::Returned => {
+                if let Some(Some(name)) = self.fluent_method(f.scope) {
+                    self.fluent.insert(name);
+                }
+                Handed::No
+            }
+            handed => handed,
+        };
+        let line = self.line(f.node);
+        self.note_instance_use(InstRoot::This, f.scope, handed, proto, line);
+    }
+
+    /// For `return this` in `scope`: the name of the class method whose own
+    /// body it is, when that is neither async nor a generator, or
+    /// `Some(None)` for a constructor; `None` anywhere else.
+    fn fluent_method(&self, scope: usize) -> Option<Option<&'t str>> {
+        let own = self.scopes[scope].var_scope;
+        if self.scopes[own].arrow {
+            return None;
+        }
+        let method = self.funcs[*self.scope_func.get(&own)?].method?;
+        if method.ctor {
+            return Some(None);
+        }
+        (method.sync && !method.name.is_empty()).then_some(Some(method.name))
+    }
+
+    /// Records a use of the whole value of what may be a class instance
+    /// that may do more than read it.
+    fn note_instance_use(
+        &mut self,
+        root: InstRoot<'t>,
+        scope: usize,
+        handed: Handed<'t>,
+        proto: bool,
+        line: u32,
+    ) {
+        if matches!(handed, Handed::No) && !proto {
+            return;
+        }
+        self.instance_uses.push(InstUse {
+            root,
+            scope,
+            handed,
+            computed: None,
+            proto,
+            line,
+        });
+    }
+
+    /// The name a call's callee reads off an object by a static key
+    /// (`svc.withModel(...)`, `svc["withModel"](...)`).
+    fn method_name(&self, call: Node<'t>) -> Option<&'t str> {
+        let function = unwrap_expression(call.child_by_field_name("function")?);
+        match function.kind() {
+            "member_expression" => function
+                .child_by_field_name("property")
+                .filter(|p| {
+                    matches!(
+                        p.kind(),
+                        "property_identifier" | "private_property_identifier"
+                    )
+                })
+                .map(|p| self.text(p)),
+            "subscript_expression" => function
+                .child_by_field_name("index")
+                .and_then(|i| static_key(i, self.src)),
+            _ => None,
+        }
+    }
+
+    /// What an expression may be an instance of a same-file class (or the
+    /// class) as: `this` or `super`, a name, `new X(...)`, a call of a
+    /// method by name (which may return `this`), or `C.prototype`.
+    fn instance_root(&self, expr: Node<'t>) -> Option<InstRoot<'t>> {
+        let base = unwrap_expression(expr);
+        match base.kind() {
+            "this" | "super" => Some(InstRoot::This),
+            "identifier" => Some(InstRoot::Name(base)),
+            "new_expression" => base.child_by_field_name("constructor").map(InstRoot::New),
+            "call_expression" => self.method_name(base).map(InstRoot::Fluent),
+            _ => self.prototype_root(base).map(InstRoot::Prototype),
+        }
+    }
+
+    /// The name `C` of `C.prototype` (past wrappers).
+    fn prototype_root(&self, member: Node<'t>) -> Option<Node<'t>> {
+        let member = unwrap_expression(member);
+        if member.kind() != "member_expression" {
+            return None;
+        }
+        let property = member.child_by_field_name("property")?;
+        if self.text(property) != "prototype" {
+            return None;
+        }
+        let object = unwrap_expression(member.child_by_field_name("object")?);
+        (object.kind() == "identifier").then_some(object)
+    }
+
     /// Whether every call a member's value is passed to
-    /// ([`Ctx::prop_passed`]) is an SDK request or a read-only builtin,
-    /// decided once per name: every class's property of that name shares
-    /// the answer.
+    /// ([`Ctx::prop_passed`]) is an SDK request, a read-only builtin or a
+    /// same-file function whose parameter there hands nothing out
+    /// ([`Ctx::param_of`]), and every name it is bound to
+    /// ([`Ctx::prop_bound`]) hands nothing out ([`Ctx::hands_out`]):
+    /// decided once per name, as every class's property of that name
+    /// shares the answer.
     fn prop_passed_harmless(&mut self, name: &'t str) -> bool {
         if let Some(&harmless) = self.prop_passed_memo.get(name) {
             return harmless;
         }
         let passed = self.prop_passed.get(name).cloned().unwrap_or_default();
-        let harmless = passed
-            .into_iter()
-            .all(|(call, scope)| self.harmless_call(call, scope));
+        let bound = self.prop_bound.get(name).cloned().unwrap_or_default();
+        let mut harmless = true;
+        for (call, scope, index) in passed {
+            if !harmless {
+                break;
+            }
+            if self.harmless_call(call, scope) {
+                continue;
+            }
+            harmless = match self.param_of(call, scope, index) {
+                Some(Param::Name(param)) => !self.hands_out(param),
+                Some(Param::Pattern) => true,
+                None => false,
+            };
+        }
+        for (target, scope) in bound {
+            if !harmless {
+                break;
+            }
+            harmless = self
+                .lookup(scope, self.text(target))
+                .is_some_and(|alias| !self.hands_out(alias));
+        }
         self.prop_passed_memo.insert(name, harmless);
         harmless
-    }
-
-    /// Records a call a member's value is passed to; past
-    /// [`MAX_WRITES_READ`] of them, the value counts as handed out.
-    fn note_prop_passed(&mut self, name: &'t str, call: Node<'t>, scope: usize) -> bool {
-        let passed = self.prop_passed.entry(name).or_default();
-        let room = passed.len() < MAX_WRITES_READ;
-        if room {
-            passed.push((call, scope));
-        }
-        !room
     }
 
     /// Whether `member` reads `call`, `apply` or `bind` off its object.
@@ -4581,21 +5267,105 @@ fn keeps_value(kind: &str) -> bool {
 
 /// Whether a value used where `context` says is only read there: an
 /// operand of a unary operator (`!x`, `typeof x`) or of one that gives a
-/// primitive (`x === y`, `"k" in x`), a condition, or a statement of its
-/// own.
+/// primitive (`x === y`, `"k" in x`), the left side of `&&` (an object is
+/// always truthy, so `x && y` never gives `x` when `x` holds one), a
+/// condition (`if`, `while`, `do`, `?:`; a `for` condition is a statement),
+/// a `switch` or `case` value, a substitution in a template that is not
+/// tagged (a tagged one passes it to its tag function), what a `for...in`
+/// loop takes the keys of, or a statement of its own.
 fn reads_only(context: Context<'_>) -> bool {
     let Some(parent) = context.parent else {
         return true;
     };
+    let field = context.field;
     match parent.kind() {
         "unary_expression" => !is_delete(parent),
-        "binary_expression" => !matches!(operator(parent), Some("??" | "||" | "&&")),
+        "binary_expression" => match operator(parent) {
+            Some("??" | "||") => false,
+            Some("&&") => field == Some("left"),
+            _ => true,
+        },
         "ternary_expression" | "if_statement" | "while_statement" | "do_statement" => {
-            context.field == Some("condition")
+            field == Some("condition")
+        }
+        "switch_statement" | "switch_case" => field == Some("value"),
+        "for_in_statement" => {
+            field == Some("right")
+                && parent
+                    .child_by_field_name("operator")
+                    .is_some_and(|op| op.kind() == "in")
+        }
+        "template_substitution" => {
+            // `` tag`${x}` `` is a call of `tag` with `x` among its arguments.
+            let template = context.grand.or_else(|| parent.parent());
+            !template.is_some_and(|template| {
+                template.parent().is_some_and(|call| {
+                    call.kind() == "call_expression"
+                        && call.child_by_field_name("arguments") == Some(template)
+                })
+            })
         }
         "expression_statement" => true,
         _ => false,
     }
+}
+
+/// The name a value used where `context` says is bound to: a declarator's
+/// name (`const o = x`), the left side of `=` (`o = x`), or a parameter
+/// (its default, `function f(o = x)`).
+fn bound_target(context: Context<'_>) -> Option<Node<'_>> {
+    let parent = context.parent?;
+    let target = match (parent.kind(), context.field) {
+        ("variable_declarator", Some("value")) => parent.child_by_field_name("name"),
+        ("assignment_expression", Some("right")) => parent.child_by_field_name("left"),
+        ("required_parameter" | "optional_parameter", Some("value")) => {
+            parent.child_by_field_name("pattern")
+        }
+        ("assignment_pattern", Some("right")) => parent.child_by_field_name("left"),
+        _ => None,
+    }?;
+    (target.kind() == "identifier").then_some(target)
+}
+
+/// The object pattern a value used where `context` says is destructured
+/// by in a declaration (`const { a, b = 0 } = x`), if any.
+fn destructured_by(context: Context<'_>) -> Option<Node<'_>> {
+    let parent = context.parent?;
+    if parent.kind() != "variable_declarator" || context.field != Some("value") {
+        return None;
+    }
+    parent
+        .child_by_field_name("name")
+        .filter(|name| name.kind() == "object_pattern")
+}
+
+/// Whether an object pattern names every property it reads, none of them
+/// `__proto__`: no computed key that is not a literal and no rest element
+/// (`{ a, b: c, d = 0 }`).
+fn names_every_key(pattern: Node<'_>, src: &str) -> bool {
+    let mut cursor = pattern.walk();
+    let all = pattern
+        .named_children(&mut cursor)
+        .all(|entry| match entry.kind() {
+            "shorthand_property_identifier_pattern" | "comment" => true,
+            "object_assignment_pattern" => entry
+                .child_by_field_name("left")
+                .is_some_and(|left| src.get(left.byte_range()) != Some("__proto__")),
+            "pair_pattern" => {
+                entry
+                    .child_by_field_name("key")
+                    .is_some_and(|key| match key.kind() {
+                        "computed_property_name" => key
+                            .named_child(0)
+                            .and_then(|k| static_key(k, src))
+                            .is_some_and(|k| k != "__proto__"),
+                        "string" => string_content(key, src).is_some_and(|k| k != "__proto__"),
+                        _ => src.get(key.byte_range()) != Some("__proto__"),
+                    })
+            }
+            _ => false,
+        });
+    all
 }
 
 /// `expr` without the parentheses around it.
@@ -4766,8 +5536,9 @@ impl<'t> Ctx<'t> {
                 if r.name == "arguments"
                     && matches!(
                         r.kind,
-                        RefKind::Arg(_)
+                        RefKind::Arg(..)
                             | RefKind::Escape
+                            | RefKind::Bound(_)
                             | RefKind::Member {
                                 does: ChainUse::Write { .. },
                                 ..
@@ -4775,6 +5546,15 @@ impl<'t> Ctx<'t> {
                     )
                 {
                     self.arguments_scopes.push(r.scope);
+                }
+                // Any use of `arguments` may read what a call passes.
+                if r.name == "arguments" {
+                    if let Some(func) = self
+                        .arguments_owner(r.scope)
+                        .and_then(|owner| self.scope_func.get(&owner))
+                    {
+                        self.arguments_funcs.insert(*func);
+                    }
                 }
                 continue;
             };
@@ -4792,12 +5572,27 @@ impl<'t> Ctx<'t> {
                         news.push((call, r.scope));
                     }
                 }
-                RefKind::Arg(call) => {
+                RefKind::Arg(call, index) => {
                     let uses = &mut self.bindings[b].uses;
                     if uses.passed_to.len() < MAX_WRITES_READ {
-                        uses.passed_to.push((call, r.scope));
+                        uses.passed_to.push((call, r.scope, index));
                     } else {
                         uses.passed_cut = true;
+                    }
+                }
+                // `const o = OPTS`: an alias, which every analysis but
+                // [`Ctx::hands_out`] takes as an escape.
+                RefKind::Bound(target) => {
+                    let target = self.lookup(r.scope, self.text(target));
+                    let uses = &mut self.bindings[b].uses;
+                    uses.escapes = true;
+                    match target {
+                        Some(target) if uses.bound_to.contains(&target) => {}
+                        Some(target) if uses.bound_to.len() < MAX_WRITES_READ => {
+                            uses.bound_to.push(target);
+                        }
+                        Some(_) => uses.bound_cut = true,
+                        None => uses.escapes_unbound = true,
                     }
                 }
                 RefKind::Member { path, does, .. } => {
@@ -4824,7 +5619,7 @@ impl<'t> Ctx<'t> {
                             Some((entries.into(), call.map(|c| (c, r.scope))))
                         }
                         ChainUse::Read => Some((path, None)),
-                        ChainUse::Arg(call) => Some((path, Some((call, r.scope)))),
+                        ChainUse::Arg(call, _) => Some((path, Some((call, r.scope)))),
                     };
                     if let Some(handed) = handed {
                         self.hand_out(b, handed);
@@ -4835,10 +5630,15 @@ impl<'t> Ctx<'t> {
                 // `{ ...CONFIG }` copies the entries, and shares the
                 // containers they hold.
                 RefKind::Spread(call) => {
+                    self.bindings[b].uses.spread = true;
                     self.hand_out(b, (Rc::from([Step::Other]), call.map(|c| (c, r.scope))));
                 }
                 RefKind::Harmless => {}
-                RefKind::Escape => self.bindings[b].uses.escapes = true,
+                RefKind::Escape => {
+                    let uses = &mut self.bindings[b].uses;
+                    uses.escapes = true;
+                    uses.escapes_unbound = true;
+                }
             }
         }
         for class in 0..self.classes.len() {
@@ -4904,25 +5704,11 @@ impl<'t> Ctx<'t> {
     /// `arguments` may be written: each parameter may be rewritten through
     /// it (`arguments[0] = x`).
     fn alias_arguments(&mut self) {
-        let mut owners = HashSet::new();
-        for &scope in &self.arguments_scopes {
-            // `arguments` is the nearest non-arrow function's.
-            let mut s = self.scopes[scope].var_scope;
-            loop {
-                let here = &self.scopes[s];
-                if here.kind == ScopeKind::Module {
-                    break;
-                }
-                if !here.arrow {
-                    owners.insert(s);
-                    break;
-                }
-                match here.parent {
-                    Some(parent) => s = self.scopes[parent].var_scope,
-                    None => break,
-                }
-            }
-        }
+        let owners: HashSet<usize> = self
+            .arguments_scopes
+            .iter()
+            .filter_map(|&scope| self.arguments_owner(scope))
+            .collect();
         if owners.is_empty() {
             return;
         }
@@ -4946,6 +5732,22 @@ impl<'t> Ctx<'t> {
             if simple {
                 self.bindings[b].writes_cut = true;
             }
+        }
+    }
+
+    /// The function scope whose `arguments` the code in `scope` sees: the
+    /// nearest that is not an arrow function's, if any.
+    fn arguments_owner(&self, scope: usize) -> Option<usize> {
+        let mut s = self.scopes[scope].var_scope;
+        loop {
+            let here = &self.scopes[s];
+            if here.kind == ScopeKind::Module {
+                return None;
+            }
+            if !here.arrow {
+                return Some(s);
+            }
+            s = self.scopes[here.parent?].var_scope;
         }
     }
 
@@ -5460,6 +6262,11 @@ impl<'t> Ctx<'t> {
         {
             return false;
         }
+        // `[root] = [globalThis]`: a write whose value the file does not
+        // show may give it the global object.
+        if binding.writes_cut || binding.writes.iter().any(|w| w.value.is_none()) {
+            return true;
+        }
         let init = binding.init.map(|init| (init, binding.init_scope));
         let writes = binding
             .writes
@@ -5619,7 +6426,7 @@ impl<'t> Ctx<'t> {
                 && !uses.mutated
                 && !uses.member_calls
                 && !uses.passed_cut
-                && uses.passed_to.iter().all(|(call, call_scope)| {
+                && uses.passed_to.iter().all(|(call, call_scope, _)| {
                     call.child_by_field_name("function")
                         .and_then(|f| self.global_callee(f, *call_scope))
                         .is_some_and(|callee| READ_ONLY_CALLS.contains(&callee.as_str()))
@@ -5870,6 +6677,729 @@ impl<'t> Ctx<'t> {
             }
         }
         self.calls = calls;
+    }
+
+    /// Uses of what may be a class instance or a same-file class
+    /// ([`Ctx::instance_uses`]), decided once names are bound and before
+    /// any value is evaluated (they change what methods and properties
+    /// read):
+    /// - a member read under a key known only at run time (`this[k]`,
+    ///   `(bot as any)[k]`, `Bot[k]`, `Bot.prototype[k]`, `Reflect.get(x,
+    ///   k)`) may read any method, to be called from anywhere or run with
+    ///   another `this`, as Python's `getattr(self, k)` does: no method's
+    ///   calls are all seen ([`Ctx::method_calls_wild`]), and every method
+    ///   may run with another `this` ([`Ctx::method_refs_wild`]). Called
+    ///   right there (`this[k](...)`), it runs with that object.
+    /// - such a read used for more than a read, a test or a call, and the
+    ///   whole value spread, destructured with a rest element or a key
+    ///   known only at run time, or given to a call that reads its
+    ///   properties without naming them ([`Ctx::instance_handed`]), may
+    ///   reach a class property's object without naming it
+    ///   ([`Ctx::props_wild`]).
+    /// - the whole value made another object's prototype or a `Proxy`'s
+    ///   target (`Object.create(bot)`, `new Proxy(bot, h)`, `{ __proto__:
+    ///   bot }`) runs its class's methods with another `this`
+    ///   ([`Class::borrowed`]), as `C.prototype` used as a value does.
+    fn settle_instances(&mut self) {
+        let calls = std::mem::take(&mut self.calls);
+        for (call, scope) in &calls {
+            if call.kind() != "call_expression" {
+                continue;
+            }
+            let reflected = call
+                .child_by_field_name("function")
+                .and_then(|f| self.global_callee(f, *scope));
+            if reflected.as_deref() != Some("Reflect.get") {
+                continue;
+            }
+            let line = self.line(*call);
+            match nth_argument(*call, 1).and_then(|k| static_key(unwrap_expression(k), self.src)) {
+                // `Reflect.get(this, "chat")` reads `chat`, as `this.chat`.
+                Some(name) => {
+                    self.method_refs.entry(name).or_insert(Feature {
+                        what: "a method read through `Reflect.get`",
+                        line,
+                    });
+                    self.prop_handed.insert(name);
+                }
+                // `Reflect.get(this, k)` reads under a run-time name, as
+                // `this[k]` does, off the same values; called, it runs with
+                // no `this`.
+                None => {
+                    let root = nth_argument(*call, 0).and_then(|target| self.instance_root(target));
+                    if let Some(root) = root {
+                        let handed = self
+                            .reflect_gets
+                            .get(&call.id())
+                            .copied()
+                            .unwrap_or(Handed::Yes);
+                        self.instance_uses.push(InstUse {
+                            root,
+                            scope: *scope,
+                            handed,
+                            computed: Some(false),
+                            proto: false,
+                            line,
+                        });
+                    }
+                }
+            }
+        }
+        self.calls = calls;
+        let uses = std::mem::take(&mut self.instance_uses);
+        for u in &uses {
+            let instance = match u.root {
+                InstRoot::This => self.this_instance(u.scope),
+                InstRoot::Name(name) => match self.lookup(u.scope, self.text(name)) {
+                    Some(b) => self.instance_of(b),
+                    None => Inst::None,
+                },
+                InstRoot::New(constructor) => self.constructed(constructor, u.scope),
+                InstRoot::Fluent(name) if self.fluent.contains(name) => Inst::Any,
+                InstRoot::Fluent(_) => Inst::None,
+                InstRoot::Prototype(name) => self
+                    .class_named(name, u.scope)
+                    .map_or(Inst::None, Inst::One),
+            };
+            if instance == Inst::None {
+                continue;
+            }
+            match u.computed {
+                Some(called) => {
+                    if !called {
+                        let feature = Feature {
+                            what: "a member read under a name known only at run time",
+                            line: u.line,
+                        };
+                        self.method_calls_wild.get_or_insert(feature);
+                        self.method_refs_wild.get_or_insert(feature);
+                    }
+                    let (handed, _) = self.instance_handed(u.handed, false);
+                    if handed {
+                        let feature = Feature {
+                            what: "a member read under a name known only at run time handed out",
+                            line: u.line,
+                        };
+                        self.props_wild_of(instance, feature);
+                    }
+                }
+                None => {
+                    let (handed, proxied) = self.instance_handed(u.handed, true);
+                    if handed {
+                        let feature = Feature {
+                            what: "an instance whose properties the file may reach without their names",
+                            line: u.line,
+                        };
+                        self.props_wild_of(instance, feature);
+                    }
+                    if proxied || u.proto {
+                        self.borrow(instance, u.line);
+                    }
+                }
+            }
+        }
+        self.instance_uses = uses;
+        // Names that may hold an instance or a class, used whole: stored,
+        // returned or bound to another name, they hand it to nothing the
+        // file shows (a name bound to it is decided by its own uses).
+        for b in 0..self.bindings.len() {
+            let uses = &self.bindings[b].uses;
+            if !(uses.spread || uses.passed_cut || !uses.passed_to.is_empty()) {
+                continue;
+            }
+            let instance = self.instance_of(b);
+            if instance == Inst::None {
+                continue;
+            }
+            let binding = &self.bindings[b];
+            let line = self.line(binding.node);
+            let uses = &binding.uses;
+            let mut handed = uses.spread || uses.passed_cut;
+            let mut proxied = None;
+            for (call, scope, index) in binding.uses.passed_to.clone() {
+                let (h, p) = self.instance_handed(Handed::Passed(call, scope, index), true);
+                handed |= h;
+                if p {
+                    proxied.get_or_insert(self.line(call));
+                }
+            }
+            if handed {
+                let feature = Feature {
+                    what: "an instance whose properties the file may reach without their names",
+                    line,
+                };
+                self.props_wild_of(instance, feature);
+            }
+            if let Some(line) = proxied {
+                self.borrow(instance, line);
+            }
+        }
+        for (name, scope, line) in std::mem::take(&mut self.prototype_uses) {
+            if let Some(class) = self.class_named(name, scope) {
+                self.classes[class].borrowed.get_or_insert(Feature {
+                    what: "the class's prototype used as a value",
+                    line,
+                });
+            }
+        }
+    }
+
+    /// Whether a use of what may be a class instance (`whole`), or of a
+    /// member read off it under a run-time key, may hand out what its
+    /// properties hold, and whether it makes the instance another object's
+    /// prototype or a `Proxy`'s target. A member's value is handed out by
+    /// anything but a read-only builtin. The whole instance only by a call
+    /// that reads its properties without naming them (`Object.values`,
+    /// `Object.entries`, `Object.getOwnPropertyDescriptors`, a source of
+    /// `Object.assign`, a same-file function whose parameter there is an
+    /// object pattern with a rest element or a run-time key, or that reads
+    /// its `arguments`), or makes it a prototype or a `Proxy`'s target.
+    /// Returned, bound to a name or passed anywhere else it reaches nothing
+    /// the file shows: other modules do not write its properties' objects,
+    /// and a name or parameter given it is decided by its own uses.
+    fn instance_handed(&mut self, handed: Handed<'t>, whole: bool) -> (bool, bool) {
+        match handed {
+            Handed::No => (false, false),
+            Handed::Yes => (true, false),
+            // An alias of an instance is an instance: its own uses decide.
+            Handed::Returned | Handed::Bound(..) => (!whole, false),
+            Handed::Passed(call, scope, index) => {
+                let callee = match call.kind() {
+                    "new_expression" => call.child_by_field_name("constructor"),
+                    _ => call.child_by_field_name("function"),
+                }
+                .and_then(|f| self.global_callee(f, scope));
+                match (callee.as_deref(), index) {
+                    (Some("Proxy"), Some(0)) if call.kind() == "new_expression" => (true, true),
+                    (Some("Object.create"), Some(0))
+                    | (Some("Object.setPrototypeOf" | "Reflect.setPrototypeOf"), Some(1)) => {
+                        (true, true)
+                    }
+                    // `Reflect.set(o, "__proto__", bot)`
+                    (Some("Reflect.set"), Some(2))
+                        if nth_argument(call, 1)
+                            .and_then(|k| static_key(unwrap_expression(k), self.src))
+                            == Some("__proto__") =>
+                    {
+                        (true, true)
+                    }
+                    (Some(callee), _) if READ_ONLY_CALLS.contains(&callee) => {
+                        (self.hands_back(call, scope) != HandBack::Nothing, false)
+                    }
+                    _ if !whole => (true, false),
+                    // `Object.assign(target, this)` copies its properties;
+                    // `Object.assign(this, ...)` writes it (rule 5).
+                    (Some("Object.assign"), index) => (index != Some(0), false),
+                    (
+                        Some(
+                            "Object.getOwnPropertyDescriptors" | "Object.getOwnPropertyDescriptor",
+                        ),
+                        _,
+                    ) => (true, false),
+                    _ => (self.walks_argument(call, scope, index), false),
+                }
+            }
+        }
+    }
+
+    /// Whether the same-file function `call` calls by name (the `private`
+    /// method it calls through `this`, or the constructor `new C(...)`
+    /// runs) may read the properties of its argument at `index` without
+    /// naming them: that parameter is an object pattern with a rest
+    /// element or a run-time key, or the function reads its `arguments`. A
+    /// parameter that is a name is decided by its own uses
+    /// ([`Ctx::instance_of`]).
+    fn walks_argument(&self, call: Node<'t>, scope: usize, index: Option<u32>) -> bool {
+        let func = match call.kind() {
+            "call_expression" => self
+                .called_function(call, scope)
+                .or_else(|| self.private_method_called(call, scope)),
+            "new_expression" => call
+                .child_by_field_name("constructor")
+                .map(unwrap_expression)
+                .filter(|c| c.kind() == "identifier")
+                .and_then(|c| self.class_named(c, scope))
+                .and_then(|class| self.classes[class].ctor),
+            _ => None,
+        };
+        let Some(func) = func else {
+            return false;
+        };
+        if self.arguments_funcs.contains(&func) {
+            return true;
+        }
+        let Some(index) = index.map(|i| i as usize) else {
+            // Past a spread argument, it may be any parameter.
+            let params = self.funcs[func].params.len();
+            return (0..params).any(|i| self.walks_param(func, i));
+        };
+        self.walks_param(func, index)
+    }
+
+    /// Whether parameter `index` of `func` is an object pattern with a rest
+    /// element or a run-time key.
+    fn walks_param(&self, func: usize, index: usize) -> bool {
+        self.param_pattern(func, index)
+            .is_some_and(|pattern| !names_every_key(pattern, self.src))
+    }
+
+    /// Parameter `index` of `func`, when it is an object pattern.
+    fn param_pattern(&self, func: usize, index: usize) -> Option<Node<'t>> {
+        if !self.param_patterns.contains(&(func, index)) {
+            return None;
+        }
+        self.funcs[func]
+            .params
+            .get(index)
+            .and_then(|p| match p.kind() {
+                "required_parameter" | "optional_parameter" => p.child_by_field_name("pattern"),
+                "assignment_pattern" => p.child_by_field_name("left"),
+                _ => Some(*p),
+            })
+    }
+
+    /// The parameter of a same-file function whose calls are all seen that
+    /// a call's argument at `index` is bound to: a function called by name
+    /// ([`Ctx::called_function`]) or a `private` method called through
+    /// `this`, that does not read its `arguments`. `Pattern` for an object
+    /// pattern, which only reads properties of the argument.
+    fn param_of(&mut self, call: Node<'t>, scope: usize, index: Option<u32>) -> Option<Param> {
+        let index = index? as usize;
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        let func = self
+            .called_function(call, scope)
+            .or_else(|| self.private_method_called(call, scope))?;
+        if self.arguments_funcs.contains(&func) {
+            return None;
+        }
+        let complete = match self.complete_memo.get(&func) {
+            Some(&complete) => complete,
+            None => {
+                let complete = self.callers(func).complete;
+                self.complete_memo.insert(func, complete);
+                complete
+            }
+        };
+        if !complete {
+            return None;
+        }
+        if let Some(&param) = self.param_slots.get(&(func, index)) {
+            return Some(Param::Name(param));
+        }
+        self.param_pattern(func, index).map(|_| Param::Pattern)
+    }
+
+    /// The `private` method `this.m(...)` calls, in a class method.
+    fn private_method_called(&self, call: Node<'t>, scope: usize) -> Option<usize> {
+        let function = unwrap_expression(call.child_by_field_name("function")?);
+        if function.kind() != "member_expression" {
+            return None;
+        }
+        let object = unwrap_expression(function.child_by_field_name("object")?);
+        if object.kind() != "this" {
+            return None;
+        }
+        let name = self.member_name(function.child_by_field_name("property")?)?;
+        let (class, is_static) = match self.scopes[scope].this {
+            This::Instance(class) => (class, false),
+            This::Static(class) => (class, true),
+            This::Other => return None,
+        };
+        let func = (*self.class_methods.get(&(class, is_static, name))?)?;
+        self.funcs[func]
+            .method
+            .is_some_and(|m| m.private && !m.ctor)
+            .then_some(func)
+    }
+
+    /// The same-file class a name is bound to.
+    fn class_named(&self, name: Node<'t>, scope: usize) -> Option<usize> {
+        self.lookup(scope, self.text(name))
+            .and_then(|b| self.bindings[b].class)
+    }
+
+    /// The class `new X(...)` builds an instance of: a same-file class `X`
+    /// names, one the file cannot tell for a class expression, and the
+    /// class (or a subclass) for `this` in a static method or
+    /// `this.constructor`.
+    fn constructed(&self, constructor: Node<'t>, scope: usize) -> Inst {
+        let constructor = unwrap_expression(constructor);
+        match constructor.kind() {
+            "identifier" => self
+                .class_named(constructor, scope)
+                .map_or(Inst::None, Inst::One),
+            "class" => Inst::Any,
+            "this" => self.this_instance(scope),
+            "member_expression" if self.text(constructor) == "this.constructor" => {
+                self.this_instance(scope)
+            }
+            _ => Inst::None,
+        }
+    }
+
+    /// What `this` is in `scope`: an instance of its class (or the class,
+    /// in static code), nothing of a class in an object literal's method,
+    /// and anything in a plain function.
+    fn this_instance(&self, scope: usize) -> Inst {
+        match self.scopes[scope].this {
+            This::Instance(class) | This::Static(class) => Inst::One(class),
+            This::Other if self.this_object(scope).is_some() => Inst::None,
+            This::Other => Inst::Any,
+        }
+    }
+
+    /// Records that the file may reach an instance's properties without
+    /// naming them: on the one class, or on any.
+    fn props_wild_of(&mut self, instance: Inst, feature: Feature) {
+        match instance {
+            Inst::None => {}
+            Inst::One(class) => {
+                self.classes[class].props_wild.get_or_insert(feature);
+            }
+            Inst::Any => {
+                self.props_wild.get_or_insert(feature);
+            }
+        }
+    }
+
+    /// Records that an instance of a class (any class, when the file
+    /// cannot tell which) is made another object's prototype or a
+    /// `Proxy`'s target.
+    fn borrow(&mut self, instance: Inst, line: u32) {
+        let feature = Feature {
+            what: "an instance made another object's prototype or a `Proxy`'s target",
+            line,
+        };
+        match instance {
+            Inst::None => {}
+            Inst::One(class) => {
+                self.classes[class].borrowed.get_or_insert(feature);
+            }
+            Inst::Any => {
+                self.any_borrowed.get_or_insert(feature);
+            }
+        }
+    }
+
+    /// Which same-file class binding `root` may hold an instance of, or
+    /// that class itself: a class, a `const`, `let` or `var` given one (or
+    /// a loop variable over an array literal of them), or a parameter an
+    /// in-file call passes one, joined over every name its values are read
+    /// through ([`Ctx::instance_values`]). Every name reached is answered
+    /// at once and kept, so each name's values are read once per file.
+    fn instance_of(&mut self, root: usize) -> Inst {
+        let root = InstNode::Binding(root);
+        if let Some(&known) = self.instance_memo.get(&root) {
+            return known;
+        }
+        // Each name reached that is not answered yet, with what its own
+        // values give and the names they are read through.
+        let mut index: HashMap<InstNode<'t>, usize> = HashMap::from([(root, 0)]);
+        let mut nodes = vec![root];
+        let mut found: Vec<Inst> = Vec::new();
+        let mut readers: Vec<Vec<usize>> = Vec::new();
+        let mut names = Vec::new();
+        let mut at = 0;
+        while at < nodes.len() {
+            let mut here = self.instance_values(nodes[at], &mut names);
+            for name in names.drain(..) {
+                if let Some(&known) = self.instance_memo.get(&name) {
+                    here = here.join(known);
+                    continue;
+                }
+                let next = *index.entry(name).or_insert_with(|| {
+                    nodes.push(name);
+                    nodes.len() - 1
+                });
+                if next >= readers.len() {
+                    readers.resize_with(next + 1, Vec::new);
+                }
+                readers[next].push(at);
+            }
+            found.push(here);
+            at += 1;
+        }
+        readers.resize_with(nodes.len(), Vec::new);
+        // A name may hold whatever a name it is read through may: each
+        // answer rises at most twice (none, one class, any), so this stays
+        // linear in the names and reads.
+        let mut work: Vec<usize> = (0..nodes.len()).collect();
+        while let Some(name) = work.pop() {
+            for &reader in &readers[name] {
+                let joined = found[reader].join(found[name]);
+                if joined != found[reader] {
+                    found[reader] = joined;
+                    work.push(reader);
+                }
+            }
+        }
+        for (node, inst) in nodes.into_iter().zip(&found) {
+            self.instance_memo.insert(node, *inst);
+        }
+        found[0]
+    }
+
+    /// What one node's own values give ([`Ctx::instance_of`]): the
+    /// instance or class they may be, and in `names` the nodes they are
+    /// read through. A method's parameter is read through the arguments
+    /// every call of a method of that name passes there, which all the
+    /// file's methods of that name share.
+    fn instance_values(&mut self, node: InstNode<'t>, names: &mut Vec<InstNode<'t>>) -> Inst {
+        let b = match node {
+            InstNode::Binding(b) => b,
+            InstNode::MethodArgs(name, index) => {
+                let sites = self.method_calls.get(name).cloned().unwrap_or_default();
+                let mut found = Inst::None;
+                for (call, call_scope) in sites {
+                    if let Argument::Expr(arg, arg_scope) =
+                        self.argument_at(call, call_scope, index)
+                    {
+                        found = found.join(self.instance_valued(arg, arg_scope, names));
+                        if found == Inst::Any {
+                            break;
+                        }
+                    }
+                }
+                return found;
+            }
+        };
+        let binding = &self.bindings[b];
+        if let Some(class) = binding.class {
+            return Inst::One(class);
+        }
+        // Past the writes kept, any value may be given.
+        if binding.writes_cut {
+            return Inst::Any;
+        }
+        let mut values: Vec<(Node<'t>, usize)> = Vec::new();
+        match binding.decl {
+            Decl::Const | Decl::Let | Decl::Var => {
+                if let Some(init) = binding.init {
+                    if binding.each && binding.path.is_empty() {
+                        // `for (const bot of [a, b])`
+                        let array = unwrap_expression(init);
+                        if array.kind() == "array" {
+                            let mut cursor = array.walk();
+                            values.extend(
+                                array
+                                    .named_children(&mut cursor)
+                                    .take(MAX_CALLERS_READ)
+                                    .map(|item| (item, binding.init_scope)),
+                            );
+                        }
+                    } else if binding.path.is_empty() {
+                        values.push((init, binding.init_scope));
+                    }
+                }
+            }
+            Decl::Param if binding.path.is_empty() => {
+                let Some((func, index)) = binding.param else {
+                    return Inst::None;
+                };
+                values.extend(binding.init.map(|d| (d, binding.init_scope)));
+                match self.funcs[func].method {
+                    Some(method) if !method.ctor => {
+                        if !method.name.is_empty() {
+                            names.push(InstNode::MethodArgs(method.name, index));
+                        }
+                    }
+                    _ => {
+                        for (call, call_scope) in self.callers(func).sites {
+                            if let Argument::Expr(arg, arg_scope) =
+                                self.argument_at(call, call_scope, index)
+                            {
+                                values.push((arg, arg_scope));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => return Inst::None,
+        }
+        let binding = &self.bindings[b];
+        values.extend(
+            binding
+                .writes
+                .iter()
+                .filter_map(|w| w.value.map(|v| (v, w.scope))),
+        );
+        let mut found = Inst::None;
+        for (value, scope) in values {
+            found = found.join(self.instance_valued(value, scope, names));
+            if found == Inst::Any {
+                break;
+            }
+        }
+        found
+    }
+
+    /// Which same-file class an expression may give an instance of, or
+    /// that class itself: `this`, `new C(...)` (or `Reflect.construct(C,
+    /// args)`), a call of a method that returns `this` (of a class the
+    /// file does not tell), `C.prototype`,
+    /// either side of a conditional or of `??` and `||`, the right side of
+    /// `&&`, an awaited one; a name it may be is added to `names`. Read in
+    /// at most 64 steps; past them, it may be any.
+    fn instance_valued(
+        &mut self,
+        expr: Node<'t>,
+        scope: usize,
+        names: &mut Vec<InstNode<'t>>,
+    ) -> Inst {
+        let mut work = vec![expr];
+        let mut steps = 64;
+        let mut found = Inst::None;
+        while let Some(expr) = work.pop() {
+            if steps == 0 {
+                return Inst::Any;
+            }
+            steps -= 1;
+            let expr = unwrap_expression(expr);
+            let here = match expr.kind() {
+                "this" => self.this_instance(scope),
+                "identifier" => {
+                    names.extend(self.lookup(scope, self.text(expr)).map(InstNode::Binding));
+                    Inst::None
+                }
+                "new_expression" => expr
+                    .child_by_field_name("constructor")
+                    .map_or(Inst::None, |c| self.constructed(c, scope)),
+                "call_expression" => match self.method_name(expr) {
+                    Some(name) if self.fluent.contains(name) => Inst::Any,
+                    // `Reflect.construct(Bot, args)` is `new Bot(...args)`.
+                    Some("construct")
+                        if expr
+                            .child_by_field_name("function")
+                            .and_then(|f| self.global_callee(f, scope))
+                            .as_deref()
+                            == Some("Reflect.construct") =>
+                    {
+                        first_argument(expr).map_or(Inst::None, |c| self.constructed(c, scope))
+                    }
+                    _ => Inst::None,
+                },
+                "member_expression" => self
+                    .prototype_root(expr)
+                    .and_then(|c| self.class_named(c, scope))
+                    .map_or(Inst::None, Inst::One),
+                "ternary_expression" => {
+                    work.extend(expr.child_by_field_name("consequence"));
+                    work.extend(expr.child_by_field_name("alternative"));
+                    Inst::None
+                }
+                "binary_expression" => {
+                    match operator(expr) {
+                        Some("??" | "||") => work.extend(expr.child_by_field_name("left")),
+                        Some("&&") => {}
+                        _ => continue,
+                    }
+                    work.extend(expr.child_by_field_name("right"));
+                    Inst::None
+                }
+                "assignment_expression" | "sequence_expression" => {
+                    work.extend(expr.child_by_field_name("right"));
+                    Inst::None
+                }
+                "await_expression" => {
+                    work.extend(expr.named_child(0));
+                    Inst::None
+                }
+                _ => Inst::None,
+            };
+            found = found.join(here);
+            if found == Inst::Any {
+                return found;
+            }
+        }
+        found
+    }
+
+    /// Whether the value a name holds may reach code that changes what it
+    /// holds: stored, returned or otherwise handed out
+    /// ([`Uses::escapes_unbound`]), written under a key of [`HOOK_KEYS`]
+    /// or one known only at run time, a member of it called, passed to
+    /// anything but an SDK request, a read-only builtin or a same-file
+    /// function whose parameter there hands nothing out
+    /// ([`Ctx::param_of`]), or bound to a name that hands it out. Every
+    /// name reached is answered at once and kept, so each name's uses are
+    /// read once per file.
+    fn hands_out(&mut self, root: usize) -> bool {
+        if let Some(&known) = self.hands_memo.get(&root) {
+            return known;
+        }
+        // Each name reached that is not answered yet, whether its own uses
+        // hand the value out, and the names that hand it on to it.
+        let mut index: HashMap<usize, usize> = HashMap::from([(root, 0)]);
+        let mut nodes = vec![root];
+        let mut bad: Vec<bool> = Vec::new();
+        let mut givers: Vec<Vec<usize>> = Vec::new();
+        let mut at = 0;
+        while at < nodes.len() {
+            let b = nodes[at];
+            let uses = &self.bindings[b].uses;
+            let mut here = uses.escapes_unbound
+                || uses.hook_mutated
+                || uses.member_calls
+                || uses.passed_cut
+                || uses.bound_cut;
+            let mut next = Vec::new();
+            if !here {
+                next.extend(uses.bound_to.iter().copied());
+                for (call, scope, position) in uses.passed_to.clone() {
+                    if self.harmless_call(call, scope) {
+                        continue;
+                    }
+                    match self.param_of(call, scope, position) {
+                        Some(Param::Name(param)) => next.push(param),
+                        Some(Param::Pattern) => {}
+                        None => {
+                            here = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !here {
+                for name in next {
+                    match self.hands_memo.get(&name) {
+                        Some(true) => {
+                            here = true;
+                            break;
+                        }
+                        Some(false) => {}
+                        None => {
+                            let to = *index.entry(name).or_insert_with(|| {
+                                nodes.push(name);
+                                nodes.len() - 1
+                            });
+                            if to >= givers.len() {
+                                givers.resize_with(to + 1, Vec::new);
+                            }
+                            givers[to].push(at);
+                        }
+                    }
+                }
+            }
+            bad.push(here);
+            at += 1;
+        }
+        givers.resize_with(nodes.len(), Vec::new);
+        // A name hands the value out when one it hands it on to does.
+        let mut work: Vec<usize> = (0..nodes.len()).filter(|&n| bad[n]).collect();
+        while let Some(name) = work.pop() {
+            for &giver in &givers[name] {
+                if !bad[giver] {
+                    bad[giver] = true;
+                    work.push(giver);
+                }
+            }
+        }
+        for (b, handed) in nodes.into_iter().zip(&bad) {
+            self.hands_memo.insert(b, *handed);
+        }
+        bad[0]
     }
 
     /// Whether a call passes the environment object to code that may write
@@ -6493,9 +8023,10 @@ impl<'t> Ctx<'t> {
     /// (`setTimeout(bot.ask)`, `{ ask: bot.ask }`, `const { ask } = bot`),
     /// it is called through `call`, `apply` or `bind`, or the file does
     /// either under a name known only at run time (`this[m].call(other)`),
-    /// which never reaches a `#name`: the first such use in the file, which
-    /// a gap names. Bound to the object it is read off (`x.m.bind(x)`), it
-    /// is not ([`Ctx::method_bound`]).
+    /// which never reaches a `#name`, or another object borrows its class's
+    /// prototype or a subclass's ([`Class::borrowed`]): the first such use
+    /// in the file, which a gap names. Bound to the object it is read off
+    /// (`x.m.bind(x)`), it is not ([`Ctx::method_bound`]).
     fn this_rebound(&self, scope: usize) -> Option<Feature> {
         let m = self.scopes[scope]
             .method
@@ -6505,10 +8036,22 @@ impl<'t> Ctx<'t> {
             .then(|| self.method_refs.get(m.name).copied())
             .flatten();
         let wild = self.method_refs_wild.filter(|_| !m.name.starts_with('#'));
-        match (named, wild) {
-            (Some(a), Some(b)) => Some(if b.line < a.line { b } else { a }),
-            (a, b) => a.or(b),
-        }
+        // An object that borrows the class's prototype, or a subclass's,
+        // runs its instance methods (`#name` ones too) with itself as
+        // `this`; one whose prototype or `Proxy` target is the class itself
+        // (`new Proxy(Bot, h)`) runs its static methods.
+        let borrowed = match self.scopes[scope].this {
+            This::Instance(class) | This::Static(class) => std::iter::once(class)
+                .chain(self.classes[class].subclasses.iter().copied())
+                .filter_map(|c| self.classes[c].borrowed)
+                .chain(self.any_borrowed)
+                .min_by_key(|f| f.line),
+            _ => None,
+        };
+        [named, wild, borrowed]
+            .into_iter()
+            .flatten()
+            .min_by_key(|f| f.line)
     }
 
     /// What a class property holds: the one or more writes of it, combined.
@@ -7222,29 +8765,31 @@ impl<'t> Ctx<'t> {
     }
 
     /// Every value a name may hold ([`Ctx::hook_scan`]): a `const`, `let`
-    /// or `var` (not destructured, not a loop variable) whose every use
-    /// reads it or passes it to an SDK request or a read-only builtin.
+    /// or `var` (not destructured, not a loop variable) that hands nothing
+    /// out ([`Ctx::hands_out`]): every use reads it, binds it to a name
+    /// that hands nothing out, or passes it to an SDK request, a read-only
+    /// builtin or a same-file function whose parameter there hands nothing
+    /// out.
     fn hook_binding(&mut self, b: usize, depth: u32) -> Rc<HookScan<'t>> {
         self.hook_read(HookKey::Binding(b), |cx| cx.hook_binding_inner(b, depth))
     }
 
     fn hook_binding_inner(&mut self, b: usize, depth: u32) -> HookScan<'t> {
         let binding = &self.bindings[b];
-        let uses = &binding.uses;
         let param = binding.param.filter(|_| binding.decl == Decl::Param);
-        let only_read = (matches!(binding.decl, Decl::Const | Decl::Let | Decl::Var)
+        let declared = (matches!(binding.decl, Decl::Const | Decl::Let | Decl::Var)
             || param.is_some())
             && !binding.each
             && binding.path.is_empty()
-            && !binding.writes_cut
-            && !uses.escapes
-            && !uses.hook_mutated
-            && !uses.member_calls
-            && !uses.passed_cut;
+            && !binding.writes_cut;
         // `declare const opts: RequestOptions` is given its value elsewhere.
-        if !only_read || (param.is_none() && binding.init.is_none() && binding.writes.is_empty()) {
+        if !declared || (param.is_none() && binding.init.is_none() && binding.writes.is_empty()) {
             return HookScan::unread();
         }
+        if self.hands_out(b) {
+            return HookScan::unread();
+        }
+        let binding = &self.bindings[b];
         let mut values: Vec<Option<(Node<'t>, usize)>> = Vec::new();
         match param {
             // A parameter holds what each call passes, or its default where
@@ -7275,12 +8820,6 @@ impl<'t> Ctx<'t> {
         }
         let binding = &self.bindings[b];
         values.extend(binding.writes.iter().map(|w| w.value.map(|v| (v, w.scope))));
-        let passed = uses.passed_to.clone();
-        for (call, call_scope) in passed {
-            if !self.harmless_call(call, call_scope) {
-                return HookScan::unread();
-            }
-        }
         // A literal that is not only read may have its containers changed.
         let shared = self.readonly_object(b).is_none();
         let mut scan = HookScan::default();
@@ -7350,11 +8889,14 @@ impl<'t> Ctx<'t> {
     /// read of a property of that name, on whatever object
     /// (`svc.opts[k] = v` on an instance), so it is read only when every
     /// such read in the file only reads it, spreads it, passes it to an SDK
-    /// request or a read-only builtin, or writes on it under a static key
-    /// that is not one of [`HOOK_KEYS`] ([`Ctx::prop_handed`]); a write
-    /// into it of that kind is not a value of the property. Its containers
-    /// count as shared. A property written more times than are read
-    /// ([`MAX_WRITES_READ`]) cannot be read.
+    /// request, a read-only builtin or a same-file function whose parameter
+    /// hands nothing out, binds it to a name that hands nothing out, or
+    /// writes on it under a static key that is not one of [`HOOK_KEYS`]
+    /// ([`Ctx::prop_handed`], [`Ctx::prop_passed_harmless`]), and the file
+    /// reaches no class property's object without naming it
+    /// ([`Ctx::props_wild`]); a write into it of that kind is not a value of
+    /// the property. Its containers count as shared. A property written
+    /// more times than are read ([`MAX_WRITES_READ`]) cannot be read.
     fn hook_prop(
         &mut self,
         class: usize,
@@ -7365,7 +8907,10 @@ impl<'t> Ctx<'t> {
     ) -> Rc<HookScan<'t>> {
         let memo = HookKey::Prop(class, is_static, through_this, name);
         self.hook_read(memo, |cx| {
-            if cx.prop_handed.contains(name) {
+            if cx.props_wild.is_some()
+                || cx.class_props_wild(class)
+                || cx.prop_handed.contains(name)
+            {
                 return HookScan::unread();
             }
             if !cx.prop_passed_harmless(name) {
@@ -7390,6 +8935,20 @@ impl<'t> Ctx<'t> {
             scan.unread |= !assigned;
             scan
         })
+    }
+
+    /// Whether the file may reach the properties of an instance of `class`,
+    /// of its same-file base or of a direct same-file subclass (whose
+    /// instances hold its properties) without naming them
+    /// ([`Class::props_wild`]).
+    fn class_props_wild(&self, class: usize) -> bool {
+        let c = &self.classes[class];
+        c.props_wild.is_some()
+            || c.base_class
+                .is_some_and(|base| self.classes[base].props_wild.is_some())
+            || c.subclasses
+                .iter()
+                .any(|&sub| self.classes[sub].props_wild.is_some())
     }
 
     /// Whether `value` is an array literal whose items are all calls of the
@@ -8291,6 +9850,7 @@ const READ_ONLY_CALLS: &[&str] = &[
     "Object.keys",
     "Object.values",
     "Object.entries",
+    "Object.getOwnPropertyNames",
     "Object.freeze",
     "Object.isFrozen",
     "structuredClone",
@@ -8557,7 +10117,7 @@ impl<'t> Ctx<'t> {
         {
             return None;
         }
-        for (call, call_scope) in &uses.passed_to {
+        for (call, call_scope, _) in &uses.passed_to {
             if !self.harmless_call(*call, *call_scope) {
                 return None;
             }
@@ -9511,7 +11071,7 @@ impl<'t> Ctx<'t> {
         {
             return Err(Unresolved::new("reassigned", name));
         }
-        for (call, call_scope) in &uses.passed_to {
+        for (call, call_scope, _) in &uses.passed_to {
             if !self.harmless_call(*call, *call_scope) {
                 return Err(Unresolved::new("reassigned", name));
             }
@@ -9915,6 +11475,7 @@ impl<'t> Ctx<'t> {
         }
         self.settle_member_writes();
         self.settle_special_calls();
+        self.settle_instances();
         self.settle_sdk_writes();
         self.record_required_imports();
         let calls = std::mem::take(&mut self.calls);
@@ -10291,6 +11852,14 @@ impl<'t> Ctx<'t> {
             }
         };
         let mut opaque = options.opaque;
+        // `create({ model }, { body: { model: other } })` sends the body
+        // its options give: what is written in its own is a candidate.
+        let body_replaced = (request || model_bearing)
+            && positional_model.is_none()
+            && target
+                .client
+                .as_ref()
+                .is_some_and(|client| self.body_replaced(call, scope, client, options_index));
         if let Some(index) = positional_model {
             match self.argument_at(call, scope, index) {
                 Argument::Expr(expr, expr_scope) => {
@@ -10326,26 +11895,55 @@ impl<'t> Ctx<'t> {
                     .map(|r| r.constant(label, *origin))
                     .map_err(|u| u.via(label));
             }
+            // A `body` the request options may hold replaces the value: one
+            // that already has a gap keeps it, and gets this one next to it.
+            if let (true, false, Ok(resolved)) = (body_replaced, overridden, &mut result) {
+                if !resolved.caveats.is_empty() {
+                    resolved
+                        .caveats
+                        .push(Unresolved::new("splat", REQUEST_BODY.to_string()));
+                }
+            }
             // `{ model: "gpt-4o", ...overrides }`: the spread (or a computed
             // key) written after the entry may replace it, so the entry is
-            // a candidate, not the value.
-            if overridden {
+            // a candidate, not the value. So may a `body` the request
+            // options hold; a value that is not found keeps its own gap.
+            let certain = result.as_ref().is_ok_and(|r| r.caveats.is_empty());
+            if overridden || (body_replaced && certain) {
                 let candidates: Vec<Resolved> = result.ok().into_iter().collect();
-                result = Err(Unresolved::new("splat", options.shape.clone())
-                    .with_candidates(candidates, false));
+                let shape = if body_replaced {
+                    REQUEST_BODY.to_string()
+                } else {
+                    options.shape.clone()
+                };
+                result = Err(Unresolved::new("splat", shape).with_candidates(candidates, false));
             }
             self.take_value(&site, key, false, result, &mut values);
         }
 
         let positional_literals = self.positional_literals(call, &options, options_index);
-        let (nested, nested_overridden, nested_cut) =
+        let (mut nested, mut nested_overridden, nested_cut) =
             self.nested_values(&options, &positional_literals, scope);
+        let mut body_overridden = Vec::new();
+        if body_replaced {
+            nested.retain(|n| {
+                if !n.positional {
+                    body_overridden.push(n.path.clone());
+                }
+                n.positional
+            });
+            body_overridden.append(&mut nested_overridden);
+        }
         self.take_nested(&site, nested, nested_cut, &mut values);
         if site.gap_worthy {
             let mut seen = HashSet::new();
-            for path in nested_overridden.into_iter().take(MAX_NESTED_VALUES) {
+            let overridden = nested_overridden
+                .into_iter()
+                .map(|path| (path, "{...}"))
+                .chain(body_overridden.into_iter().map(|path| (path, REQUEST_BODY)));
+            for (path, shape) in overridden.take(MAX_NESTED_VALUES) {
                 if seen.insert(path.clone()) {
-                    let unresolved = Unresolved::new("splat", "{...}".to_string());
+                    let unresolved = Unresolved::new("splat", shape.to_string());
                     self.unresolved_gap(&site, &path, &unresolved, None);
                 }
             }
@@ -10397,7 +11995,8 @@ impl<'t> Ctx<'t> {
             file: self.file.clone(),
             span,
             symbol,
-            splat: options.unwritten() || spread_args,
+            // A `body` in the request options replaces every argument.
+            splat: options.unwritten() || spread_args || body_replaced,
             kwargs: options.keys,
             positional,
             // The extractor does not record what each spread holds:
@@ -10405,6 +12004,36 @@ impl<'t> Ctx<'t> {
             spreads: Vec::new(),
             values,
         });
+    }
+
+    /// Whether the request options of an OpenAI or Anthropic request (the
+    /// argument after its body) may hold a `body`, which both SDKs send in
+    /// place of the body (`{ body, ...options }`), so that the model
+    /// written in the body may not be the one sent: one the file writes
+    /// there, or options it cannot read ([`Ctx::hook_scan`]).
+    fn body_replaced(
+        &mut self,
+        call: Node<'t>,
+        scope: usize,
+        client: &Client,
+        options_index: usize,
+    ) -> bool {
+        let takes_options = matches!(
+            client.family,
+            Family::OpenaiDirect
+                | Family::Azure
+                | Family::AnthropicDirect
+                | Family::Bedrock
+                | Family::Vertex
+                | Family::Platform
+        );
+        if !takes_options {
+            return false;
+        }
+        match self.hook_argument(call, scope, options_index + 1) {
+            Some(scan) => scan.unread || scan.sets("body").next().is_some(),
+            None => false,
+        }
     }
 
     /// Arguments passed by position, the options object and spreads
@@ -10439,7 +12068,7 @@ impl<'t> Ctx<'t> {
             (
                 "multiple_assignments",
                 format!(
-                    "the receiver of `{chain}` is read through `this` in a method that may run with another object as `this` ({}), so it may be another object's",
+                    "the receiver of `{chain}` is read through `this` in a method that may run with another object as `this` ({}), so it may be another object's property",
                     rebound.describe()
                 ),
             )
@@ -10835,6 +12464,9 @@ impl<'t> Ctx<'t> {
         let phrase = unresolved.phrase();
         let shape = &unresolved.shape;
         let mut detail = match unresolved.via.as_deref() {
+            _ if unresolved.reason == "splat" && shape == REQUEST_BODY => format!(
+                "`{key}` for `{chain}` is written in the request body, which request options that may hold a `body` replace"
+            ),
             _ if unresolved.reason == "splat" && shape != "..." => format!(
                 "`{key}` for `{chain}` is set in an object (`{shape}`) where a spread or a computed key written after it may replace it"
             ),
@@ -10919,8 +12551,17 @@ impl<'t> Ctx<'t> {
                     origin.as_str()
                 ));
             }
-            Some(_) => {
+            Some(ValueOrigin::EnvDefault) => {
                 detail.push_str("; its literal fallback is captured with origin `env_default`");
+                if !values.is_empty() {
+                    detail.push_str(&format!(", and {listed}"));
+                }
+            }
+            Some(origin) => {
+                detail.push_str(&format!(
+                    "; its value is captured with origin `{}`",
+                    origin.as_str()
+                ));
                 if !values.is_empty() {
                     detail.push_str(&format!(", and {listed}"));
                 }
@@ -11071,6 +12712,15 @@ impl<'t> Ctx<'t> {
             ),
         };
         let options = self.options(call, scope, 0);
+        // `create({ model }, opts)` on an OpenAI or Anthropic client (not
+        // openai v3's) sends the `body` its request options may hold in
+        // place of the arguments written at the call.
+        let v3 = chain.ends_with(".createChatCompletion") || chain.ends_with(".createCompletion");
+        let body_replaced = sdk != Sdk::Google
+            && !v3
+            && self
+                .hook_argument(call, scope, 1)
+                .is_some_and(|scan| scan.unread || scan.sets("body").next().is_some());
         let mut values = Vec::new();
         for key in super::VALUE_KEYS {
             if let Lookup::Found(value, _, value_scope) = options.lookup(key) {
@@ -11094,7 +12744,7 @@ impl<'t> Ctx<'t> {
             // The arguments are known even when the client is not: the
             // retirement check applies its argument rules to them.
             args: Some(CallArgs {
-                splat: options.unwritten() || self.has_spread_argument(call),
+                splat: options.unwritten() || self.has_spread_argument(call) || body_replaced,
                 kwargs: options.keys,
                 spreads: Vec::new(),
             }),
