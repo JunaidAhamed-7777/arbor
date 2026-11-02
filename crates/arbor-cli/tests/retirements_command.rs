@@ -1343,6 +1343,59 @@ fn usage_gaps_never_read_as_confirmed() {
     assert!(!text.contains("Failing (exit 1)"), "{text}");
 }
 
+/// A client constructor chosen at run time: Python's `multiple_assignments`.
+const PICKED: &str = r#"import os
+
+from openai import AzureOpenAI, OpenAI
+
+
+def build():
+    return OpenAI(base_url="https://gateway.example/v1")
+
+
+make = AzureOpenAI if os.getenv("AZ") else build
+client = make()
+client.chat.completions.create(model="gpt-4-0613", messages=[])
+"#;
+
+/// A client read through `this` in a method passed on unbound, so it may run
+/// with another object as `this`: TypeScript gives it `multiple_assignments`
+/// too, although the client is assigned once.
+const REBOUND: &str = r#"import OpenAI from "openai";
+class Bot {
+  private client = new OpenAI();
+  ask() { return this.client.chat.completions.create({ model: "gpt-4-0613", messages: [] }); }
+}
+const bot = new Bot();
+setTimeout(bot.ask, 1);
+"#;
+
+#[test]
+fn a_client_that_may_be_another_object_has_a_routing_note_that_fits() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("pick.py"), PICKED).unwrap();
+    fs::write(dir.path().join("bot.ts"), REBOUND).unwrap();
+    let (code, report) = run_json(dir.path(), &[]);
+    assert_eq!(code, Some(0), "{report:#}");
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 2, "{report:#}");
+    for f in findings {
+        assert_eq!(f["routing_class"], "unknown", "{f:#}");
+        assert_eq!(f["routing_gap"], "multiple_assignments", "{f:#}");
+        assert_eq!(f["fails"], false, "{f:#}");
+    }
+
+    // One note fits both causes.
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    let note = "routing not confirmed (the client is assigned more than one way or read through a `this` that may be another object): confirm this call reaches OpenAI directly";
+    for at in ["pick.py:12", "bot.ts:4"] {
+        assert!(
+            text.lines().any(|l| l.contains(at) && l.contains(note)),
+            "missing {note:?} at {at} in:\n{text}"
+        );
+    }
+}
+
 #[test]
 fn calls_through_unresolved_clients_get_a_not_checked_line() {
     // A client passed in or built by a factory, with a model Arbor cannot

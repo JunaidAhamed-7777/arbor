@@ -313,13 +313,21 @@ pub enum UncheckedArgs {
 
 impl UncheckedArgs {
     /// What a person has to check, for the report. `spreads` names the `**`
-    /// expressions Arbor could not read (`PARAMS`), for `Splat`. The
+    /// expressions Arbor could not read (`PARAMS`), for `Splat`. Written for
+    /// a Python call; [`UncheckedArgs::message_in`] writes it for the call's
+    /// own syntax.
+    pub fn message(self, spreads: &[String]) -> String {
+        self.message_in(spreads, Syntax::Python)
+    }
+
+    /// [`UncheckedArgs::message`] for a call written in `syntax`. The
     /// TypeScript scan records no spreads: in its files `Splat` means some
-    /// property of the options object is not written at the call.
-    pub fn message(self, spreads: &[String], syntax: Syntax) -> String {
+    /// property of the options object is not written at the call, or the
+    /// request options may hold a `body` that the SDK sends instead.
+    pub fn message_in(self, spreads: &[String], syntax: Syntax) -> String {
         match self {
             UncheckedArgs::Splat if syntax == Syntax::JavaScript => {
-                "Some properties of the options object are not written at the call (a spread, a computed key or an object passed by name), so Arbor could not check them all."
+                "Some properties of the options object are not written at the call (a spread, a computed key or an object passed by name), or a `body` in its request options may replace them, so Arbor could not check them all."
                     .to_string()
             }
             UncheckedArgs::Splat if spreads.is_empty() => {
@@ -1527,7 +1535,7 @@ fn finding_for(
     let mut reasons = model_reasons(
         &hit,
         status,
-        unchecked.map(|u| u.message(&unread_spreads, Syntax::of_file(&file))),
+        unchecked.map(|u| u.message_in(&unread_spreads, Syntax::of_file(&file))),
         source.is_some(),
         chained,
     );
@@ -4153,6 +4161,8 @@ export async function run(opts: any, key: string, client: any, params: any) {
   await openai.chat.completions.create(...params, { model: "gpt-4o-2024-05-13" });
   await client.chat.completions.create({ model: "gpt-4o", max_tokens: 5, messages: [] });
   await client.chat.completions.create({ ...opts, model: "gpt-4o-mini", messages: [] });
+  await openai.chat.completions.create({ model: "gpt-4o-2024-11-20", messages: [] }, opts);
+  await client.chat.completions.create({ model: "gpt-4o-mini-2024-07-18", messages: [] }, opts);
 }
 "#;
         let report = check_typescript(source, &options("2026-10-24"));
@@ -4162,7 +4172,7 @@ export async function run(opts: any, key: string, client: any, params: any) {
             assert_eq!(found.len(), 1, "{needle}: {:#?}", report.findings);
             found[0]
         };
-        let unread = "Some properties of the options object are not written at the call (a spread, a computed key or an object passed by name), so Arbor could not check them all.";
+        let unread = "Some properties of the options object are not written at the call (a spread, a computed key or an object passed by name), or a `body` in its request options may replace them, so Arbor could not check them all.";
 
         // Every property written at the call: read in full.
         let written = at("openai.chat.completions.create({ model: \"gpt-4o\"");
@@ -4177,6 +4187,10 @@ export async function run(opts: any, key: string, client: any, params: any) {
             "...BASE",
             "...params",
             "{ ...opts, model: \"gpt-4o-mini\"",
+            // Request options that may hold a `body`, which the SDK sends
+            // in place of the arguments written.
+            "\"gpt-4o-2024-11-20\"",
+            "\"gpt-4o-mini-2024-07-18\"",
         ] {
             let finding = at(needle);
             assert!(!finding.decisions.is_empty(), "{needle}: {finding:#?}");
@@ -4622,10 +4636,7 @@ def run():
             let unseen = finding(at(args));
             assert_eq!(unseen.decisions[0].unchecked_args, Some(why));
             assert!(
-                unseen
-                    .review
-                    .iter()
-                    .any(|r| r.message == why.message(&[], Syntax::Python)),
+                unseen.review.iter().any(|r| r.message == why.message(&[])),
                 "{:#?}",
                 unseen.review
             );
@@ -4647,10 +4658,7 @@ def run():
             assert_eq!(finding.decisions[0].unchecked_args, why, "{finding:#?}");
             match why {
                 Some(why) => {
-                    assert!(finding
-                        .review
-                        .iter()
-                        .any(|r| r.message == why.message(&[], Syntax::Python)));
+                    assert!(finding.review.iter().any(|r| r.message == why.message(&[])));
                     assert_eq!(finding.fix, FixKind::Manual);
                 }
                 // Every argument was read and none conflicts: "no change"
@@ -4685,7 +4693,47 @@ def run():
         assert!(!finding
             .review
             .iter()
-            .any(|r| r.message == UncheckedArgs::ExtraBody.message(&[], Syntax::Python)));
+            .any(|r| r.message == UncheckedArgs::ExtraBody.message(&[])));
+    }
+
+    /// `UncheckedArgs::message` keeps the signature and the Python wording
+    /// 3.1.1 published; `message_in` writes the same for the call's syntax.
+    #[test]
+    fn the_released_unchecked_args_message_keeps_its_signature_and_wording() {
+        let released: fn(UncheckedArgs, &[String]) -> String = UncheckedArgs::message;
+        let named = ["settings.llm".to_string(), "kwargs".to_string()];
+        for (why, spreads, text) in [
+            (
+                UncheckedArgs::Splat,
+                &[][..],
+                "Some arguments are spread into the call with `**`, so Arbor could not check them all.",
+            ),
+            (
+                UncheckedArgs::Splat,
+                &named[..],
+                "Some arguments come from `**settings.llm` and `**kwargs`, so Arbor could not check them all.",
+            ),
+            (
+                UncheckedArgs::ExtraBody,
+                &[][..],
+                "The entries of `extra_body` are sent as request arguments, and Arbor could not check them.",
+            ),
+            (
+                UncheckedArgs::NotRecorded,
+                &[][..],
+                "Arbor did not record this call's arguments, so it could not check them.",
+            ),
+        ] {
+            assert_eq!(released(why, spreads), text);
+            assert_eq!(why.message_in(spreads, Syntax::Python), text);
+        }
+        assert_eq!(
+            UncheckedArgs::Splat.message_in(&[], Syntax::JavaScript),
+            "Some properties of the options object are not written at the call (a spread, a computed key or an object passed by name), or a `body` in its request options may replace them, so Arbor could not check them all."
+        );
+        for why in [UncheckedArgs::ExtraBody, UncheckedArgs::NotRecorded] {
+            assert_eq!(why.message_in(&[], Syntax::JavaScript), why.message(&[]));
+        }
     }
 
     #[test]

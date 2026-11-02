@@ -477,9 +477,10 @@ fn unchecked_clause(
     code: bool,
 ) -> String {
     match unchecked {
-        UncheckedArgs::Splat if syntax == Syntax::JavaScript => {
-            "could not check the properties not written at the call".to_string()
-        }
+        UncheckedArgs::Splat if syntax == Syntax::JavaScript => format!(
+            "could not check the properties not written at the call or a {} in its request options",
+            tick("body", code)
+        ),
         UncheckedArgs::Splat if spreads.is_empty() => format!(
             "could not check the arguments spread in with {}",
             tick("**", code)
