@@ -561,6 +561,28 @@ export async function ask() {
 }
 
 #[test]
+fn openai_v3_api_given_its_own_axios_instance_may_go_elsewhere() {
+    // v3's third argument is the axios instance it sends through: the v3
+    // form of a custom `fetch`.
+    let found = usages_js(
+        r#"
+const axios = require("axios");
+const { Configuration, OpenAIApi } = require("openai");
+const http = axios.create();
+http.interceptors.request.use((c) => { c.url = c.url.replace("api.openai.com", "gateway.example.com"); return c; });
+const openai = new OpenAIApi(new Configuration({ apiKey: process.env.KEY }), undefined, http);
+const plain = new OpenAIApi(new Configuration({ apiKey: process.env.KEY }), undefined, undefined);
+exports.r = () => openai.createChatCompletion({ model: "gpt-3.5-turbo-0301", messages: [] });
+"#,
+    );
+    let c = call(&found, "openai.createChatCompletion");
+    assert_eq!(c.routing, Routing::Unknown);
+    assert_eq!(gaps_at(&found, c), vec!["ambiguous_client/endpoint_option"]);
+    assert_eq!(routing_of(&found, "openai"), Routing::Unknown);
+    assert_eq!(routing_of(&found, "plain"), Routing::OpenaiDirect);
+}
+
+#[test]
 fn commonjs_clients_resolve() {
     let found = usages_js(
         r#"
@@ -1734,6 +1756,32 @@ fn long_chains_of_names_are_linear() {
 }
 
 #[test]
+fn many_computed_keys_in_object_patterns_are_linear() {
+    // Every computed key of an object pattern, deep in nested scopes, over
+    // names written many times: each key costs the same small step.
+    let mut source =
+        with_client("client.chat.completions.create({ model: \"gpt-4-0613\", messages: [] });\n");
+    for i in 0..60 {
+        source.push_str(&format!("function f{i}(k) {{\n"));
+    }
+    for (name, init) in [("d", "new X()"), ("c", "d"), ("b", "c"), ("a", "b")] {
+        source.push_str(&format!("let {name} = {init};\n"));
+        for _ in 0..63 {
+            source.push_str(&format!("{name} = {init};\n"));
+        }
+    }
+    let keys = "[k]: v, ".repeat(100);
+    for _ in 0..400 {
+        source.push_str(&format!("({{ {keys} }} = a);\n"));
+    }
+    source.push_str(&"}\n".repeat(60));
+    let found = usages_within(&source, 10);
+    let c = call(&found, "client.chat.completions.create");
+    assert_eq!(value(c, "model"), Some("gpt-4-0613"));
+    assert_eq!(c.routing, Routing::OpenaiDirect);
+}
+
+#[test]
 fn many_callers_and_large_objects_stay_bounded() {
     let mut source = with_client(
         "function ask(model = \"gpt-4o\") { return client.chat.completions.create({ model, messages: [] }); }\n",
@@ -2157,6 +2205,136 @@ new Bot().run();"
 new Router().route();",
     );
     assert_eq!(gaps, vec!["unresolved_model/unseen_callers"]);
+}
+
+#[test]
+fn a_computed_key_in_any_object_pattern_may_read_a_method() {
+    // As Python's `getattr(obj, name)`, a computed key in an object pattern
+    // counts file-wide, whatever the pattern destructures: the file cannot
+    // tell an instance from a record (`new this()`, a `Bot | undefined`
+    // parameter, an instance held in a property, a factory's result, an
+    // untyped parameter, a parameter pattern).
+    let bot = "class Bot {
+  private model = \"gpt-4\";
+  ask() { return client.chat.completions.create({ model: this.model, messages: [] }); }
+  static run(m: string) { const inst = new this(); const { [m]: f } = inst as any; return f.call({ model: \"gpt-5.5\" }); }
+}
+";
+    let router = "class Router {
+  private chat(model = \"gpt-4o\") {
+    return client.chat.completions.create({ model, messages: [] });
+  }
+  route() { return this.chat(); }
+}
+new Router().route();
+";
+    let class_free = "class Bot {
+  private model = \"gpt-4\";
+  ask() { return client.chat.completions.create({ model: this.model, messages: [] }); }
+}
+";
+    let (value, gaps) = model_of(bot);
+    assert_eq!(value.as_deref(), Some("gpt-4"));
+    assert!(
+        gaps.iter().any(|g| g == "unresolved_model/attribute"),
+        "{gaps:?}"
+    );
+    for helper in [
+        "export function run(bot: Bot | undefined, m: string) { const { [m]: f } = bot as any; return f.call({ model: \"gpt-5.5\" }); }",
+        "class Holder { private bot = new Bot(); run(m: string) { const { [m]: f } = this.bot as any; return f.call({ model: \"gpt-5.5\" }); } }",
+        "class Holder { constructor(private readonly bot: Bot) {} run(m: string) { const { [m]: f } = this.bot as any; return f.call({ model: \"gpt-5.5\" }); } }",
+        "function makeBot() { return new Bot(); }
+export function run(m: string) { const { [m]: f } = makeBot() as any; return f.call({ model: \"gpt-5.5\" }); }",
+        "export function run(bot: any, m: string) { const { [m]: f } = bot; return f.call({ model: \"gpt-5.5\" }); }",
+        "const bots = { support: new Bot() };
+export function run(m: string) { const { [m]: f } = bots.support as any; return f.call({ model: \"gpt-5.5\" }); }",
+        "export function invoke(k: \"ask\", { [k]: f }: Bot) { return f.call({ model: \"gpt-5.5\" } as any); }",
+        "export function run(m: string, alt?: any) { let f: any; ({ [m]: f } = alt ?? new Bot()); return f.call({}); }",
+        // The omit/redact idiom over-approximates the same way.
+        "export function redact<T extends object>(ticket: T, field: keyof T) {
+  const { [field]: _hidden, ...safe } = ticket;
+  return safe;
+}",
+    ] {
+        let (value, gaps) = model_of(&format!("{class_free}{helper}"));
+        assert_eq!(value.as_deref(), Some("gpt-4"), "{helper}");
+        assert!(
+            gaps.iter().any(|g| g == "unresolved_model/attribute"),
+            "{helper}: {gaps:?}"
+        );
+        let (value, origin, gaps) = model_row(&format!("{router}{helper}"));
+        assert_eq!(value.as_deref(), Some("gpt-4o"), "{helper}");
+        assert_eq!(origin, Some(ValueOrigin::ParameterDefault), "{helper}");
+        assert_eq!(gaps, vec!["unresolved_model/unseen_callers"], "{helper}");
+    }
+    // The `unseen_callers` detail names the pattern and its line.
+    let found = usages(&with_client(&format!(
+        "{router}export function redact(ticket: object, field: string) {{
+  const {{ [field]: _hidden, ...safe }} = ticket as any;
+  return safe;
+}}"
+    )));
+    let gap = found
+        .gaps
+        .iter()
+        .find(|g| g.reason == "unseen_callers")
+        .unwrap_or_else(|| panic!("{:?}", found.gaps));
+    assert!(
+        gap.detail
+            .contains("a computed key in an object pattern at line 11"),
+        "{}",
+        gap.detail
+    );
+    // A literal key reads that member only.
+    let (value, gaps) = model_of(&format!(
+        "{class_free}export function pick(row: any) {{ const {{ [\"id\"]: id, name }} = row; return [id, name]; }}"
+    ));
+    assert_eq!(value.as_deref(), Some("gpt-4"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn unseen_callers_names_the_call_under_a_run_time_name() {
+    // The call may be in code that has nothing to do with the method.
+    let found = usages(&with_client(
+        "class Summarizer {
+  private summarize(text: string, model = \"gpt-4o\") {
+    return client.chat.completions.create({ model, messages: [{ role: \"user\", content: text }] });
+  }
+  run(text: string) { return this.summarize(text); }
+}
+export function log(level: \"info\" | \"warn\", message: string) {
+  console[level](message);
+}",
+    ));
+    let gap = found
+        .gaps
+        .iter()
+        .find(|g| g.reason == "unseen_callers")
+        .unwrap_or_else(|| panic!("{:?}", found.gaps));
+    assert!(
+        gap.detail.contains("name known only at run time"),
+        "{}",
+        gap.detail
+    );
+    assert!(gap.detail.contains("at line 10"), "{}", gap.detail);
+    assert!(!gap.detail.contains("passed, stored"), "{}", gap.detail);
+    // Passed or stored, the function's own use is the reason.
+    let found = usages(&with_client(
+        "class Summarizer {
+  private summarize(text: string, model = \"gpt-4o\") {
+    return client.chat.completions.create({ model, messages: [{ role: \"user\", content: text }] });
+  }
+  run(texts: string[]) { return texts.map(this.summarize); }
+}",
+    ));
+    let gap = found
+        .gaps
+        .iter()
+        .find(|g| g.reason == "unseen_callers")
+        .unwrap_or_else(|| panic!("{:?}", found.gaps));
+    assert!(gap.detail.contains("passed, stored"), "{}", gap.detail);
+    assert!(!gap.detail.contains("at line"), "{}", gap.detail);
 }
 
 #[test]
@@ -2683,10 +2861,22 @@ client.chat.completions.create({{ model: \"gpt-4\", messages: [] }});"
     );
     assert_eq!(routing, Routing::Unknown);
     assert!(!gaps.is_empty());
-    // Written before the base URL, a spread is replaced by it.
+    // Written before the base URL, a spread is replaced by it, but may still
+    // hold a custom `fetch`.
     let (routing, gaps) = route(
         &format!(
             "{OPENAI}const client = new OpenAI({{ ...overrides, baseURL: \"https://api.openai.com/v1\" }});
+client.chat.completions.create({{ model: \"gpt-4\", messages: [] }});"
+        ),
+        "chat.completions.create",
+    );
+    assert_eq!(routing, Routing::Unknown);
+    assert_eq!(gaps, vec!["ambiguous_client/endpoint_option"]);
+    // A spread of a literal the file shows, with no `fetch` in it, does not.
+    let (routing, gaps) = route(
+        &format!(
+            "{OPENAI}const overrides = {{ timeout: 5000 }};
+const client = new OpenAI({{ ...overrides, baseURL: \"https://api.openai.com/v1\" }});
 client.chat.completions.create({{ model: \"gpt-4\", messages: [] }});"
         ),
         "chat.completions.create",
@@ -2940,6 +3130,488 @@ const MIDDLEWARE = [{fallback}];"
 }
 
 #[test]
+fn a_request_given_middleware_or_another_url_may_go_elsewhere() {
+    // A request's own options: Anthropic runs its `middleware` after the
+    // client's (the SDK's examples/middleware.ts), and both SDKs build the
+    // URL from its `path` and `defaultBaseURL`.
+    let gateway = "const viaGateway = async (req: any, next: any) =>
+  next({ ...req, url: String(req.url).replace(\"api.anthropic.com\", \"gateway.example.com\") });
+";
+    let params = "{ model: \"claude-3-5-sonnet-20241022\", max_tokens: 10, messages: [] }";
+    let fallback = "betaRefusalFallbackMiddleware([{ model: \"claude-opus-4-8\" }])";
+    let anthropic =
+        "import Anthropic, { betaRefusalFallbackMiddleware } from \"@anthropic-ai/sdk\";";
+    for request in [
+        format!("client.messages.create({params}, {{ middleware: [viaGateway] }});"),
+        format!("client.messages.stream({params}, {{ middleware: [viaGateway] }});"),
+        format!("client.beta.messages.create({params}, {{ middleware: [viaGateway] }});"),
+        format!("client.messages.countTokens({params}, {{ middleware: [viaGateway] }});"),
+        format!("const opts = {{ middleware: [viaGateway] }};\nclient.messages.create({params}, opts);"),
+        format!("client.messages.create({params}, {{ middleware: [{fallback}, viaGateway] }});"),
+        format!("client.messages.create({params}, {{ defaultBaseURL: \"https://gateway.example.com\" }});"),
+        format!("client.messages.create({params}, {{ path: \"https://gateway.example.com/v1/messages\" }});"),
+        // Options this file does not show may hold any of them.
+        format!("client.messages.create({params}, requestOptions);"),
+        format!("client.messages.create({params}, {{ ...requestOptions, timeout: 1000 }});"),
+        format!("client.messages.create({params}, {{ [key]: [viaGateway] }});"),
+    ] {
+        let found = usages(&format!(
+            "{anthropic}\n{gateway}const client = new Anthropic();\n{request}"
+        ));
+        let c = found
+            .calls
+            .iter()
+            .find(|c| c.member.ends_with("create") || c.member.ends_with("stream") || c.member.ends_with("countTokens"))
+            .unwrap_or_else(|| panic!("no request in {request}: {:?}", found.calls));
+        assert_eq!(c.routing, Routing::Unknown, "{request}");
+        assert_eq!(
+            gaps_at(&found, c),
+            vec!["ambiguous_client/endpoint_option"],
+            "{request}"
+        );
+        // The value is still confirmed, and the client's own route stays.
+        assert_eq!(value(c, "model"), Some("claude-3-5-sonnet-20241022"));
+        assert_eq!(routing_of(&found, "client"), Routing::AnthropicDirect);
+    }
+    // OpenAI's request options take a `path` and a `defaultBaseURL` too.
+    for options in [
+        "{ path: \"https://gateway.example.com/v1/chat/completions\" }",
+        "{ defaultBaseURL: \"https://gateway.example.com/v1\" }",
+        "requestOptions",
+    ] {
+        let (routing, gaps) = route(
+            &format!(
+                "{OPENAI}const client = new OpenAI();
+client.chat.completions.create({{ model: \"gpt-4o\", messages: [] }}, {options});"
+            ),
+            "chat.completions.create",
+        );
+        assert_eq!(routing, Routing::Unknown, "{options}");
+        assert_eq!(gaps, vec!["ambiguous_client/endpoint_option"], "{options}");
+    }
+    let (routing, gaps) = route(
+        &format!(
+            "{OPENAI}const client = new OpenAI();
+client.beta.threads.runs.create(\"thread_abc\", {{ assistant_id: \"asst_abc\", model: \"gpt-4\" }}, {{ path: \"https://gateway.example.com/v1/runs\" }});"
+        ),
+        "beta.threads.runs.create",
+    );
+    assert_eq!(routing, Routing::Unknown);
+    assert_eq!(gaps, vec!["ambiguous_client/endpoint_option"]);
+
+    // Options that only set how the request is sent keep the route, as the
+    // SDK's own refusal fallback does (the real slice's
+    // `{ fallbackState: state }`).
+    for request in [
+        format!("client.messages.create({params}, {{ fallbackState: state }});"),
+        format!("client.messages.create({params}, {{ middleware: [{fallback}] }});"),
+        format!("client.messages.create({params}, {{ signal: controller.signal, timeout: 1000, maxRetries: 2, headers: {{ \"x-trace\": id }} }});"),
+        format!("const opts = {{ timeout: 1000 }};\nclient.messages.create({params}, opts);"),
+        format!("client.messages.create({params}, undefined);"),
+        format!("client.messages.create({params});"),
+    ] {
+        let found = usages(&format!(
+            "{anthropic}\n{gateway}const client = new Anthropic();\n{request}"
+        ));
+        let c = call(&found, "client.messages.create");
+        assert_eq!(c.routing, Routing::AnthropicDirect, "{request}");
+        assert!(gaps_at(&found, c).is_empty(), "{request}: {:?}", found.gaps);
+    }
+    let (routing, gaps) = route(
+        &format!(
+            "{OPENAI}const client = new OpenAI();
+client.beta.threads.runs.create(threadId, {{ assistant_id: \"asst_abc\", model: \"gpt-4\" }});"
+        ),
+        "beta.threads.runs.create",
+    );
+    assert_eq!(routing, Routing::OpenaiDirect);
+    assert!(gaps.is_empty(), "{gaps:?}");
+    // Past a request that takes no model, an argument the file does not
+    // show may be a path parameter or a body: only options written in the
+    // file are read.
+    for (request, member) in [
+        (
+            "client.beta.threads.runs.retrieve(threadId, run.id);",
+            "beta.threads.runs.retrieve",
+        ),
+        (
+            "client.beta.threads.messages.create(threadId, message);",
+            "beta.threads.messages.create",
+        ),
+        (
+            "client.beta.threads.runs.steps.retrieve(threadId, runId, stepId);",
+            "beta.threads.runs.steps.retrieve",
+        ),
+    ] {
+        let (routing, gaps) = route(
+            &format!("{OPENAI}const client = new OpenAI();\n{request}"),
+            member,
+        );
+        assert_eq!(routing, Routing::OpenaiDirect, "{request}");
+        assert!(
+            !gaps.iter().any(|g| g.starts_with("ambiguous_client/")),
+            "{request}: {gaps:?}"
+        );
+    }
+    let (routing, gaps) = route(
+        &format!(
+            "{OPENAI}const client = new OpenAI();
+client.files.retrieve(fileId, {{ path: \"https://gateway.example.com/v1/files/x\" }});"
+        ),
+        "files.retrieve",
+    );
+    assert_eq!(routing, Routing::Unknown);
+    assert_eq!(gaps, vec!["ambiguous_client/endpoint_option"]);
+    // A client already routed elsewhere keeps its route for options it may
+    // be given; options written in the file still count.
+    let (routing, gaps) = route(
+        &format!(
+            "{OPENAI}const client = new OpenAI({{ baseURL: \"http://localhost:11434/v1\" }});
+client.chat.completions.create({{ model: \"gpt-4o\", messages: [] }}, requestOptions);"
+        ),
+        "chat.completions.create",
+    );
+    assert_eq!(routing, Routing::CustomBaseUrl);
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn request_options_are_read_through_every_value_the_file_gives_them() {
+    // Options held in a class property, a static member or a reassigned
+    // `let`, or picked by a conditional or a conditional spread of
+    // literals: each value is read, and only one that may hold a
+    // `middleware`, `path`, `defaultBaseURL` or `fetch` (or that cannot be
+    // read) costs the route.
+    let bot = |fields: &str, body: &str, options: &str| {
+        format!(
+            "import Anthropic from \"@anthropic-ai/sdk\";
+const viaGateway = async (req: any, next: any) => next(req);
+class SupportBot {{
+  private readonly client = new Anthropic();
+  private readonly model = \"claude-3-5-sonnet-20241022\";
+{fields}
+  async reply(text: string, signal?: AbortSignal, stream?: boolean, slow?: boolean) {{
+{body}
+    return this.client.messages.create(
+      {{ model: this.model, max_tokens: 1024, messages: [{{ role: \"user\", content: text }}] }},
+      {options},
+    );
+  }}
+}}
+export const supportBot = new SupportBot();
+"
+        )
+    };
+    let reply = |source: &str| {
+        let found = usages(source);
+        let c = call(&found, "this.client.messages.create");
+        (
+            c.routing,
+            value(c, "model").map(str::to_string),
+            gaps_at(&found, c),
+        )
+    };
+    for (fields, body, options) in [
+        (
+            "  private readonly requestOptions = { timeout: 60_000, maxRetries: 3 };",
+            "",
+            "this.requestOptions",
+        ),
+        (
+            "  private requestOptions: { timeout: number };\n  constructor() { this.requestOptions = { timeout: 60_000 }; }",
+            "",
+            "this.requestOptions",
+        ),
+        (
+            "  static readonly OPTIONS = { timeout: 30_000, maxRetries: 2 };",
+            "",
+            "SupportBot.OPTIONS",
+        ),
+        ("", "", "signal ? { signal } : undefined"),
+        ("", "", "signal ? { signal } : {}"),
+        ("", "", "signal ? { signal } : null"),
+        ("", "", "stream ? { timeout: 120_000 } : { timeout: 30_000 }"),
+        ("", "", "{ maxRetries: 0, ...(signal ? { signal } : {}) }"),
+        ("", "", "{ maxRetries: 0, ...(signal && { signal }) }"),
+        (
+            "",
+            "    let opts = { timeout: 30_000 };\n    if (slow) opts = { timeout: 120_000 };",
+            "opts",
+        ),
+        (
+            "",
+            "    let opts: any = { timeout: 30_000 };\n    if (signal) opts = { ...opts, signal };",
+            "opts",
+        ),
+        (
+            "",
+            "    const base = { timeout: 1000 };\n    const opts = signal ? { ...base, signal } : { ...base };",
+            "opts",
+        ),
+    ] {
+        let source = bot(fields, body, options);
+        let (routing, model, gaps) = reply(&source);
+        assert_eq!(routing, Routing::AnthropicDirect, "{source}");
+        assert_eq!(model.as_deref(), Some("claude-3-5-sonnet-20241022"));
+        assert!(gaps.is_empty(), "{source}: {gaps:?}");
+    }
+    // A value that may hold one, or one the file cannot read.
+    for (fields, body, options) in [
+        (
+            "  private readonly requestOptions = { middleware: [viaGateway] };",
+            "",
+            "this.requestOptions",
+        ),
+        (
+            "  static readonly OPTIONS = { path: \"https://gateway.example.com/v1/messages\" };",
+            "",
+            "SupportBot.OPTIONS",
+        ),
+        ("", "", "signal ? { middleware: [viaGateway] } : undefined"),
+        (
+            "",
+            "",
+            "{ maxRetries: 0, ...(signal ? { defaultBaseURL: \"https://gateway.example.com\" } : {}) }",
+        ),
+        (
+            "",
+            "    let opts: any = { timeout: 30_000 };\n    if (slow) opts = { path: \"https://gateway.example.com/v1/messages\" };",
+            "opts",
+        ),
+        (
+            "",
+            "    let opts: any = { timeout: 1 };\n    if (slow) opts = { ...opts, middleware: [viaGateway] };",
+            "opts",
+        ),
+        // Written by the file through the property, or given to a call
+        // that may write it.
+        (
+            "  private readonly requestOptions: any = { timeout: 60_000 };\n  useGateway() { this.requestOptions.middleware = [viaGateway]; }",
+            "",
+            "this.requestOptions",
+        ),
+        (
+            "  private readonly requestOptions: any = { timeout: 60_000 };\n  useGateway() { const o = this.requestOptions; o.middleware = [viaGateway]; }",
+            "",
+            "this.requestOptions",
+        ),
+        (
+            "",
+            "    const opts = { timeout: 1 };\n    configure(opts);",
+            "opts",
+        ),
+        ("", "", "signal ? { signal } : extraOptions"),
+        ("", "", "{ ...(signal ? { signal } : defaults()) }"),
+    ] {
+        let source = bot(fields, body, options);
+        let (routing, model, gaps) = reply(&source);
+        assert_eq!(routing, Routing::Unknown, "{source}");
+        assert_eq!(model.as_deref(), Some("claude-3-5-sonnet-20241022"));
+        assert_eq!(gaps, vec!["ambiguous_client/endpoint_option"], "{source}");
+    }
+    // Names that hold each other: each holds what the other may.
+    for order in [["a", "b"], ["b", "a"]] {
+        let found = usages(&format!(
+            "import Anthropic from \"@anthropic-ai/sdk\";
+const viaGateway = async (req: any, next: any) => next(req);
+const client = new Anthropic();
+let a: any = {{ timeout: 1 }};
+const b = {{ ...a }};
+if (process.argv[2]) a = {{ ...b, middleware: [viaGateway] }};
+client.messages.create({{ model: \"claude-3-5-sonnet-20241022\", max_tokens: 10, messages: [] }}, {});
+client.messages.create({{ model: \"claude-3-5-sonnet-20241022\", max_tokens: 10, messages: [] }}, {});",
+            order[0], order[1]
+        ));
+        assert_eq!(found.calls.len(), 2);
+        for c in &found.calls {
+            assert_eq!(c.routing, Routing::Unknown, "{order:?}");
+            assert_eq!(gaps_at(&found, c), vec!["ambiguous_client/endpoint_option"]);
+        }
+    }
+    // In a method that may run with another `this`, the property may be
+    // another object's.
+    let (routing, gaps) = route(
+        "import Anthropic from \"@anthropic-ai/sdk\";
+const client = new Anthropic();
+class Bot {
+  private readonly requestOptions = { timeout: 60_000 };
+  reply() {
+    return client.messages.create({ model: \"claude-3-5-sonnet-20241022\", max_tokens: 10, messages: [] }, this.requestOptions);
+  }
+}
+setTimeout(new Bot().reply);",
+        "messages.create",
+    );
+    assert_eq!(routing, Routing::Unknown);
+    assert_eq!(gaps, vec!["ambiguous_client/endpoint_option"]);
+    // As for the client it reads through `this`, a subclass in another
+    // module is taken not to replace an exported class's options.
+    let source = bot(
+        "  private readonly requestOptions = { timeout: 60_000 };",
+        "",
+        "this.requestOptions",
+    )
+    .replace("class SupportBot", "export class SupportBot");
+    let (routing, _, gaps) = reply(&source);
+    assert_eq!(routing, Routing::AnthropicDirect);
+    assert!(
+        !gaps.iter().any(|g| g.starts_with("ambiguous_client/")),
+        "{gaps:?}"
+    );
+    // The SDK's refusal fallback keeps the route where nothing else may
+    // change the array: not in a class property.
+    let fallback = "[betaRefusalFallbackMiddleware([{ model: \"claude-opus-4-8\" }])]";
+    for (fields, body, options, routing) in [
+        (
+            String::new(),
+            format!("    const opts = {{ middleware: {fallback} }};"),
+            "opts",
+            Routing::AnthropicDirect,
+        ),
+        (
+            format!("  private readonly requestOptions = {{ middleware: {fallback} }};"),
+            String::new(),
+            "this.requestOptions",
+            Routing::Unknown,
+        ),
+    ] {
+        let source = bot(&fields, &body, options).replace(
+            "import Anthropic from",
+            "import Anthropic, { betaRefusalFallbackMiddleware } from",
+        );
+        assert_eq!(reply(&source).0, routing, "{source}");
+    }
+    // The same reading for OpenAI's request options, and for a client's.
+    let (routing, gaps) = route(
+        &format!(
+            "{OPENAI}const client = new OpenAI();
+export const ask = (signal?: AbortSignal) =>
+  client.chat.completions.create({{ model: \"gpt-4o\", messages: [] }}, signal ? {{ signal }} : undefined);"
+        ),
+        "chat.completions.create",
+    );
+    assert_eq!(routing, Routing::OpenaiDirect);
+    assert!(gaps.is_empty(), "{gaps:?}");
+    let (routing, gaps) = route(
+        "import Anthropic from \"@anthropic-ai/sdk\";
+const debug = process.argv.includes(\"--debug\");
+const client = new Anthropic({ ...(debug ? { logLevel: \"debug\" } : {}), baseURL: \"https://api.anthropic.com\" });
+client.messages.create({ model: \"claude-3-5-sonnet-20241022\", max_tokens: 10, messages: [] });",
+        "messages.create",
+    );
+    assert_eq!(routing, Routing::AnthropicDirect);
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn reading_request_options_through_their_values_is_linear() {
+    // Many requests given options that spread names that are only read,
+    // each reassigned many times with conditionals of spreads of the one
+    // before: a name read in full is kept, and one read takes a bounded
+    // number of steps.
+    let mut source = String::from(
+        "import Anthropic from \"@anthropic-ai/sdk\";\nconst client = new Anthropic();\nconst o0 = { timeout: 1 };\n",
+    );
+    for i in 1..200 {
+        let prev = i - 1;
+        source.push_str(&format!(
+            "let o{i}: any = {{ ...o{prev}, maxRetries: 1 }};\n"
+        ));
+        for _ in 0..30 {
+            source.push_str(&format!(
+                "o{i} = process.argv[1] ? {{ ...o{prev} }} : {{ ...o{prev}, timeout: 2 }};\n"
+            ));
+        }
+    }
+    for _ in 0..3_000 {
+        source.push_str("client.messages.create({ model: \"claude-3-5-sonnet-20241022\", max_tokens: 1, messages: [] }, { ...o199 });\n");
+    }
+    let found = usages_within(&source, 10);
+    assert_eq!(found.calls.len(), 3_000);
+}
+
+#[test]
+fn options_that_may_hold_a_fetch_or_middleware_unconfirm_a_provider_base_url() {
+    // The `baseURL` written after a spread or a computed key decides the
+    // host, but what they hold may still be a `fetch` or a `middleware`.
+    let gateway = "const viaGateway = async (req: any, next: any) =>
+  next({ ...req, url: String(req.url).replace(\"api.anthropic.com\", \"gateway.example.com\") });
+";
+    let request = "client.messages.create({ model: \"claude-3-5-sonnet-20241022\", max_tokens: 10, messages: [] });";
+    for (setup, client) in [
+        (
+            "const useGateway = process.argv.includes(\"--gateway\");",
+            "new Anthropic({\n  ...(useGateway ? { middleware: [viaGateway] } : {}),\n  baseURL: \"https://api.anthropic.com\",\n})",
+        ),
+        (
+            "const shared = { middleware: [viaGateway] };",
+            "new Anthropic({ ...shared, baseURL: \"https://api.anthropic.com\" })",
+        ),
+        (
+            "import { clientOptions } from \"./config\";",
+            "new Anthropic({ ...clientOptions, baseURL: \"https://api.anthropic.com\" })",
+        ),
+        (
+            "declare const key: string;",
+            "new Anthropic({ [key]: [viaGateway], baseURL: \"https://api.anthropic.com\" })",
+        ),
+        (
+            "declare const key: string;",
+            "new Anthropic().withOptions({ [key]: [viaGateway], baseURL: \"https://api.anthropic.com\" })",
+        ),
+        (
+            "import { clientOptions } from \"./config\";",
+            "new Anthropic().withOptions({ ...clientOptions, baseURL: \"https://api.anthropic.com\" })",
+        ),
+    ] {
+        let source = format!(
+            "import Anthropic from \"@anthropic-ai/sdk\";\n{gateway}{setup}\nconst client = {client};\n{request}"
+        );
+        let (routing, gaps) = route(&source, "messages.create");
+        assert_eq!(routing, Routing::Unknown, "{source}");
+        assert_eq!(gaps, vec!["ambiguous_client/endpoint_option"], "{source}");
+    }
+    // The `fetch` arm: OpenAI.
+    let (routing, gaps) = route(
+        &format!(
+            "{OPENAI}import {{ clientOptions }} from \"./config\";
+const client = new OpenAI({{ ...clientOptions, baseURL: \"https://api.openai.com/v1\" }});
+client.chat.completions.create({{ model: \"gpt-4-0613\", messages: [] }});"
+        ),
+        "chat.completions.create",
+    );
+    assert_eq!(routing, Routing::Unknown);
+    assert_eq!(gaps, vec!["ambiguous_client/endpoint_option"]);
+    // A spread the file shows that holds neither keeps the route.
+    let (routing, gaps) = route(
+        &format!(
+            "import Anthropic from \"@anthropic-ai/sdk\";
+const shared = {{ maxRetries: 2, timeout: 1000 }};
+const client = new Anthropic({{ ...shared, baseURL: \"https://api.anthropic.com\" }});
+{request}"
+        ),
+        "messages.create",
+    );
+    assert_eq!(routing, Routing::AnthropicDirect);
+    assert!(gaps.is_empty(), "{gaps:?}");
+    // Next to another host's `baseURL`, the request leaves the provider
+    // either way: the route stays.
+    for client in [
+        "new OpenAI({ ...clientOptions, baseURL: \"http://localhost:11434/v1\" })",
+        "new OpenAI().withOptions({ ...clientOptions, baseURL: \"http://localhost:11434/v1\" })",
+    ] {
+        let source = format!(
+            "{OPENAI}import {{ clientOptions }} from \"./config\";
+const client = {client};
+client.chat.completions.create({{ model: \"gpt-4-0613\", messages: [] }});"
+        );
+        let (routing, gaps) = route(&source, "chat.completions.create");
+        assert_eq!(routing, Routing::CustomBaseUrl, "{client}");
+        assert!(gaps.is_empty(), "{client}: {gaps:?}");
+    }
+}
+
+#[test]
 fn a_global_fetch_written_in_the_file_is_a_custom_fetch() {
     // The SDKs send every request through the global `fetch` unless the
     // client is given its own: the in-file form of what nock and msw do.
@@ -2969,7 +3641,7 @@ fn a_global_fetch_written_in_the_file_is_a_custom_fetch() {
         assert_eq!(c.routing, Routing::Unknown, "{write}");
         assert_eq!(
             gaps_at(&found, c),
-            vec!["ambiguous_client/endpoint_option"],
+            vec!["ambiguous_client/global_fetch"],
             "{write}"
         );
         assert_eq!(routing_of(&found, "client"), Routing::Unknown, "{write}");
@@ -2989,7 +3661,7 @@ fn a_global_fetch_written_in_the_file_is_a_custom_fetch() {
         let found = usages(&source);
         let c = &found.calls[0];
         assert_eq!(c.routing, Routing::Unknown, "{source}");
-        assert_eq!(gaps_at(&found, c), vec!["ambiguous_client/endpoint_option"]);
+        assert_eq!(gaps_at(&found, c), vec!["ambiguous_client/global_fetch"]);
     }
     // openai v3 sends through axios: its route stays, while a v4 client in
     // the same file is re-routed.
@@ -3007,10 +3679,7 @@ client.chat.completions.create({ model: \"gpt-4o\", messages: [] });",
     assert_eq!(routing_of(&found, "legacy"), Routing::OpenaiDirect);
     let v4 = call(&found, "client.chat.completions.create");
     assert_eq!(v4.routing, Routing::Unknown);
-    assert_eq!(
-        gaps_at(&found, v4),
-        vec!["ambiguous_client/endpoint_option"]
-    );
+    assert_eq!(gaps_at(&found, v4), vec!["ambiguous_client/global_fetch"]);
     assert_eq!(routing_of(&found, "client"), Routing::Unknown);
     // Read, or written on an object literal of the file: nothing replaced.
     for other in [
@@ -3025,6 +3694,406 @@ client.chat.completions.create({ model: \"gpt-4o\", messages: [] });",
         let c = call(&found, "client.chat.completions.create");
         assert_eq!(c.routing, Routing::OpenaiDirect, "{other}");
         assert!(gaps_at(&found, c).is_empty(), "{other}");
+    }
+    // A CommonJS module exporting a helper named `fetch` (or a `baseURL`
+    // setting) writes its own export object, never the global or a client.
+    for export in [
+        "exports.fetch = async function (url) { return (await globalThis.fetch(url)).json(); };",
+        "module.exports.fetch = (url) => globalThis.fetch(url);",
+        "exports.baseURL = \"https://gateway.example.com/v1\";",
+        "module.exports = { summarize };\nmodule.exports.fetch = (url) => globalThis.fetch(url);",
+    ] {
+        let source = format!(
+            "const OpenAI = require(\"openai\");\nconst client = new OpenAI();\n{export}\n{request}"
+        );
+        let found = usages_js(&source);
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(c.routing, Routing::OpenaiDirect, "{export}");
+        assert!(gaps_at(&found, c).is_empty(), "{export}: {:?}", found.gaps);
+    }
+    // Once the module exports a client, a property written on the export
+    // object may be that client's.
+    let found = usages_js(&format!(
+        "const OpenAI = require(\"openai\");\nconst client = new OpenAI();\nmodule.exports = client;\nmodule.exports.fetch = proxy;\n{request}"
+    ));
+    let c = call(&found, "client.chat.completions.create");
+    assert_eq!(c.routing, Routing::Unknown);
+    assert_eq!(gaps_at(&found, c), vec!["ambiguous_client/global_fetch"]);
+    // So does a module that assigns `exports` itself: `exports.x` then
+    // writes what it was given.
+    for (write, gap) in [
+        (
+            "exports = client;\nexports.baseURL = \"https://gateway.example.com/v1\";",
+            "ambiguous_client/dynamic_feature",
+        ),
+        (
+            "exports = client;\nexports.fetch = proxy;",
+            "ambiguous_client/global_fetch",
+        ),
+        (
+            "module = { exports: client };\nmodule.exports.fetch = proxy;",
+            "ambiguous_client/global_fetch",
+        ),
+    ] {
+        let found = usages_js(&format!(
+            "const OpenAI = require(\"openai\");\nconst client = new OpenAI();\n{write}\n{request}"
+        ));
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(c.routing, Routing::Unknown, "{write}");
+        assert_eq!(gaps_at(&found, c), vec![gap], "{write}");
+    }
+}
+
+#[test]
+fn the_global_object_written_under_a_run_time_name_may_replace_fetch() {
+    // A name held in a binding, a spread, or a key known only at run time:
+    // like `vi.stubGlobal(name, ...)`, any of them may be `fetch`.
+    let request = "client.chat.completions.create({ model: \"gpt-4o\", messages: [] });";
+    for write in [
+        "const mocks = { fetch: proxy };\nObject.assign(globalThis, mocks);",
+        "Object.assign(globalThis, { ...polyfills });",
+        "const name = \"fetch\";\n(globalThis as any)[name] = proxy;",
+        "function setGlobal(name: string, value: unknown) {\n  (globalThis as any)[name] = value;\n}\nsetGlobal(\"fetch\", proxy);",
+        // Another module may call an exported helper with `"fetch"`.
+        "export function setGlobal(k: string, v: unknown) {\n  Reflect.set(globalThis, k, v);\n}",
+        "export function setGlobal(k: string, v: unknown) {\n  Object.defineProperty(globalThis, k, { value: v });\n}",
+        "function setGlobal(k: string, v: unknown) {\n  Reflect.set(globalThis, k, v);\n}\nsetGlobal(process.argv[2], proxy);",
+        "for (const [k, v] of Object.entries({ fetch: proxy })) (globalThis as any)[k] = v;",
+        "const g: any = globalThis;\ng[name] = proxy;",
+        "(window as any)[name] = proxy;",
+        // A name or an expression that may be the global object.
+        "let g: any = globalThis;\ng = {};\ng[name] = proxy;",
+        "let g: any = {};\nif (process.argv[2]) g = globalThis;\ng[name] = proxy;",
+        "const root: any = typeof window !== \"undefined\" ? window : globalThis;\nroot[name] = proxy;",
+        "(typeof window !== \"undefined\" ? window : (globalThis as any))[name] = proxy;",
+        "((globalThis || window) as any)[name] = proxy;",
+        "const k = \"fetch\";\njest.spyOn(globalThis, k).mockImplementation(proxy);",
+        // A key the file shows may be `fetch`.
+        // undici keeps the global dispatcher under the registry's symbol.
+        "(globalThis as any)[Symbol.for(\"undici.globalDispatcher.1\")] = new MockAgent();",
+        "const DISPATCHER = Symbol.for(\"undici.globalDispatcher.1\");\n(globalThis as any)[DISPATCHER] = agent;",
+        "(globalThis as any)[Symbol.for(name)] = agent;",
+        "let key = \"__cache\";\nkey = \"fetch\";\n(globalThis as any)[key] = proxy;",
+        "const key = process.argv[2] ? \"__cache\" : \"fetch\";\n(globalThis as any)[key] = proxy;",
+        "(globalThis as any)[`fe${\"tch\"}`] = proxy;",
+        "function Symbol(k: string) { return k; }\n(globalThis as any)[Symbol(\"fetch\")] = proxy;",
+        "declare const KEY: string;\nReflect.set(globalThis, KEY, proxy);",
+    ] {
+        let source = format!("{OPENAI}const client = new OpenAI();\n{write}\n{request}");
+        let found = usages(&source);
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(c.routing, Routing::Unknown, "{write}");
+        assert_eq!(
+            gaps_at(&found, c),
+            vec!["ambiguous_client/global_fetch"],
+            "{write}"
+        );
+    }
+    // Run-time names written on anything else are ordinary code.
+    for other in [
+        "const headers: Record<string, string> = {};\nheaders[name] = value;",
+        "export function merge(options: any, defaults: any) { return Object.assign(options, defaults); }",
+        "export function set(target: any, k: string, v: unknown) { target[k] = v; }",
+        // A symbol, or a string the file shows is not `fetch`: a global
+        // cache or singleton.
+        "const CACHE_KEY = Symbol.for(\"app.summaryCache\");\nconst g = globalThis as unknown as Record<symbol, Map<string, string> | undefined>;\ng[CACHE_KEY] ??= new Map<string, string>();",
+        "const KEY = \"__summaryCache\";\n(globalThis as any)[KEY] = (globalThis as any)[KEY] || new Map();",
+        "const APP = \"summaries\";\n(globalThis as any)[`__${APP}_started`] = Date.now();",
+        "(globalThis as any)[Symbol(\"started\")] = Date.now();",
+        "(window as any)[Symbol.iterator] = function* () {};",
+        "const key = process.argv[2] ? \"__a\" : \"__b\";\n(globalThis as any)[key] = 1;",
+        "Reflect.set(globalThis, Symbol.for(\"app.cache\"), new Map());",
+        "const K = \"__cache\";\nObject.defineProperty(globalThis, K, { value: new Map() });",
+        "const NAME = \"ResizeObserver\";\nvi.stubGlobal(NAME, vi.fn());",
+        "const KEY = \"setTimeout\";\njest.spyOn(globalThis, KEY);",
+    ] {
+        let source = format!("{OPENAI}const client = new OpenAI();\n{other}\n{request}");
+        let found = usages(&source);
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(c.routing, Routing::OpenaiDirect, "{other}");
+        assert!(gaps_at(&found, c).is_empty(), "{other}");
+    }
+}
+
+#[test]
+fn a_test_double_of_fetch_is_seen_however_the_runner_is_reached() {
+    // The runner is read by the call's last name, not by how its object is
+    // bound: CommonJS, a sinon sandbox, node:test's context, named imports,
+    // Vitest's in-source `import.meta.vitest`.
+    let request = "client.chat.completions.create({ model: \"gpt-4o\", messages: [] });";
+    for (setup, js) in [
+        (
+            "const sinon = require(\"sinon\");\nsinon.stub(global, \"fetch\").resolves(new Response(\"{}\"));",
+            true,
+        ),
+        (
+            "const { jest } = require(\"@jest/globals\");\njest.spyOn(global, \"fetch\");",
+            true,
+        ),
+        (
+            "const { mock } = require(\"node:test\");\nmock.method(globalThis, \"fetch\", async () => new Response(\"{}\"));",
+            true,
+        ),
+        (
+            "import sinon from \"sinon\";\nconst sandbox = sinon.createSandbox();\nbeforeEach(() => { sandbox.stub(globalThis, \"fetch\"); });",
+            false,
+        ),
+        (
+            "import sinon from \"sinon\";\nsinon.createSandbox().stub(globalThis, \"fetch\");",
+            false,
+        ),
+        (
+            "import test from \"node:test\";\ntest(\"x\", (t) => { t.mock.method(globalThis, \"fetch\", async () => new Response(\"{}\")); });",
+            false,
+        ),
+        (
+            "import test from \"node:test\";\ntest.mock.method(globalThis, \"fetch\");",
+            false,
+        ),
+        (
+            "import { stub } from \"sinon\";\nstub(globalThis, \"fetch\").resolves(new Response(\"{}\"));",
+            false,
+        ),
+        (
+            "import { stub } from \"jsr:@std/testing/mock\";\nconst fetchStub = stub(globalThis, \"fetch\", () => Promise.resolve(new Response(\"{}\")));",
+            false,
+        ),
+        (
+            "import { spyOn } from \"bun:test\";\nspyOn(globalThis, \"fetch\").mockImplementation(proxy);",
+            false,
+        ),
+        (
+            "if (import.meta.vitest) {\n  const { it, vi } = import.meta.vitest;\n  it(\"x\", () => { vi.stubGlobal(\"fetch\", vi.fn()); });\n}",
+            false,
+        ),
+        (
+            "const { vi } = import.meta.vitest;\nvi.spyOn(globalThis, \"fetch\");",
+            false,
+        ),
+        (
+            "import { vi as v } from \"vitest\";\nv.stubGlobal(\"fetch\", v.fn());",
+            false,
+        ),
+        (
+            "import * as vitest from \"vitest\";\nvitest.vi.stubGlobal(\"fetch\", vitest.vi.fn());",
+            false,
+        ),
+        ("jest.replaceProperty(globalThis, \"fetch\", proxy);", false),
+        // Jasmine's global `spyOn`.
+        ("spyOn(window, \"fetch\").and.returnValue(response);", false),
+    ] {
+        let (imports, found) = if js {
+            let imports = "const OpenAI = require(\"openai\");\n";
+            (
+                imports,
+                usages_js(&format!(
+                    "{imports}{setup}\nconst client = new OpenAI();\n{request}"
+                )),
+            )
+        } else {
+            (
+                OPENAI,
+                usages(&format!(
+                    "{OPENAI}{setup}\nconst client = new OpenAI();\n{request}"
+                )),
+            )
+        };
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(c.routing, Routing::Unknown, "{imports}{setup}");
+        assert_eq!(
+            gaps_at(&found, c),
+            vec!["ambiguous_client/global_fetch"],
+            "{setup}"
+        );
+    }
+    // The same forms on an SDK object replace its member.
+    for setup in [
+        "const sinon = require(\"sinon\");\nsinon.stub(client.chat.completions, \"create\").resolves({});",
+        "const sandbox = require(\"sinon\").createSandbox();\nsandbox.stub(client.chat.completions, \"create\");",
+        "test(\"x\", (t) => { t.mock.method(client.chat.completions, \"create\", async () => ({})); });",
+    ] {
+        let found = usages_js(&format!(
+            "const OpenAI = require(\"openai\");\nconst client = new OpenAI();\n{setup}\n{request}"
+        ));
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(c.routing, Routing::Unknown, "{setup}");
+        assert_eq!(
+            gaps_at(&found, c),
+            vec!["ambiguous_client/dynamic_feature"],
+            "{setup}"
+        );
+    }
+    // Calls that only share a name stay ordinary code.
+    for other in [
+        "const label = name.replace(\"get\", \"fetch\");",
+        "export const rename = (name: string, prefix: string) => name.replace(prefix, \"fetch\");",
+        "http.method(server, \"fetch\");",
+        "const api = { fetch: proxy };\nsinon.stub(api, \"fetch\");",
+        "sinon.stub(globalThis, \"setTimeout\");",
+        "jest.spyOn(console, \"log\");",
+    ] {
+        let source = format!("{OPENAI}const client = new OpenAI();\n{other}\n{request}");
+        let found = usages(&source);
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(c.routing, Routing::OpenaiDirect, "{other}");
+        assert!(gaps_at(&found, c).is_empty(), "{other}");
+    }
+}
+
+#[test]
+fn a_library_that_intercepts_fetch_set_up_in_the_file_is_a_global_fetch() {
+    let request = "client.chat.completions.create({ model: \"gpt-4o\", messages: [] });";
+    for setup in [
+        "import nock from \"nock\";\nnock(\"https://api.openai.com\").post(\"/v1/chat/completions\").reply(200, {});",
+        "import { setupServer } from \"msw/node\";\nconst server = setupServer();\nbeforeAll(() => server.listen());",
+        "import fetchMock from \"jest-fetch-mock\";\nfetchMock.enableMocks();",
+        "require(\"jest-fetch-mock\").enableMocks();",
+        "import fetchMock from \"fetch-mock\";\nfetchMock.mockGlobal().post(\"https://api.openai.com/v1/chat/completions\", {});",
+        "const { default: nock } = await import(\"nock\");",
+        "import { MockAgent, setGlobalDispatcher } from \"undici\";\nconst agent = new MockAgent();\nsetGlobalDispatcher(agent);",
+    ] {
+        let source = format!("{OPENAI}{setup}\nconst client = new OpenAI();\n{request}");
+        let found = usages(&source);
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(c.routing, Routing::Unknown, "{setup}");
+        assert_eq!(
+            gaps_at(&found, c),
+            vec!["ambiguous_client/global_fetch"],
+            "{setup}"
+        );
+    }
+    // undici's own fetch, a proxy agent, and types only change nothing.
+    for other in [
+        "import { fetch as undiciFetch } from \"undici\";",
+        "import { ProxyAgent, setGlobalDispatcher } from \"undici\";\nsetGlobalDispatcher(new ProxyAgent(proxyUrl));",
+        "import { Agent, setGlobalDispatcher } from \"undici\";\nconst agent = new Agent({ keepAliveTimeout: 10_000 });\nsetGlobalDispatcher(agent);",
+        "import type { HttpHandler } from \"msw\";",
+    ] {
+        let source = format!("{OPENAI}{other}\nconst client = new OpenAI();\n{request}");
+        let found = usages(&source);
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(c.routing, Routing::OpenaiDirect, "{other}");
+        assert!(gaps_at(&found, c).is_empty(), "{other}");
+    }
+}
+
+#[test]
+fn openai_v3_is_intercepted_through_node_http_not_fetch() {
+    // nock and msw intercept Node's `http` module, which axios sends v3's
+    // requests through; the `fetch` mocks and undici's dispatchers do not.
+    let v3 = "const { Configuration, OpenAIApi } = require(\"openai\");
+const openai = new OpenAIApi(new Configuration({ apiKey: \"test\" }));
+";
+    let request = "openai.createChatCompletion({ model: \"gpt-3.5-turbo-0301\", messages: [] });";
+    for setup in [
+        "const nock = require(\"nock\");\nnock(\"https://api.openai.com\").post(\"/v1/chat/completions\").reply(200, { choices: [] });",
+        "const { setupServer } = require(\"msw/node\");\nconst server = setupServer();\nserver.listen();",
+        "const { http } = require(\"msw\");",
+        "const { ClientRequestInterceptor } = require(\"@mswjs/interceptors/ClientRequest\");",
+    ] {
+        let found = usages_js(&format!("{setup}\n{v3}{request}"));
+        let c = call(&found, "openai.createChatCompletion");
+        assert_eq!(c.routing, Routing::Unknown, "{setup}");
+        assert_eq!(
+            gaps_at(&found, c),
+            vec!["ambiguous_client/global_fetch"],
+            "{setup}"
+        );
+        assert_eq!(routing_of(&found, "openai"), Routing::Unknown, "{setup}");
+        let gap = found.gaps.iter().find(|g| g.reason == "global_fetch").unwrap();
+        assert!(gap.detail.contains("Node's `http` module"), "{}", gap.detail);
+        assert!(gap.detail.contains("at line 1"), "{}", gap.detail);
+    }
+    // ESM, next to a v4 client that gets the `fetch` gap.
+    let found = usages(&format!(
+        "import nock from \"nock\";\nimport OpenAI, {{ Configuration, OpenAIApi }} from \"openai\";
+const openai = new OpenAIApi(new Configuration({{ apiKey: \"test\" }}));
+const client = new OpenAI();
+{request}
+client.chat.completions.create({{ model: \"gpt-4o\", messages: [] }});"
+    ));
+    for chain in [
+        "openai.createChatCompletion",
+        "client.chat.completions.create",
+    ] {
+        let c = call(&found, chain);
+        assert_eq!(c.routing, Routing::Unknown, "{chain}");
+        assert_eq!(gaps_at(&found, c), vec!["ambiguous_client/global_fetch"]);
+    }
+    for setup in [
+        "const fetchMock = require(\"jest-fetch-mock\");\nfetchMock.enableMocks();",
+        "const fetchMock = require(\"fetch-mock\");\nfetchMock.mockGlobal();",
+        "const { MockAgent, setGlobalDispatcher } = require(\"undici\");\nsetGlobalDispatcher(new MockAgent());",
+        "global.fetch = require(\"node-fetch\");",
+    ] {
+        let found = usages_js(&format!("{setup}\n{v3}{request}"));
+        let c = call(&found, "openai.createChatCompletion");
+        assert_eq!(c.routing, Routing::OpenaiDirect, "{setup}");
+        assert!(gaps_at(&found, c).is_empty(), "{setup}: {:?}", found.gaps);
+    }
+}
+
+#[test]
+fn a_global_fetch_gap_names_what_the_file_does() {
+    // A client with no options is not told it has one, nor sent to Vertex
+    // AI.
+    let found = usages(&format!(
+        "{OPENAI}const client = new OpenAI();
+globalThis.fetch = myFetch;
+client.chat.completions.create({{ model: \"gpt-4-0613\", messages: [] }});"
+    ));
+    let gap = &found.gaps[0];
+    assert_eq!(gap.reason, "global_fetch");
+    assert!(gap.detail.contains("line 3"), "{}", gap.detail);
+    let text = crate::retirements::gap_text(gap.kind, &gap.reason).unwrap();
+    for detail in [gap.detail.as_str(), text] {
+        assert!(detail.contains("global `fetch`"), "{detail}");
+        assert!(!detail.contains("option"), "{detail}");
+        assert!(!detail.contains("Vertex"), "{detail}");
+    }
+    // Anthropic's `middleware` is an option, which sends no request to
+    // Vertex AI.
+    let found = usages(
+        "import Anthropic from \"@anthropic-ai/sdk\";
+const client = new Anthropic({ middleware: [logRequests] });
+client.messages.create({ model: \"claude-3-5-sonnet-20241022\", max_tokens: 10, messages: [] });",
+    );
+    let gap = &found.gaps[0];
+    assert_eq!(gap.reason, "endpoint_option");
+    let text = crate::retirements::gap_text(gap.kind, &gap.reason).unwrap();
+    for detail in [gap.detail.as_str(), text] {
+        assert!(detail.contains("another endpoint"), "{detail}");
+        assert!(!detail.contains("Vertex"), "{detail}");
+    }
+    // One request's options are that request's, not the client's.
+    for (request, option) in [
+        (
+            "{ middleware: [logRequests] }",
+            "request options with `middleware`",
+        ),
+        (
+            "{ defaultBaseURL: \"https://gateway.example.com\" }",
+            "request options with a `defaultBaseURL`",
+        ),
+        (
+            "requestOptions",
+            "request options that may hold `middleware`, a `path` or a `defaultBaseURL`",
+        ),
+    ] {
+        let found = usages(&format!(
+            "import Anthropic from \"@anthropic-ai/sdk\";
+const client = new Anthropic();
+client.messages.create({{ model: \"claude-3-5-sonnet-20241022\", max_tokens: 10, messages: [] }}, {request});"
+        ));
+        let gap = &found.gaps[0];
+        assert_eq!(gap.reason, "endpoint_option");
+        assert_eq!(
+            gap.detail,
+            format!(
+                "`client.messages.create` is given {option}, which may send it to another endpoint"
+            )
+        );
+        assert_eq!(routing_of(&found, "client"), Routing::AnthropicDirect);
     }
 }
 
@@ -3206,4 +4275,542 @@ await cacheManager.list();
     assert_eq!(gaps.len(), 1, "{:?}", found.gaps);
     assert_eq!(gaps[0].reason, "sdk_call_result");
     assert_eq!(gaps[0].values[0].value, "models/gemini-1.5-flash");
+}
+
+/// The routing and gaps of the one `client.chat.completions.create` call
+/// in `source` (TypeScript).
+fn create_route(source: &str) -> (Routing, Vec<String>) {
+    let found = usages(source);
+    let c = call(&found, "client.chat.completions.create");
+    (c.routing, gaps_at(&found, c))
+}
+
+#[test]
+fn class_held_request_options_are_read_only_when_no_read_of_the_name_hands_them_out() {
+    // The object a class property holds may be reached through any read of
+    // a property of that name, on any object: a cast, parentheses, an
+    // alias, a destructuring, an instance, the class name or a helper's
+    // parameter. Written there under a run-time key, a `path` or a `fetch`,
+    // it may send the request elsewhere.
+    let summarizer = |method: &str, after: &str| {
+        format!(
+            "{OPENAI}const client = new OpenAI();
+export class Summarizer {{
+  private requestOptions: any = {{ timeout: 30_000, maxRetries: 2 }};
+  {method}
+  summarize(text: string) {{
+    return client.chat.completions.create(
+      {{ model: \"gpt-4-0613\", messages: [{{ role: \"user\", content: text }}] }},
+      this.requestOptions,
+    );
+  }}
+}}
+{after}
+"
+        )
+    };
+    let gapped = vec!["ambiguous_client/endpoint_option".to_string()];
+    for (method, after) in [
+        (
+            "setOption(key: string, value: unknown) { (this.requestOptions as any)[key] = value; }",
+            "",
+        ),
+        (
+            "setOption(key: string, value: unknown) { (this.requestOptions)[key] = value; }",
+            "",
+        ),
+        (
+            "setOption(key: string, value: unknown) { this.requestOptions[key] = value; }",
+            "",
+        ),
+        (
+            "setOption(key: string, value: unknown) { const o = this.requestOptions; o[key] = value; }",
+            "",
+        ),
+        (
+            "setOption(key: string, value: unknown) { const { requestOptions } = this; requestOptions[key] = value; }",
+            "",
+        ),
+        (
+            "useGateway() { this.requestOptions.path = \"https://gateway.example.com/v1/chat/completions\"; }",
+            "",
+        ),
+        (
+            "useGateway() { this.requestOptions.__proto__ = { path: \"https://gateway.example.com/v1/chat/completions\" }; }",
+            "",
+        ),
+        (
+            "useGateway() { this.requestOptions.__proto__.path = \"https://gateway.example.com/v1/chat/completions\"; }",
+            "",
+        ),
+        (
+            "useProxy(proxy: any) { put(this.requestOptions, \"fetch\", proxy); }",
+            "function put(o: any, k: string, v: unknown) { o[k] = v; }",
+        ),
+        (
+            "",
+            "export const summarizer = new Summarizer();\nexport function setOption(k: string, v: unknown) { (summarizer as any).requestOptions[k] = v; }",
+        ),
+        ("options() { return this.requestOptions; }", ""),
+        ("merge(extra: any) { _.merge(this.requestOptions, extra); }", ""),
+        ("set(k: string, v: unknown) { this.requestOptions.set(k, v); }", ""),
+    ] {
+        let source = summarizer(method, after);
+        assert_eq!(
+            create_route(&source),
+            (Routing::Unknown, gapped.clone()),
+            "{source}"
+        );
+    }
+    // The same through a static property read by class name.
+    let statics = format!(
+        "{OPENAI}const client = new OpenAI();
+class Svc {{
+  static OPTS: any = {{ timeout: 1 }};
+  static ask() {{ return client.chat.completions.create({{ model: \"gpt-4-0613\", messages: [] }}, Svc.OPTS); }}
+}}
+export function configure(k: string, v: unknown) {{ Svc.OPTS[k] = v; }}
+"
+    );
+    assert_eq!(create_route(&statics), (Routing::Unknown, gapped.clone()));
+    // Reads that cannot change what it holds keep the route, whatever the
+    // file writes on other objects.
+    for (method, after) in [
+        ("", ""),
+        ("setTimeoutMs(ms: number) { this.requestOptions.timeout = ms; }", ""),
+        ("describe() { return `${this.requestOptions.timeout} ms`; }", ""),
+        ("log() { console.log(this.requestOptions); }", ""),
+        ("has() { return !this.requestOptions || \"path\" in this.requestOptions; }", ""),
+        ("copy() { return { ...this.requestOptions }; }", ""),
+        (
+            "",
+            "export function prefixed(route: any) { route.path = \"/api\" + route.path; return route; }",
+        ),
+        (
+            "",
+            "export function defaults(target: any, extra: any) { (target as any)[\"path\"] ??= extra; }",
+        ),
+        (
+            "",
+            "class Other { path = \"\"; at(p: string) { this.path = p; } }\nnew Other().at(\"/x\");",
+        ),
+    ] {
+        let source = summarizer(method, after);
+        assert_eq!(
+            create_route(&source),
+            (Routing::OpenaiDirect, vec![]),
+            "{source}"
+        );
+    }
+    // Passed through a conditional to the request.
+    let source = summarizer("", "").replace(
+        "      this.requestOptions,\n",
+        "      text ? this.requestOptions : undefined,\n",
+    );
+    assert_eq!(
+        create_route(&source),
+        (Routing::OpenaiDirect, vec![]),
+        "{source}"
+    );
+}
+
+#[test]
+fn a_method_bound_to_its_own_object_still_runs_with_it() {
+    // `ctrl.chat.bind(ctrl)` and `this.send = this.send.bind(this)` run the
+    // method with the object it is read off, as a call of it does: its
+    // reads of `this` keep their value. Bound to anything else, it may
+    // run with another `this`.
+    let controller = |bind: &str| {
+        format!(
+            "{OPENAI}import express from \"express\";
+const client = new OpenAI();
+class ChatController {{
+  private readonly requestOptions = {{ timeout: 30_000, maxRetries: 2 }};
+  private readonly model = \"gpt-4-0613\";
+  async chat(req: any, res: any) {{
+    const r = await client.chat.completions.create({{ model: this.model, messages: req.body.messages }}, this.requestOptions);
+    res.json(r);
+  }}
+}}
+const controller = new ChatController();
+const router = express.Router();
+{bind}
+"
+        )
+    };
+    for bind in [
+        "router.post(\"/chat\", controller.chat.bind(controller));",
+        "router.post(\"/chat\", (req, res) => controller.chat.call(controller, req, res));",
+    ] {
+        let found = usages(&controller(bind));
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(c.routing, Routing::OpenaiDirect, "{bind}");
+        assert_eq!(value(c, "model"), Some("gpt-4-0613"), "{bind}");
+        assert!(gaps_at(&found, c).is_empty(), "{bind}: {:?}", found.gaps);
+    }
+    for bind in [
+        "router.post(\"/chat\", controller.chat.bind({ requestOptions: { path: \"https://gateway.example.com/v1/chat/completions\" } }));",
+        "router.post(\"/chat\", controller.chat);",
+        "const other = new ChatController();\nrouter.post(\"/chat\", controller.chat.bind(other));",
+    ] {
+        let found = usages(&controller(bind));
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(c.routing, Routing::Unknown, "{bind}");
+        assert!(
+            gaps_at(&found, c).contains(&"ambiguous_client/endpoint_option".to_string()),
+            "{bind}: {:?}",
+            found.gaps
+        );
+    }
+    // A class component binding its handler in the constructor.
+    let component = format!(
+        "{OPENAI}const client = new OpenAI({{ dangerouslyAllowBrowser: true, apiKey: \"x\" }});
+export class Chat {{
+  private requestOptions = {{ timeout: 20_000 }};
+  constructor() {{
+    this.send = this.send.bind(this);
+  }}
+  async send() {{
+    return client.chat.completions.create({{ model: \"gpt-4-0613\", messages: [] }}, this.requestOptions);
+  }}
+}}
+"
+    );
+    assert_eq!(create_route(&component), (Routing::OpenaiDirect, vec![]));
+}
+
+#[test]
+fn request_options_written_under_other_keys_stay_read() {
+    // `options.signal = req.signal` cannot add a `path`, `defaultBaseURL`,
+    // `fetch` or `middleware`; a write of one of those, or under a key
+    // known only at run time, can.
+    let handler = |writes: &str| {
+        format!(
+            "{OPENAI}const client = new OpenAI();
+export async function POST(req: Request) {{
+  const options: OpenAI.RequestOptions = {{ timeout: 30_000 }};
+{writes}
+  return client.chat.completions.create({{ model: \"gpt-4-0613\", messages: [] }}, options);
+}}
+"
+        )
+    };
+    for writes in [
+        "  if (req.signal) options.signal = req.signal;",
+        "  options.headers = { \"x-request-id\": \"1\" };\n  options.maxRetries = 0;",
+        "  (options.headers as any)[\"x-trace\"] = \"1\";",
+        "  delete options.timeout;",
+    ] {
+        let source = handler(writes);
+        assert_eq!(
+            create_route(&source),
+            (Routing::OpenaiDirect, vec![]),
+            "{writes}"
+        );
+    }
+    for writes in [
+        "  options.path = \"https://gateway.example.com/v1/chat/completions\";",
+        "  options.__proto__ = { path: \"https://gateway.example.com/v1/chat/completions\" };",
+        "  options[\"defaultBaseURL\"] = \"https://gateway.example.com\";",
+        "  for (const [k, v] of Object.entries(overrides)) options[k] = v;",
+        "  (options as any)[key] = value;",
+        "  Object.assign(options, { signal: req.signal });",
+    ] {
+        let source = handler(writes);
+        assert_eq!(
+            create_route(&source),
+            (
+                Routing::Unknown,
+                vec!["ambiguous_client/endpoint_option".to_string()]
+            ),
+            "{writes}"
+        );
+    }
+}
+
+#[test]
+fn frozen_request_options_are_read() {
+    let ask = |options: &str| {
+        format!(
+            "const OpenAI = require(\"openai\");
+const client = new OpenAI();
+const REQUEST_OPTIONS = {options};
+exports.ask = (q) => client.chat.completions.create({{ model: \"gpt-4-0613\", messages: [{{ role: \"user\", content: q }}] }}, REQUEST_OPTIONS);
+"
+        )
+    };
+    let found = usages_js(&ask("Object.freeze({ timeout: 30000, maxRetries: 2 })"));
+    let c = call(&found, "client.chat.completions.create");
+    assert_eq!(c.routing, Routing::OpenaiDirect);
+    assert!(gaps_at(&found, c).is_empty(), "{:?}", found.gaps);
+    for options in [
+        "Object.freeze({ path: \"https://gateway.example.com/v1/chat/completions\" })",
+        "Object.freeze(...[{ timeout: 1 }])",
+        "Object.freeze(loadOptions())",
+        "freeze({ timeout: 1 })",
+    ] {
+        let found = usages_js(&ask(options));
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(c.routing, Routing::Unknown, "{options}");
+    }
+}
+
+#[test]
+fn request_options_reached_through_a_conditional_or_a_same_file_function_are_read() {
+    // A name used as one side of a conditional passed to the request, a
+    // same-file helper's returned literal, and a non-exported wrapper's
+    // parameter (every call of it is in the file) are read.
+    let file = |body: &str| format!("{OPENAI}const client = new OpenAI();\n{body}\n");
+    let create = "client.chat.completions.create({ model: \"gpt-4-0613\", messages: [] }";
+    for body in [
+        format!("const base = {{ timeout: 30_000 }};\nexport async function ask(signal?: AbortSignal) {{\n  return {create}, signal ? {{ ...base, signal }} : base);\n}}"),
+        format!("const base = {{ timeout: 30_000 }};\nexport async function ask(signal?: AbortSignal) {{\n  return {create}, signal && base);\n}}"),
+        format!("function requestOptions(req: Request) {{\n  return {{ signal: req.signal, timeout: 60_000 }};\n}}\nexport async function POST(req: Request) {{\n  return {create}, requestOptions(req));\n}}"),
+        format!("const requestOptions = (req: Request) => ({{ signal: req.signal }});\nexport async function POST(req: Request) {{\n  return {create}, requestOptions(req));\n}}"),
+        format!("function load(slow: boolean) {{ if (slow) {{ const t = 120_000; return {{ timeout: t }}; }} return; }}\nexport async function POST() {{\n  return {create}, load(!!process.env.SLOW));\n}}"),
+        format!("function complete(prompt: string, options?: OpenAI.RequestOptions) {{\n  return {create}, options);\n}}\nexport const ask = (p: string) => complete(p, {{ timeout: 1 }});\nexport const fast = (p: string) => complete(p);"),
+        format!("function complete(prompt: string, options = {{ timeout: 1 }}) {{\n  return {create}, options);\n}}\nexport const ask = (p: string) => complete(p, undefined);"),
+    ] {
+        let source = file(&body);
+        assert_eq!(
+            create_route(&source),
+            (Routing::OpenaiDirect, vec![]),
+            "{source}"
+        );
+    }
+    for body in [
+        // Another module may call it, or pass another value.
+        format!("export function complete(prompt: string, options?: OpenAI.RequestOptions) {{\n  return {create}, options);\n}}"),
+        format!("function complete(prompt: string, options?: OpenAI.RequestOptions) {{\n  return {create}, options);\n}}\nexport const ask = complete;"),
+        format!("function complete(prompt: string, options?: any) {{\n  return {create}, options);\n}}\nexport const ask = (p: string, o: any) => complete(p, o);"),
+        format!("function complete(prompt: string, options?: any) {{\n  return {create}, options);\n}}\nexport const ask = (p: string) => complete(p, {{ path: \"https://gateway.example.com/v1/chat/completions\" }});"),
+        // The helper returns something it cannot read, or may be replaced.
+        format!("function requestOptions(o: any) {{ return {{ ...o }}; }}\nexport async function POST(o: any) {{\n  return {create}, requestOptions(o));\n}}"),
+        format!("let requestOptions = () => ({{ timeout: 1 }});\nexport function swap(f: any) {{ requestOptions = f; }}\nexport async function POST() {{\n  return {create}, requestOptions());\n}}"),
+        format!("function requestOptions() {{ return {{ fetch: proxy }}; }}\nexport async function POST() {{\n  return {create}, requestOptions());\n}}"),
+        // The name used as a side is passed elsewhere too.
+        format!("const base: any = {{ timeout: 30_000 }};\nconfigure(base);\nexport async function ask(signal?: AbortSignal) {{\n  return {create}, signal ? {{ ...base, signal }} : base);\n}}"),
+    ] {
+        let source = file(&body);
+        let (routing, gaps) = create_route(&source);
+        assert_eq!(routing, Routing::Unknown, "{source}");
+        assert_eq!(gaps, vec!["ambiguous_client/endpoint_option"], "{source}");
+    }
+}
+
+#[test]
+fn module_exports_reached_through_module_itself_may_be_a_client() {
+    // `module` aliased, or written reflectively, may set `module.exports`
+    // to the client; a `baseURL` written through `module.exports` is then
+    // the client's.
+    let file = |setup: &str| {
+        format!(
+            "const OpenAI = require(\"openai\");
+const client = new OpenAI();
+{setup}
+module.exports.baseURL = \"https://gw.example.com/v1\";
+client.chat.completions.create({{ model: \"gpt-4-0613\", messages: [] }});
+"
+        )
+    };
+    for setup in [
+        "const m = module;\nm.exports = client;",
+        "Object.assign(module, { exports: client });",
+        "Reflect.set(module, \"exports\", client);",
+        "module[process.argv[2]] = client;",
+    ] {
+        let found = usages_js(&file(setup));
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(c.routing, Routing::Unknown, "{setup}");
+    }
+    // A member of `module` read or written by name leaves the export alone.
+    for setup in [
+        "if (module.hot) module.hot.accept();",
+        "if (typeof module === \"object\") console.log(module.id);",
+        "require.main === module && main();",
+    ] {
+        let found = usages_js(&file(setup));
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(
+            c.routing,
+            Routing::OpenaiDirect,
+            "{setup}: {:?}",
+            found.gaps
+        );
+    }
+}
+
+#[test]
+fn global_keys_from_in_file_callers_and_literal_loops_are_read() {
+    // A key that is a parameter of a function every call of which is in the
+    // file, or a loop variable over a literal's keys or an array literal,
+    // is read through what those give it.
+    let request = "client.chat.completions.create({ model: \"gpt-4o\", messages: [] });";
+    let many = format!(
+        "const many = {{ {} }};\nfor (const name of Object.keys(many)) (globalThis as any)[name] = 1;",
+        (0..300).map(|i| format!("k{i}: {i}")).collect::<Vec<_>>().join(", ")
+    );
+    for write in [
+        "function singleton<T>(name: string, make: () => T): T {\n  const g = globalThis as any;\n  return (g[name] ??= make());\n}\nexport const cache = singleton(\"cache\", () => new Map());\nexport const db = singleton(\"db\", () => ({}));",
+        "function setGlobal(k = \"__app\", v: unknown = 1) { (globalThis as any)[k] = v; }\nsetGlobal();\nsetGlobal(undefined, 2);",
+        "const polyfills: Record<string, unknown> = { TextEncoder, TextDecoder };\nfor (const name of Object.keys(polyfills)) {\n  if (!(globalThis as any)[name]) (globalThis as any)[name] = polyfills[name];\n}",
+        "const browserGlobals = { ResizeObserver: class {}, IntersectionObserver: class {} };\nfor (const [key, value] of Object.entries(browserGlobals)) {\n  Object.defineProperty(globalThis, key, { value, writable: true });\n}",
+        "for (const name of [\"ResizeObserver\", \"matchMedia\"]) (window as any)[name] = vi.fn();",
+        "const stubs = { ResizeObserver: class {}, IntersectionObserver: class {} };\nfor (const [name, impl] of Object.entries(stubs)) vi.stubGlobal(name, impl);",
+    ] {
+        let source = format!("{OPENAI}const client = new OpenAI();\n{write}\n{request}");
+        assert_eq!(
+            create_route(&source),
+            (Routing::OpenaiDirect, vec![]),
+            "{write}"
+        );
+    }
+    for write in [
+        "function singleton<T>(name: string, make: () => T): T {\n  const g = globalThis as any;\n  return (g[name] ??= make());\n}\nexport const f = singleton(\"fetch\", () => proxy);",
+        "export function singleton(name: string, v: unknown) { (globalThis as any)[name] = v; }",
+        "function setGlobal(k = \"fetch\", v: unknown = 1) { (globalThis as any)[k] = v; }\nsetGlobal();",
+        "const polyfills = { TextEncoder, fetch: proxy };\nfor (const name of Object.keys(polyfills)) (globalThis as any)[name] = (polyfills as any)[name];",
+        "const polyfills: any = { TextEncoder };\npolyfills.fetch = proxy;\nfor (const name of Object.keys(polyfills)) (globalThis as any)[name] = polyfills[name];",
+        "const polyfills: any = { TextEncoder };\nextend(polyfills);\nfor (const name of Object.keys(polyfills)) (globalThis as any)[name] = polyfills[name];",
+        "export const polyfills: any = { TextEncoder };\nexport function install() { for (const name of Object.keys(polyfills)) (globalThis as any)[name] = polyfills[name]; }",
+        "for (const name of [\"ResizeObserver\", ...extra]) (window as any)[name] = vi.fn();",
+        "for (const name in polyfills) (globalThis as any)[name] = polyfills[name];",
+        // More keys than are read.
+        many.as_str(),
+    ] {
+        let source = format!("{OPENAI}const client = new OpenAI();\n{write}\n{request}");
+        assert_eq!(
+            create_route(&source),
+            (
+                Routing::Unknown,
+                vec!["ambiguous_client/global_fetch".to_string()]
+            ),
+            "{write}"
+        );
+    }
+}
+
+#[test]
+fn many_class_properties_read_as_request_options_are_linear() {
+    // One class with many fields and many properties its constructor
+    // writes, and requests whose options spread many of them or read one
+    // as the model: each lookup reads only the writes of its own name.
+    let props = 15_000;
+    let mut source = with_client("class Q {");
+    for j in 0..props {
+        source.push_str(&format!("  a{j} = {{}};\n  m{j} = \"gpt-4-0613\";\n"));
+    }
+    source.push_str("  constructor() {\n");
+    for j in 0..props {
+        source.push_str(&format!("    this.b{j} = {{}};\n"));
+    }
+    source.push_str("  }\n  run() {\n");
+    for start in (0..props).step_by(250) {
+        let spreads: Vec<String> = (start..start + 250)
+            .map(|j| format!("...this.a{j}, ...this.b{j}"))
+            .collect();
+        source.push_str(&format!(
+            "    client.chat.completions.create({{ model: this.m{start}, messages: [] }}, {{ {} }});\n",
+            spreads.join(", ")
+        ));
+    }
+    source.push_str("  }\n}\n");
+    let found = usages_within(&source, 10);
+    assert_eq!(found.calls.len(), props / 250);
+}
+
+#[test]
+fn a_rebound_this_gap_names_its_cause_and_the_value_origin() {
+    // Read in a method that may run with another `this`, the gaps say why
+    // and where, and the value keeps its own origin.
+    let found = usages(
+        "import Anthropic from \"@anthropic-ai/sdk\";
+
+class Bot {
+  private client = new Anthropic();
+  private model = \"claude-3-5-sonnet-20241022\";
+  ask() {
+    return this.client.messages.create({ model: this.model, max_tokens: 10, messages: [] });
+  }
+  run(m: \"ask\") { return this[m].call({ model: \"claude-sonnet-5-5\" }); }
+}
+new Bot().run(\"ask\");
+",
+    );
+    let c = call(&found, "this.client.messages.create");
+    let model = found
+        .gaps
+        .iter()
+        .find(|g| g.reason == "attribute")
+        .unwrap_or_else(|| panic!("{:?}", found.gaps));
+    assert_eq!(
+        model.detail,
+        "`model` for `this.client.messages.create` is `this.model`, read in a method that may run with another object as `this` (a computed member run with another `this` at line 9), so it may be that object's property; its value is captured with origin `class_constant`"
+    );
+    let client = found
+        .gaps
+        .iter()
+        .find(|g| g.reason == "multiple_assignments")
+        .unwrap_or_else(|| panic!("{:?}", found.gaps));
+    assert_eq!(
+        client.detail,
+        "the receiver of `this.client.messages.create` is read through `this` in a method that may run with another object as `this` (a computed member run with another `this` at line 9), so it may be another object's"
+    );
+    assert!(gaps_at(&found, c).contains(&"ambiguous_client/multiple_assignments".to_string()));
+    // A method name read without being called, named at its first read.
+    let found = usages(
+        "import Anthropic from \"@anthropic-ai/sdk\";
+class Bot {
+  private client = new Anthropic();
+  ask() {
+    return this.client.messages.create({ model: \"claude-3-5-sonnet-20241022\", max_tokens: 10, messages: [] });
+  }
+}
+const bot = new Bot();
+setTimeout(bot.ask, 10);
+",
+    );
+    let client = found
+        .gaps
+        .iter()
+        .find(|g| g.reason == "multiple_assignments")
+        .unwrap_or_else(|| panic!("{:?}", found.gaps));
+    assert!(
+        client
+            .detail
+            .contains("(a method read without being called at line 9)"),
+        "{}",
+        client.detail
+    );
+}
+
+#[test]
+fn a_class_property_written_more_often_than_read_holds_any_request_options() {
+    // Past the writes read per property, a later one may hold a `path`.
+    let mut writes = String::new();
+    for i in 0..70 {
+        writes.push_str(&format!(
+            "    if (n === {i}) this.requestOptions = {{ timeout: {i} }};\n"
+        ));
+    }
+    let source = format!(
+        "{OPENAI}const client = new OpenAI();
+export class Svc {{
+  private requestOptions: any;
+  constructor(n: number) {{
+{writes}    if (n < 0) this.requestOptions = {{ path: \"https://gateway.example.com/v1/chat/completions\" }};
+  }}
+  ask() {{
+    return client.chat.completions.create({{ model: \"gpt-4-0613\", messages: [] }}, this.requestOptions);
+  }}
+}}
+"
+    );
+    assert_eq!(
+        create_route(&source),
+        (
+            Routing::Unknown,
+            vec!["ambiguous_client/endpoint_option".to_string()]
+        )
+    );
 }

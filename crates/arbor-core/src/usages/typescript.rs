@@ -677,11 +677,18 @@ fn base_url_key(family: Family) -> Option<&'static str> {
     }
 }
 
-/// Whether a client sends its requests to a provider's own API through the
-/// global `fetch`, as every SDK does unless the client is given its own:
-/// not openai v3's `OpenAIApi` (`v3`), which sends through axios.
-fn through_global_fetch(routing: Routing, v3: bool) -> bool {
-    !v3 && matches!(
+/// Whether a client with `routing` sends its requests to the provider's own
+/// API (OpenAI or Anthropic), as far as its options show.
+fn is_direct(routing: Routing) -> bool {
+    matches!(routing, Routing::OpenaiDirect | Routing::AnthropicDirect)
+}
+
+/// Whether a client sends its requests to a provider's own API, through
+/// the global `fetch` (as every SDK does unless the client is given its
+/// own) or, for openai v3's `OpenAIApi`, through axios and Node's `http`
+/// module.
+fn to_provider(routing: Routing) -> bool {
+    matches!(
         routing,
         Routing::OpenaiDirect
             | Routing::AnthropicDirect
@@ -812,14 +819,94 @@ const MODULE_MOCKS: &[&str] = &[
     "mock.module",
 ];
 
-/// Test-runner calls that replace an object's method (`vi.spyOn(client.chat.completions, "create")`).
-const METHOD_MOCKS: &[&str] = &[
-    "jest.spyOn",
-    "vi.spyOn",
-    "sinon.stub",
-    "sinon.replace",
-    "mock.method",
+/// Test-double calls that replace the property their second argument names
+/// on the object their first argument is (`vi.spyOn(client.chat.completions,
+/// "create")`, `sinon.stub(globalThis, "fetch")`), by the callee's last
+/// name, with the fewest arguments each takes. The runner may be reached any
+/// way: `jest.spyOn`, a sinon sandbox's `stub`, `const sinon =
+/// require("sinon")`, `stub` imported from sinon or Deno's std, Bun's
+/// `spyOn`, `const { vi } = import.meta.vitest`. `replace` takes the
+/// replacement too, so `String#replace` is not one.
+const METHOD_DOUBLES: &[(&str, usize)] = &[
+    ("spyOn", 2),
+    ("stub", 2),
+    ("replace", 3),
+    ("replaceGetter", 3),
+    ("replaceSetter", 3),
+    ("replaceProperty", 3),
 ];
+
+/// node:test's test doubles, called on a `mock` (`mock.method(o, "k")`,
+/// `t.mock.method`, `test.mock.property`).
+const NODE_MOCK_DOUBLES: &[&str] = &["method", "getter", "setter", "property"];
+
+/// Packages that intercept or replace the global `fetch` once loaded and set
+/// up (`nock(...)`, msw's `setupServer(...).listen()`,
+/// `fetchMock.enableMocks()`): a direct client in a file that loads one may
+/// never reach the provider.
+const FETCH_INTERCEPTORS: &[&str] = &[
+    "nock",
+    "msw",
+    "@mswjs/interceptors",
+    "fetch-mock",
+    "fetch-mock-jest",
+    "@fetch-mock/jest",
+    "@fetch-mock/vitest",
+    "jest-fetch-mock",
+    "vitest-fetch-mock",
+];
+
+/// Packages of [`FETCH_INTERCEPTORS`] that also intercept Node's `http`
+/// module (nock, msw's `setupServer` from `msw/node`, the `ClientRequest`
+/// interceptor of `@mswjs/interceptors`), which axios sends through: an
+/// openai v3 `OpenAIApi` in a file that loads one may never reach the
+/// provider either. undici's dispatchers and the `fetch` mocks reach only
+/// `fetch`.
+const HTTP_INTERCEPTORS: &[&str] = &["nock", "msw", "@mswjs/interceptors"];
+
+/// The package of [`FETCH_INTERCEPTORS`] an import specifier names
+/// (`msw/node`, `npm:nock@14`).
+fn fetch_interceptor(source: &str) -> Option<&str> {
+    let spec = source.trim();
+    let spec = spec.strip_prefix("npm:").unwrap_or(spec);
+    split_package(spec)
+        .map(|(name, _)| name)
+        .filter(|name| FETCH_INTERCEPTORS.contains(name))
+}
+
+/// The name a callee ends in: `stub` for `sinon.stub`, `sandbox.stub` and a
+/// bare `stub`.
+fn callee_name<'t>(function: Node<'t>, src: &'t str) -> Option<&'t str> {
+    let function = unwrap_expression(function);
+    match function.kind() {
+        "identifier" => src.get(function.byte_range()),
+        "member_expression" => src.get(function.child_by_field_name("property")?.byte_range()),
+        _ => None,
+    }
+}
+
+/// Whether a call is a test double of [`METHOD_DOUBLES`] or
+/// [`NODE_MOCK_DOUBLES`], with the arguments it takes.
+fn method_double(call: Node<'_>, function: Node<'_>, src: &str) -> bool {
+    let Some(name) = callee_name(function, src) else {
+        return false;
+    };
+    let fewest = match METHOD_DOUBLES.iter().find(|(double, _)| *double == name) {
+        Some((_, fewest)) => *fewest,
+        None if NODE_MOCK_DOUBLES.contains(&name) => {
+            let on_mock = unwrap_expression(function)
+                .child_by_field_name("object")
+                .filter(|_| unwrap_expression(function).kind() == "member_expression")
+                .and_then(|object| callee_name(object, src));
+            if on_mock != Some("mock") {
+                return false;
+            }
+            2
+        }
+        None => return false,
+    };
+    nth_argument(call, fewest - 1).is_some()
+}
 
 /// Builtins that write properties of their first argument under names known
 /// only at run time.
@@ -866,6 +953,10 @@ struct Client {
     site: Option<usize>,
     /// Assigned more than one kind of client, or a client and something else.
     ambiguous: bool,
+    /// Read through `this` in a method that may run with another object as
+    /// `this` (rule 5), by the feature that may make it so: it may be
+    /// another object's (`ambiguous` is set).
+    rebound: Option<Feature>,
     /// Why the routing may not hold at a call, reported there as an
     /// `ambiguous_client` gap.
     caveat: Option<ClientCaveat>,
@@ -896,9 +987,110 @@ enum ClientCaveat {
     Dynamic(Feature),
     /// A client built with an option that may send its requests to another
     /// endpoint (Gemini's `vertexai`, `enterprise` or `httpOptions`,
-    /// OpenAI's `dataResidency`, a spread), or a legacy Gemini model given
-    /// `requestOptions` with a `baseUrl`.
+    /// OpenAI's `dataResidency`, a custom `fetch`, Anthropic's `middleware`,
+    /// openai v3's own axios instance, a spread), or a legacy Gemini model
+    /// given `requestOptions` with a `baseUrl`.
     EndpointOption { option: &'static str },
+    /// One request given options that may send it to another endpoint
+    /// ([`Ctx::request_endpoint`]): the client keeps its own route.
+    RequestOption { option: &'static str },
+    /// The file may replace or intercept the global `fetch` the client
+    /// sends its requests through.
+    GlobalFetch(Feature),
+    /// The file may intercept Node's `http` module, which openai v3's
+    /// `OpenAIApi` sends its requests through by axios.
+    HttpIntercept(Feature),
+}
+
+/// A client option that may send the client's requests to another endpoint
+/// ([`Ctx::endpoint_option`], [`Ctx::request_hook`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hook {
+    /// One is written, or the options do not show whether one is.
+    Set(&'static str),
+    /// None is written, but a spread or computed key may hold a custom
+    /// `fetch` or `middleware`: a gap only where the `baseURL` rule leaves
+    /// none.
+    Maybe(&'static str),
+}
+
+/// Keys of an options object that may send a request to another endpoint:
+/// a custom `fetch` and Anthropic's `middleware` (a client's or one
+/// request's), and one request's `path` and `defaultBaseURL`.
+const HOOK_KEYS: &[&str] = &["fetch", "middleware", "path", "defaultBaseURL"];
+
+/// Steps one read of an options object for [`HOOK_KEYS`] takes (each
+/// expression, entry and name it follows), and how deep it follows them:
+/// past either, the object may hold any of them.
+const MAX_HOOK_STEPS: usize = 1024;
+const MAX_HOOK_DEPTH: u32 = 32;
+
+/// Entries setting a key of [`HOOK_KEYS`] kept per read; past that, the
+/// object may hold any of them.
+const MAX_HOOK_SETS: usize = 16;
+
+/// What an options object may hold among [`HOOK_KEYS`], over every value
+/// the file gives it ([`Ctx::hook_scan`]).
+#[derive(Debug, Default)]
+struct HookScan<'t> {
+    /// The entries that set one of them.
+    set: Vec<HookEntry<'t>>,
+    /// Some value it may hold cannot be read, and may set any of them.
+    unread: bool,
+}
+
+/// An entry of an options object that sets a key of [`HOOK_KEYS`].
+#[derive(Debug, Clone, Copy)]
+struct HookEntry<'t> {
+    key: &'static str,
+    value: Node<'t>,
+    scope: usize,
+    /// The object is reached through a name or property whose containers
+    /// may be shared, so the value may be changed after it is written.
+    shared: bool,
+}
+
+impl<'t> HookScan<'t> {
+    fn unread() -> Self {
+        HookScan {
+            set: Vec::new(),
+            unread: true,
+        }
+    }
+
+    fn push(&mut self, entry: HookEntry<'t>) {
+        if self.set.len() < MAX_HOOK_SETS {
+            self.set.push(entry);
+        } else {
+            self.unread = true;
+        }
+    }
+
+    /// Adds what another value the object may be holds.
+    fn add(&mut self, other: &HookScan<'t>, shared: bool) {
+        self.unread |= other.unread;
+        for entry in &other.set {
+            self.push(HookEntry {
+                shared: entry.shared || shared,
+                ..*entry
+            });
+        }
+    }
+
+    fn sets<'s>(&'s self, key: &'s str) -> impl Iterator<Item = &'s HookEntry<'t>> + 's {
+        self.set.iter().filter(move |entry| entry.key == key)
+    }
+}
+
+/// What a [`HookScan`] is kept for: an object literal, a name, or a class
+/// property (class, static, read through `this`, name).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum HookKey<'t> {
+    Object(usize),
+    Binding(usize),
+    Prop(usize, bool, bool, &'t str),
+    /// What a same-file function returns.
+    Returns(usize),
 }
 
 /// A JavaScript feature that can change what a name, property or the
@@ -1078,6 +1270,11 @@ struct Unresolved {
     /// any) are every value it can take: `Some(true)` only when every
     /// source added was complete.
     complete: Option<bool>,
+    /// For `unseen_callers`, the call under a name known only at run time
+    /// that may reach the method (`this[kind](...)`), when that is why; for
+    /// `attribute`, what may run the method reading `this` with another
+    /// object (`setTimeout(bot.ask)`, `this[m].call(other)`).
+    by_key: Option<Feature>,
 }
 
 impl Unresolved {
@@ -1088,6 +1285,7 @@ impl Unresolved {
             via: None,
             candidates: Vec::new(),
             complete: None,
+            by_key: None,
         }
     }
 
@@ -1135,7 +1333,7 @@ impl Unresolved {
             "splat" => "possibly passed through a spread or an options object built elsewhere",
             "parameter_overridden" => "a parameter that in-file callers set to other values",
             "unseen_callers" => {
-                "a parameter of a function that is passed, stored or exported in a way this file does not show, so callers may set it"
+                "a parameter of a function that is passed, stored or exported, or called under a name known only at run time, so callers this file does not show may set it"
             }
             "credential" => {
                 "credential-shaped (a secret-like name or value), so it is never captured"
@@ -1394,6 +1592,12 @@ struct Uses<'t> {
     /// A property is written or deleted (`x.k = v`, `delete x.k`,
     /// `Object.assign(x, ...)`).
     mutated: bool,
+    /// One may be written that sends a request elsewhere: a key of
+    /// [`HOOK_KEYS`], its prototype (`x.__proto__ = p`) or a key known only
+    /// at run time on the value itself (`x.path = p`, `x[k] = v`,
+    /// `Object.assign(x, ...)`). `x.signal = s` and `x.headers.k = v` are
+    /// not.
+    hook_mutated: bool,
     /// A member is called (`x.k(...)`), which may write into it through
     /// `this`.
     member_calls: bool,
@@ -1446,6 +1650,7 @@ struct NameRef<'t> {
     scope: usize,
     name: &'t str,
     kind: RefKind<'t>,
+    line: u32,
 }
 
 #[derive(Clone)]
@@ -1508,6 +1713,12 @@ struct Func<'t> {
     /// (`function retry() { ... retry() }`): its calls are calls too.
     inner: Option<usize>,
     method: Option<Method<'t>>,
+    /// What it returns: each `return` in its own body (not a nested
+    /// function's) with the scope it is in, `None` for a bare `return;`,
+    /// or an arrow function's expression body. At most
+    /// [`MAX_WRITES_READ`]; `returns_cut` is set past that.
+    returns: Vec<(Option<Node<'t>>, usize)>,
+    returns_cut: bool,
 }
 
 /// A class member function.
@@ -1530,12 +1741,14 @@ struct Class<'t> {
     subclasses: Vec<usize>,
     /// A decorator on the class or one of its members.
     decorated: Option<Feature>,
-    fields: Vec<PropWrite<'t>>,
-    static_fields: Vec<PropWrite<'t>>,
+    /// Field declarations, by property name, as are the writes below, so
+    /// that a lookup reads only the writes of its name.
+    fields: PropWrites<'t>,
+    static_fields: PropWrites<'t>,
     /// `this.x = ...` in the class's instance code, `this.x = ...` in its
     /// static code and `Class.x = ...` by name.
-    writes: Vec<PropWrite<'t>>,
-    static_writes: Vec<PropWrite<'t>>,
+    writes: PropWrites<'t>,
+    static_writes: PropWrites<'t>,
     /// Method, getter and setter names: a property with one of these names
     /// is not a plain value.
     members: HashSet<&'t str>,
@@ -1562,13 +1775,29 @@ struct PropWrite<'t> {
     value: Option<Node<'t>>,
     /// Declared without an initializer (`model?: string;`).
     bare: bool,
+    /// A write into the object the property holds (`this.opts.timeout =
+    /// ms`), not of the property itself: `value` is `None`.
+    nested: bool,
     scope: usize,
+}
+
+/// A class's property writes of one kind, by property name.
+type PropWrites<'t> = HashMap<&'t str, Vec<PropWrite<'t>>>;
+
+/// Records a property write under its name.
+fn push_prop<'t>(writes: &mut PropWrites<'t>, write: PropWrite<'t>) {
+    writes.entry(write.name).or_default().push(write);
 }
 
 /// A member write found in the walk, decided once names are bound.
 struct MemberWrite<'t> {
     scope: usize,
     root: MemberRoot<'t>,
+    /// The expression the chain starts at (`(globalThis as any)`).
+    object: Node<'t>,
+    /// The index of the last link, when it is a subscript known only at
+    /// run time (`name` in `globalThis[name] = v`).
+    key: Option<Node<'t>>,
     path: Rc<[Step<'t>]>,
     value: Option<Node<'t>>,
     line: u32,
@@ -1610,6 +1839,11 @@ struct Frame<'t> {
     /// Inside wrappers that keep its value (`(x)`, `x!`, `x as T`, `x
     /// satisfies T`, `<T>x`): where the outermost one's value goes.
     wrapped: Option<Context<'t>>,
+    /// A branch of a conditional or an operand of `??`, `||` or `&&`
+    /// (`create(body, signal ? { ...base, signal } : base)`), also inside
+    /// wrappers: where the outermost such expression's value goes, which
+    /// is where this value may go.
+    flow: Option<Context<'t>>,
 }
 
 /// Where a node's value goes: its parent, the field it is in there, and
@@ -1671,15 +1905,36 @@ struct Ctx<'t> {
     method_calls: HashMap<&'t str, Vec<(Node<'t>, usize)>>,
     /// Member names read without being called (`x.ask` passed or stored,
     /// or a key of an object pattern: `const { ask } = bot`).
-    method_refs: HashSet<&'t str>,
+    method_refs: HashMap<&'t str, Feature>,
+    /// Member names read, bound or called through `call`, `apply` or
+    /// `bind` with the object they are read off as `this` (`this.m.bind(
+    /// this)`, `ctrl.m.bind(ctrl)`, `x.m.call(x, ...)`): their calls are
+    /// not all seen, but they run with that object, as a call `x.m(...)`
+    /// does.
+    method_bound: HashSet<&'t str>,
     /// A method may be called under a name known only at run time
     /// (`this[kind](...)`, as Python's `getattr(self, kind)(...)`): no
     /// method's calls are all seen.
-    method_calls_wild: bool,
+    method_calls_wild: Option<Feature>,
     /// A method may be read under a name known only at run time and run
     /// with another `this` (`this[m].call(other)`, `const { [m]: f } =
     /// this`): as if every method name were in `method_refs`.
-    method_refs_wild: bool,
+    method_refs_wild: Option<Feature>,
+    /// Member names whose value, read off any object (`this.opts`,
+    /// `svc.opts`, `Svc.OPTS`), may reach code that changes what it holds,
+    /// so that a class property of that name is not read for request
+    /// options ([`Ctx::hook_prop`]): the value aliased, returned, stored,
+    /// wrapped or passed through a conditional, written into under a key
+    /// of [`HOOK_KEYS`] or one known only at run time (`(this.opts as
+    /// any)[k] = v`), a member of it called, or the name a key of an
+    /// object pattern (`const { opts } = this`).
+    prop_handed: HashSet<&'t str>,
+    /// Calls such a value is passed to (`f(this.opts)`), by member name, at
+    /// most [`MAX_WRITES_READ`] each (past that the name is handed out):
+    /// any but an SDK request or a read-only builtin may change it.
+    prop_passed: HashMap<&'t str, Vec<(Node<'t>, usize)>>,
+    /// [`Ctx::prop_passed_harmless`], by member name.
+    prop_passed_memo: HashMap<&'t str, bool>,
     /// SDK imports found in the walk: the binding, written specifier, the
     /// imported name and its span, recorded once names are bound.
     pending_imports: Vec<(usize, String, Option<String>, Node<'t>)>,
@@ -1740,9 +1995,18 @@ struct Ctx<'t> {
     rerouted_any: Option<Feature>,
     /// A `fetch` written on an object the file cannot identify, which may be
     /// the global one every SDK request goes through (`globalThis.fetch =
-    /// ...`, `fetch = ...`): a direct client may send its requests
+    /// ...`, `fetch = ...`, a test double of it), the global object written
+    /// under a name known only at run time, or a library that intercepts
+    /// `fetch` set up in the file: a direct client may send its requests
     /// elsewhere.
-    global_fetch: bool,
+    global_fetch: Option<Feature>,
+    /// A package that also intercepts Node's `http` module loaded in the
+    /// file ([`HTTP_INTERCEPTORS`]): openai v3 sends through it.
+    http_intercept: Option<Feature>,
+    /// The file replaces `module.exports` with something other than an
+    /// object literal (`module.exports = client`): a property written on
+    /// it may be a client's.
+    exports_replaced: bool,
     /// `setDefaultBaseUrls(...)` from `@google/genai`.
     genai_base_urls: Option<Feature>,
     /// A legacy Gemini request, or an `@google/genai` one, passes options that
@@ -1774,6 +2038,17 @@ struct Ctx<'t> {
     /// Object literals read (by node id), and those being read.
     object_memo: HashMap<usize, Rc<ObjectRead<'t>>>,
     reading_objects: HashSet<usize>,
+    /// What options objects, names and class properties may hold among
+    /// [`HOOK_KEYS`], kept once read; the names and properties being read,
+    /// innermost last; the lowest of them the read in progress has met
+    /// inside its own values (`usize::MAX` for none), which is not kept
+    /// until that one is; and the steps the current read has left.
+    hook_memo: HashMap<HookKey<'t>, Rc<HookScan<'t>>>,
+    hook_stack: Vec<HookKey<'t>>,
+    hook_low: usize,
+    hook_steps: usize,
+    /// Function scopes, and the function (an index into `funcs`) each is.
+    scope_func: HashMap<usize, usize>,
     /// Child buffer reused by the walk.
     kids: Vec<(Node<'t>, Option<&'static str>)>,
 
@@ -1827,9 +2102,13 @@ impl<'t> Ctx<'t> {
             member_values: Vec::new(),
             member_writes: Vec::new(),
             method_calls: HashMap::new(),
-            method_refs: HashSet::new(),
-            method_calls_wild: false,
-            method_refs_wild: false,
+            method_refs: HashMap::new(),
+            method_bound: HashSet::new(),
+            method_calls_wild: None,
+            method_refs_wild: None,
+            prop_handed: HashSet::new(),
+            prop_passed: HashMap::new(),
+            prop_passed_memo: HashMap::new(),
             pending_imports: Vec::new(),
             outside_writes: HashMap::new(),
             outside_wild: None,
@@ -1852,7 +2131,9 @@ impl<'t> Ctx<'t> {
             sdk_patched: HashMap::new(),
             rerouted: HashSet::new(),
             rerouted_any: None,
-            global_fetch: false,
+            global_fetch: None,
+            http_intercept: None,
+            exports_replaced: false,
             genai_base_urls: None,
             legacy_request_endpoint: None,
             genai_request_endpoint: None,
@@ -1872,6 +2153,11 @@ impl<'t> Ctx<'t> {
             factory_nodes: HashMap::new(),
             object_memo: HashMap::new(),
             reading_objects: HashSet::new(),
+            hook_memo: HashMap::new(),
+            hook_stack: Vec::new(),
+            hook_low: usize::MAX,
+            hook_steps: 0,
+            scope_func: HashMap::new(),
             kids: Vec::new(),
             out: FileUsages::new(file, language),
         }
@@ -2001,6 +2287,7 @@ impl<'t> Ctx<'t> {
             owner: None,
             class: None,
             wrapped: None,
+            flow: None,
         }];
         while let Some(frame) = stack.pop() {
             self.visit(frame, &mut stack);
@@ -2044,6 +2331,37 @@ impl<'t> Ctx<'t> {
             // One step per frame: a wrapper's own context, already past
             // the wrappers around it.
             wrapped: keeps_value(f.node.kind()).then(|| f.context()),
+            // One step per frame too: a wrapper passes its own on, and a
+            // conditional or logical operator its own or, outermost, where
+            // its value goes.
+            flow: match f.node.kind() {
+                kind if keeps_value(kind) => f.flow,
+                "ternary_expression" if field != Some("condition") => {
+                    Some(f.flow.unwrap_or_else(|| f.context()))
+                }
+                "binary_expression" if matches!(operator(f.node), Some("??" | "||" | "&&")) => {
+                    Some(f.flow.unwrap_or_else(|| f.context()))
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// What passing a value where `dest` says (the destination of a
+    /// conditional or logical operator it is part of, [`Frame::flow`]) does
+    /// with it: an argument of a call, a spread into a literal, or anything
+    /// else, which may store or hand it out.
+    fn flow_use(&self, dest: Context<'t>) -> RefKind<'t> {
+        let grand = dest.grand.map(|g| g.kind());
+        match dest.parent.map(|p| p.kind()) {
+            Some("arguments") if matches!(grand, Some("call_expression" | "new_expression")) => {
+                dest.grand.map_or(RefKind::Escape, RefKind::Arg)
+            }
+            Some("spread_element") if matches!(grand, Some("object" | "array")) => RefKind::Spread(
+                dest.grand
+                    .and_then(|g| self.literal_calls.get(&g.id()).copied()),
+            ),
+            _ => RefKind::Escape,
         }
     }
 
@@ -2106,7 +2424,13 @@ impl<'t> Ctx<'t> {
 
     fn add_ref(&mut self, scope: usize, node: Node<'t>, kind: RefKind<'t>) {
         let name = self.text(node);
-        self.refs.push(NameRef { scope, name, kind });
+        let line = self.line(node);
+        self.refs.push(NameRef {
+            scope,
+            name,
+            kind,
+            line,
+        });
     }
 
     fn visit(&mut self, f: Frame<'t>, stack: &mut Vec<Frame<'t>>) {
@@ -2220,6 +2544,10 @@ impl<'t> Ctx<'t> {
                 self.push_children(stack, &f, f.scope);
             }
             "member_expression" | "subscript_expression" => self.chain(&f, stack),
+            "return_statement" => {
+                self.note_return(node, f.scope);
+                self.push_children(stack, &f, f.scope);
+            }
             "identifier" => self.name_use(&f),
             "shorthand_property_identifier" => self.add_ref(f.scope, node, RefKind::Escape),
             // Only the expression of `x as T`, `x satisfies T`, `<T>x`.
@@ -2450,7 +2778,9 @@ impl<'t> Ctx<'t> {
     /// A key of an object pattern reads that member without calling it
     /// (`const { ask } = this` is `this.ask` read): the method may then be
     /// called from anywhere, with any `this`. A computed key that is not a
-    /// literal may read any member.
+    /// literal may read any member, of whatever object the pattern
+    /// destructures, as Python's `getattr(obj, name)` with a run-time name
+    /// counts file-wide (`const { [key]: _, ...rest } = record` too).
     fn pattern_key(&mut self, key: Node<'t>) {
         let name = match key.kind() {
             "shorthand_property_identifier_pattern" => Some(self.text(key)),
@@ -2462,9 +2792,21 @@ impl<'t> Ctx<'t> {
         };
         match name {
             Some(name) => {
-                self.method_refs.insert(name);
+                let line = self.line(key);
+                self.method_refs.entry(name).or_insert(Feature {
+                    what: "a key of an object pattern",
+                    line,
+                });
+                // `const { opts } = this` hands out what `this.opts` holds.
+                self.prop_handed.insert(name);
             }
-            None => self.method_refs_wild = true,
+            None => {
+                let line = self.line(key);
+                self.method_refs_wild.get_or_insert(Feature {
+                    what: "a computed key in an object pattern",
+                    line,
+                });
+            }
         }
     }
 
@@ -2560,11 +2902,34 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// A `return` of the function whose own body it is in.
+    fn note_return(&mut self, node: Node<'t>, scope: usize) {
+        let Some(&func) = self.scope_func.get(&self.scopes[scope].var_scope) else {
+            return;
+        };
+        let mut cursor = node.walk();
+        let value = node
+            .named_children(&mut cursor)
+            .find(|c| c.kind() != "comment");
+        let func = &mut self.funcs[func];
+        if func.returns.len() < MAX_WRITES_READ {
+            func.returns.push((value, scope));
+        } else {
+            func.returns_cut = true;
+        }
+    }
+
     /// An identifier used as a value.
     fn name_use(&mut self, f: &Frame<'t>) {
         let node = f.node;
         let parent = f.parent;
         let grand = f.grand.map(|g| g.kind());
+        // `create(body, signal ? { ...base, signal } : base)` passes `base`.
+        if let Some(dest) = f.flow {
+            let kind = self.flow_use(dest);
+            self.add_ref(f.scope, node, kind);
+            return;
+        }
         let kind = match (parent.map(|p| p.kind()), f.field) {
             (Some("call_expression"), Some("function")) => RefKind::Call(parent.unwrap_or(node)),
             (Some("new_expression"), Some("constructor")) => RefKind::New(parent.unwrap_or(node)),
@@ -2599,6 +2964,15 @@ impl<'t> Ctx<'t> {
 
     fn import_statement(&mut self, node: Node<'t>, scope: usize) {
         let type_only = has_token(node, "type") || has_token(node, "typeof");
+        // `import nock from "nock"`, `import { setupServer } from "msw/node"`.
+        let interceptor = node
+            .child_by_field_name("source")
+            .and_then(|source| string_content(source, self.src))
+            .and_then(fetch_interceptor);
+        if let Some(package) = interceptor.filter(|_| !type_only) {
+            let line = self.line(node);
+            self.note_interceptor(package, line);
+        }
         let mut cursor = node.walk();
         let children: Vec<Node<'t>> = node.named_children(&mut cursor).collect();
         for child in children {
@@ -2952,6 +3326,8 @@ impl<'t> Ctx<'t> {
             binding: None,
             inner: None,
             method: self.field_methods.get(&node.id()).copied(),
+            returns: Vec::new(),
+            returns_cut: false,
         });
         if declaration {
             if let Some(name) = name {
@@ -2973,9 +3349,17 @@ impl<'t> Ctx<'t> {
             self.cut(node);
             return;
         };
+        self.scope_func.insert(scope, func);
         if kind == "arrow_function" {
             self.scopes[scope].arrow = true;
             self.scopes[scope].method = self.scopes[f.scope].method;
+            // `() => ({ timeout })` returns its body.
+            if let Some(body) = node
+                .child_by_field_name("body")
+                .filter(|b| b.kind() != "statement_block")
+            {
+                self.funcs[func].returns.push((Some(body), scope));
+            }
         }
         // A function value of an object literal: its `this` is the object.
         if kind == "function_expression" && f.parent.is_some_and(|p| p.kind() == "pair") {
@@ -3146,11 +3530,14 @@ impl<'t> Ctx<'t> {
             binding: None,
             inner: None,
             method,
+            returns: Vec::new(),
+            returns_cut: false,
         });
         let Some(scope) = self.new_scope(ScopeKind::Function, f.scope, this, symbol) else {
             self.cut(node);
             return;
         };
+        self.scope_func.insert(scope, func);
         if method.is_some() {
             self.scopes[scope].method = Some(func);
         } else if let Some(object) = f.parent.filter(|p| p.kind() == "object") {
@@ -3180,12 +3567,16 @@ impl<'t> Ctx<'t> {
                 if let (true, Some(pattern)) = (property, pattern) {
                     if pattern.kind() == "identifier" {
                         let name = self.text(pattern);
-                        self.classes[class].writes.push(PropWrite {
-                            name,
-                            value: Some(pattern),
-                            bare: false,
-                            scope,
-                        });
+                        push_prop(
+                            &mut self.classes[class].writes,
+                            PropWrite {
+                                name,
+                                value: Some(pattern),
+                                bare: false,
+                                nested: false,
+                                scope,
+                            },
+                        );
                     }
                 }
             }
@@ -3219,10 +3610,10 @@ impl<'t> Ctx<'t> {
             base_class: None,
             subclasses: Vec::new(),
             decorated,
-            fields: Vec::new(),
-            static_fields: Vec::new(),
-            writes: Vec::new(),
-            static_writes: Vec::new(),
+            fields: HashMap::new(),
+            static_fields: HashMap::new(),
+            writes: HashMap::new(),
+            static_writes: HashMap::new(),
             members: HashSet::new(),
             static_members: HashSet::new(),
             wild: None,
@@ -3443,12 +3834,13 @@ impl<'t> Ctx<'t> {
             name,
             value,
             bare: value.is_none(),
+            nested: false,
             scope,
         };
         if is_static {
-            self.classes[class].static_fields.push(write);
+            push_prop(&mut self.classes[class].static_fields, write);
         } else {
-            self.classes[class].fields.push(write);
+            push_prop(&mut self.classes[class].fields, write);
         }
         if let Some(value) = value {
             if matches!(value.kind(), "arrow_function" | "function_expression") {
@@ -3741,6 +4133,7 @@ impl<'t> Ctx<'t> {
         let mut links: Vec<Step<'t>> = Vec::new();
         let mut current = top;
         let mut innermost = top;
+        let mut last_key = None;
         // The last member or subscript link: past any `!` below it, the next
         // node down is its object.
         let mut object_of = top;
@@ -3758,6 +4151,9 @@ impl<'t> Ctx<'t> {
                     match index.and_then(|i| static_key(i, self.src)) {
                         Some(key) => links.push(Step::Key(key)),
                         None => {
+                            if links.is_empty() {
+                                last_key = index;
+                            }
                             links.push(Step::Other);
                             if let Some(index) = index {
                                 let link = self.child(f, current, f.scope, None);
@@ -3842,16 +4238,39 @@ impl<'t> Ctx<'t> {
         let rebound = f.wrapped.is_some()
             && context.field == Some("object")
             && context.parent.is_some_and(|p| self.rebinds(p));
+        let rebound_wild = Feature {
+            what: "a computed member run with another `this`",
+            line,
+        };
         match path.as_ref() {
+            // `this.send.bind(this)`, `ctrl.chat.bind(ctrl)`: run with the
+            // object it is read off, as `ctrl.chat(...)` is.
+            [Step::Key(method), Step::Key("call" | "apply" | "bind")]
+                if matches!(does, ChainUse::Call)
+                    && context
+                        .parent
+                        .and_then(first_argument)
+                        .is_some_and(|this| self.same_receiver(root, this)) =>
+            {
+                self.method_bound.insert(method);
+            }
             [.., Step::Key(method), Step::Key("call" | "apply" | "bind")] => {
-                self.method_refs.insert(method);
+                self.method_refs.entry(method).or_insert(Feature {
+                    what: "a method run through `call`, `apply` or `bind`",
+                    line,
+                });
             }
             [.., Step::Other, Step::Key("call" | "apply" | "bind")] => {
-                self.method_refs_wild = true;
+                self.method_refs_wild.get_or_insert(rebound_wild);
             }
-            [.., Step::Other] if rebound => self.method_refs_wild = true,
+            [.., Step::Other] if rebound => {
+                self.method_refs_wild.get_or_insert(rebound_wild);
+            }
             [.., Step::Other] if matches!(does, ChainUse::Call) => {
-                self.method_calls_wild = true;
+                self.method_calls_wild.get_or_insert(Feature {
+                    what: "a call through a computed member",
+                    line,
+                });
             }
             _ => {}
         }
@@ -3866,11 +4285,15 @@ impl<'t> Ctx<'t> {
                     }
                 }
                 ChainUse::Read | ChainUse::Arg(_) | ChainUse::Spread(_) => {
-                    self.method_refs.insert(last);
+                    self.method_refs.entry(last).or_insert(Feature {
+                        what: "a method read without being called",
+                        line,
+                    });
                 }
                 ChainUse::Write { .. } => {}
             }
         }
+        self.note_prop_uses(&path, does, context, f.flow, f.scope);
         let rooted = matches!(root.kind(), "identifier" | "this");
         if rooted && !path.is_empty() && matches!(does, ChainUse::Read | ChainUse::Arg(_)) {
             self.member_values.push((top, f.scope));
@@ -3885,11 +4308,106 @@ impl<'t> Ctx<'t> {
             self.member_writes.push(MemberWrite {
                 scope,
                 root,
+                object: current,
+                key: last_key,
                 path,
                 value,
                 line,
             });
         }
+    }
+
+    /// Whether `this_arg`, given as `this` to a method read off `root`
+    /// (`root.m.bind(this_arg)`), is that same object: `this` for `this` or
+    /// `super`, or the same name, which in one expression is one binding.
+    fn same_receiver(&self, root: Node<'t>, this_arg: Node<'t>) -> bool {
+        let this_arg = unwrap_expression(this_arg);
+        match (root.kind(), this_arg.kind()) {
+            ("this" | "super", "this") => true,
+            ("identifier", "identifier") => self.text(root) == self.text(this_arg),
+            _ => false,
+        }
+    }
+
+    /// Records, for each member name on a chain, whether the value read
+    /// there may reach code that changes what it holds
+    /// ([`Ctx::prop_handed`], [`Ctx::prop_passed`]). Reading on past it
+    /// (`x.opts.timeout`, `x.opts.headers.y = v`) writes nothing on it; a
+    /// write on it under a static key other than [`HOOK_KEYS`]
+    /// (`this.opts.signal = s`), a spread of it, a replacement of the
+    /// property (read where it is written) and a use that only reads it
+    /// (`!x.opts`, `x.opts === y`, a condition) change nothing it holds.
+    fn note_prop_uses(
+        &mut self,
+        path: &[Step<'t>],
+        does: ChainUse<'t>,
+        context: Context<'t>,
+        flow: Option<Context<'t>>,
+        scope: usize,
+    ) {
+        for (at, step) in path.iter().enumerate() {
+            let Step::Key(name) = *step else {
+                continue;
+            };
+            let handed = match path.get(at + 1) {
+                // `x.opts.__proto__.path = p` writes what it inherits.
+                Some(next) if at + 2 < path.len() => {
+                    matches!(does, ChainUse::Write { .. }) && *next == Step::Key("__proto__")
+                }
+                Some(next) => match does {
+                    ChainUse::Write { .. } => match next {
+                        Step::Key(key) => HOOK_KEYS.contains(key) || *key == "__proto__",
+                        _ => true,
+                    },
+                    // `x.opts.set(k, v)` may write it through `this`.
+                    ChainUse::Call => true,
+                    ChainUse::Read | ChainUse::Arg(_) | ChainUse::Spread(_) => false,
+                },
+                // `signal ? this.opts : undefined` goes where the
+                // conditional's value goes.
+                None => match flow.map(|dest| self.flow_use(dest)) {
+                    Some(RefKind::Arg(call)) => self.note_prop_passed(name, call, scope),
+                    Some(RefKind::Spread(_)) => false,
+                    Some(_) => true,
+                    None => match does {
+                        ChainUse::Arg(call) => self.note_prop_passed(name, call, scope),
+                        ChainUse::Spread(_) | ChainUse::Write { .. } => false,
+                        ChainUse::Call => true,
+                        ChainUse::Read => !reads_only(context),
+                    },
+                },
+            };
+            if handed {
+                self.prop_handed.insert(name);
+            }
+        }
+    }
+
+    /// Whether every call a member's value is passed to
+    /// ([`Ctx::prop_passed`]) is an SDK request or a read-only builtin,
+    /// decided once per name: every class's property of that name shares
+    /// the answer.
+    fn prop_passed_harmless(&mut self, name: &'t str) -> bool {
+        if let Some(&harmless) = self.prop_passed_memo.get(name) {
+            return harmless;
+        }
+        let passed = self.prop_passed.get(name).cloned().unwrap_or_default();
+        let harmless = passed
+            .into_iter()
+            .all(|(call, scope)| self.harmless_call(call, scope));
+        self.prop_passed_memo.insert(name, harmless);
+        harmless
+    }
+
+    /// Records a call a member's value is passed to; past
+    /// [`MAX_WRITES_READ`] of them, the value counts as handed out.
+    fn note_prop_passed(&mut self, name: &'t str, call: Node<'t>, scope: usize) -> bool {
+        let passed = self.prop_passed.entry(name).or_default();
+        let room = passed.len() < MAX_WRITES_READ;
+        if room {
+            passed.push((call, scope));
+        }
+        !room
     }
 
     /// Whether `member` reads `call`, `apply` or `bind` off its object.
@@ -4061,6 +4579,25 @@ fn keeps_value(kind: &str) -> bool {
     )
 }
 
+/// Whether a value used where `context` says is only read there: an
+/// operand of a unary operator (`!x`, `typeof x`) or of one that gives a
+/// primitive (`x === y`, `"k" in x`), a condition, or a statement of its
+/// own.
+fn reads_only(context: Context<'_>) -> bool {
+    let Some(parent) = context.parent else {
+        return true;
+    };
+    match parent.kind() {
+        "unary_expression" => !is_delete(parent),
+        "binary_expression" => !matches!(operator(parent), Some("??" | "||" | "&&")),
+        "ternary_expression" | "if_statement" | "while_statement" | "do_statement" => {
+            context.field == Some("condition")
+        }
+        "expression_statement" => true,
+        _ => false,
+    }
+}
+
 /// `expr` without the parentheses around it.
 fn unwrap_parens(mut node: Node<'_>) -> Node<'_> {
     for _ in 0..16 {
@@ -4115,6 +4652,31 @@ fn string_content<'t>(node: Node<'t>, src: &'t str) -> Option<&'t str> {
         Some(fragment) => src.get(fragment.byte_range()),
         None => Some(""),
     }
+}
+
+/// Whether a template literal may read `text` at run time: with no
+/// substitution, when it is `text`; with some, when its fixed text before
+/// the first and after the last fit around `text`. An escape sequence may
+/// read as anything.
+fn template_may_be(template: Node<'_>, src: &str, text: &str) -> bool {
+    let mut cursor = template.walk();
+    let children: Vec<Node<'_>> = template.named_children(&mut cursor).collect();
+    if children.iter().any(|c| c.kind() == "escape_sequence") {
+        return true;
+    }
+    let substitutions: Vec<&Node<'_>> = children
+        .iter()
+        .filter(|c| c.kind() == "template_substitution")
+        .collect();
+    let (Some(first), Some(last)) = (substitutions.first(), substitutions.last()) else {
+        return string_content(template, src).is_none_or(|t| t == text);
+    };
+    let prefix = src.get(template.start_byte() + 1..first.start_byte());
+    let suffix = src.get(last.end_byte()..template.end_byte().saturating_sub(1));
+    let (Some(prefix), Some(suffix)) = (prefix, suffix) else {
+        return true;
+    };
+    prefix.len() + suffix.len() <= text.len() && text.starts_with(prefix) && text.ends_with(suffix)
 }
 
 /// A computed key that is a plain string or number literal (`x["model"]`,
@@ -4177,7 +4739,28 @@ impl<'t> Ctx<'t> {
                 }
                 // `fetch = custom`: the global `fetch` replaced.
                 if r.name == "fetch" && matches!(r.kind, RefKind::Write(_)) {
-                    self.global_fetch = true;
+                    self.global_fetch.get_or_insert(Feature {
+                        what: "the global `fetch` assigned",
+                        line: r.line,
+                    });
+                }
+                // `exports = client`: what `exports.x = ...` writes is no
+                // longer the module's export object.
+                if matches!(r.name, "exports" | "module") && matches!(r.kind, RefKind::Write(_)) {
+                    self.exports_replaced = true;
+                }
+                // `const m = module; m.exports = client`, `Object.assign(module,
+                // { exports: client })`, `module[k] = v`: `module.exports` may
+                // be replaced where the file does not show it. Only a member
+                // read or written by name (`module.exports`, `module.hot`)
+                // and `typeof module` leave it.
+                if r.name == "module" {
+                    let by_name = match &r.kind {
+                        RefKind::Member { path, .. } => matches!(path.first(), Some(Step::Key(_))),
+                        RefKind::Harmless | RefKind::Write(_) => true,
+                        _ => false,
+                    };
+                    self.exports_replaced |= !by_name;
                 }
                 // `arguments[0] = x`, or `arguments` passed or stored.
                 if r.name == "arguments"
@@ -4226,6 +4809,11 @@ impl<'t> Ctx<'t> {
                         }
                         ChainUse::Write { .. } => {
                             uses.mutated = true;
+                            uses.hook_mutated |= match path.as_ref() {
+                                [Step::Key(key)] => HOOK_KEYS.contains(key) || *key == "__proto__",
+                                [_] | [Step::Key("__proto__"), ..] => true,
+                                _ => false,
+                            };
                             None
                         }
                         // `{ ...CONFIG.openai }` copies the entries, and
@@ -4571,6 +5159,15 @@ impl<'t> Ctx<'t> {
     /// written on other objects.
     fn settle_member_writes(&mut self) {
         let writes = std::mem::take(&mut self.member_writes);
+        // `exports = client` rebinds the name a later `exports.baseURL =
+        // ...` writes through.
+        self.exports_replaced |= writes.iter().any(|w| {
+            matches!(w.root, MemberRoot::Name("module"))
+                && w.path.as_ref() == [Step::Key("exports")]
+                && self.lookup(w.scope, "module").is_none()
+                && w.value
+                    .is_none_or(|v| unwrap_expression(v).kind() != "object")
+        });
         for w in &writes {
             let feature = |what| Feature { what, line: w.line };
             let first = w.path.first().copied();
@@ -4593,12 +5190,13 @@ impl<'t> Ctx<'t> {
                                 name,
                                 value: if w.path.len() == 1 { w.value } else { None },
                                 bare: false,
+                                nested: w.path.len() > 1,
                                 scope: w.scope,
                             };
                             if is_static {
-                                self.classes[class].static_writes.push(write);
+                                push_prop(&mut self.classes[class].static_writes, write);
                             } else {
-                                self.classes[class].writes.push(write);
+                                push_prop(&mut self.classes[class].writes, write);
                             }
                         }
                         _ => {
@@ -4641,12 +5239,16 @@ impl<'t> Ctx<'t> {
                         if let (Some(class), 1, Some(Step::Key(prop))) =
                             (self.bindings[b].class, w.path.len(), first)
                         {
-                            self.classes[class].static_writes.push(PropWrite {
-                                name: prop,
-                                value: w.value,
-                                bare: false,
-                                scope: w.scope,
-                            });
+                            push_prop(
+                                &mut self.classes[class].static_writes,
+                                PropWrite {
+                                    name: prop,
+                                    value: w.value,
+                                    bare: false,
+                                    nested: false,
+                                    scope: w.scope,
+                                },
+                            );
                             continue;
                         }
                         // A property of an object literal is not a class
@@ -4789,12 +5391,30 @@ impl<'t> Ctx<'t> {
     /// no class property of that name is read through `this` with no gap.
     fn note_property_write(&mut self, w: &MemberWrite<'t>) {
         let Some(Step::Key(name)) = w.path.last().copied() else {
+            // `globalThis[name] = v`: the global object written under a name
+            // known only at run time, which may be `fetch`.
+            if let [Step::Other] = w.path.as_ref() {
+                if self.global_fetch.is_none()
+                    && self.is_global_object(w.object, w.scope)
+                    && w.key.is_none_or(|key| self.may_name_fetch(key, w.scope))
+                {
+                    self.global_fetch.get_or_insert(Feature {
+                        what: "a write of the global object under a name known only at run time",
+                        line: w.line,
+                    });
+                }
+            }
             return;
         };
         self.outside_writes.entry(name).or_insert(Feature {
             what: "a write of a property of that name on another object",
             line: w.line,
         });
+        // `exports.fetch = ...`: an export of the module, not a global or a
+        // client's.
+        if self.on_module_exports(w) {
+            return;
+        }
         if BASE_URL_PROPS.contains(&name) {
             self.rerouted_any.get_or_insert(Feature {
                 what: "a `baseURL` written on an object Arbor cannot identify",
@@ -4803,8 +5423,307 @@ impl<'t> Ctx<'t> {
         }
         // `globalThis.fetch = ...`, `(window as any).fetch = ...`.
         if name == "fetch" {
-            self.global_fetch = true;
+            self.global_fetch.get_or_insert(Feature {
+                what: "a `fetch` written on an object Arbor cannot identify",
+                line: w.line,
+            });
         }
+    }
+
+    /// Whether a property write is an export of a CommonJS module:
+    /// `exports.x = ...` or `module.exports.x = ...`, where the file does not
+    /// bind `exports` or `module` nor replace `module.exports` with what
+    /// may be a client.
+    fn on_module_exports(&self, w: &MemberWrite<'t>) -> bool {
+        let root = match (w.root, w.path.as_ref()) {
+            (MemberRoot::Name("exports"), [_]) => "exports",
+            (MemberRoot::Name("module"), [Step::Key("exports"), _]) => "module",
+            _ => return false,
+        };
+        !self.exports_replaced && self.lookup(w.scope, root).is_none()
+    }
+
+    /// Whether `name` in `scope` may be the global object: `globalThis`,
+    /// `global`, `window` or `self` where the file does not bind the name,
+    /// or a `const`, `let` or `var` given one, in its declaration or an
+    /// assignment (`const g: any = globalThis`, `let g = {}; g =
+    /// globalThis`), followed at most four names deep.
+    fn names_global_object(&self, name: &str, scope: usize, depth: u32, steps: &mut u32) -> bool {
+        let Some(b) = self.lookup(scope, name) else {
+            return matches!(name, "globalThis" | "global" | "window" | "self");
+        };
+        let binding = &self.bindings[b];
+        if depth >= 4
+            || !matches!(binding.decl, Decl::Const | Decl::Let | Decl::Var)
+            || binding.each
+            || !binding.path.is_empty()
+        {
+            return false;
+        }
+        let init = binding.init.map(|init| (init, binding.init_scope));
+        let writes = binding
+            .writes
+            .iter()
+            .filter_map(|w| w.value.map(|v| (v, w.scope)));
+        init.into_iter()
+            .chain(writes)
+            .any(|(value, value_scope)| self.global_object_at(value, value_scope, depth + 1, steps))
+    }
+
+    /// Whether a key written on the global object under a name known only
+    /// at run time may be `"fetch"`, or the symbol undici keeps the global
+    /// dispatcher of `fetch` under (`Symbol.for("undici.globalDispatcher.1")`,
+    /// which `setGlobalDispatcher` writes): not a symbol of its own
+    /// (`Symbol("k")`, `Symbol.iterator`), the registry's symbol for a name
+    /// written in the file that is not undici's (`Symbol.for("app.cache")`),
+    /// a number, or a string the file shows is not `"fetch"`: a literal, a
+    /// template literal whose fixed text rules it out (`` `__${app}_started`
+    /// ``), either side of a conditional, or a `const`, `let` or `var` every
+    /// value of which is one (`const KEY = "__cache"`). Read in at most 16
+    /// steps; past them, it may be.
+    fn may_name_fetch(&self, key: Node<'t>, scope: usize) -> bool {
+        let mut steps = 16;
+        self.may_name_fetch_at(key, scope, &mut steps)
+    }
+
+    fn may_name_fetch_at(&self, key: Node<'t>, scope: usize, steps: &mut u32) -> bool {
+        if *steps == 0 {
+            return true;
+        }
+        *steps -= 1;
+        let key = unwrap_expression(key);
+        // `Symbol` where the file does not bind the name.
+        let symbol = |node: Option<Node<'t>>| {
+            node.map(unwrap_expression).is_some_and(|n| {
+                n.kind() == "identifier"
+                    && self.text(n) == "Symbol"
+                    && self.lookup(scope, "Symbol").is_none()
+            })
+        };
+        match key.kind() {
+            "string" => string_content(key, self.src).is_none_or(|k| k == "fetch"),
+            "template_string" => template_may_be(key, self.src, "fetch"),
+            "number" => false,
+            "call_expression" => {
+                let function = key.child_by_field_name("function").map(unwrap_expression);
+                // `Symbol("k")`: a symbol no other code holds.
+                if symbol(function) {
+                    return false;
+                }
+                // `Symbol.for("k")`: the registry's, which undici's is too.
+                let registered = function.is_some_and(|f| {
+                    f.kind() == "member_expression"
+                        && symbol(f.child_by_field_name("object"))
+                        && f.child_by_field_name("property")
+                            .is_some_and(|p| self.text(p) == "for")
+                });
+                !registered
+                    || first_argument(key)
+                        .map(unwrap_expression)
+                        .and_then(|name| string_content(name, self.src))
+                        .is_none_or(|name| name.starts_with("undici"))
+            }
+            // `Symbol.iterator`.
+            "member_expression" => !symbol(key.child_by_field_name("object")),
+            "ternary_expression" => ["consequence", "alternative"].iter().any(|field| {
+                key.child_by_field_name(field)
+                    .is_none_or(|side| self.may_name_fetch_at(side, scope, steps))
+            }),
+            "identifier" => {
+                let Some(b) = self.lookup(scope, self.text(key)) else {
+                    return true;
+                };
+                let binding = &self.bindings[b];
+                if binding.writes_cut {
+                    return true;
+                }
+                let writes = binding.writes.iter().map(|w| w.value.map(|v| (v, w.scope)));
+                let written = writes
+                    .clone()
+                    .any(|value| value.is_none_or(|(v, s)| self.may_name_fetch_at(v, s, steps)));
+                if written {
+                    return true;
+                }
+                match binding.decl {
+                    Decl::Const | Decl::Let | Decl::Var if binding.each => {
+                        self.loop_key_may_name_fetch(b, steps)
+                    }
+                    Decl::Param => self.param_key_may_name_fetch(b, steps),
+                    Decl::Const | Decl::Let | Decl::Var if binding.path.is_empty() => {
+                        match binding.init {
+                            Some(init) => self.may_name_fetch_at(init, binding.init_scope, steps),
+                            None => binding.writes.is_empty(),
+                        }
+                    }
+                    _ => true,
+                }
+            }
+            _ => true,
+        }
+    }
+
+    /// For a loop variable used as a key on the global object
+    /// ([`Ctx::may_name_fetch`]): whether a key it runs over may be
+    /// `"fetch"`. Not when it runs over the items of an array literal that
+    /// are all such keys (`for (const k of ["TextEncoder", "URL"])`), or the
+    /// keys of an object literal the file only reads, none of them `fetch`
+    /// (`for (const k of Object.keys(polyfills))`, `for (const [k, v] of
+    /// Object.entries(polyfills))`).
+    fn loop_key_may_name_fetch(&self, b: usize, steps: &mut u32) -> bool {
+        let binding = &self.bindings[b];
+        let Some(iterable) = binding.init.map(unwrap_expression) else {
+            return true;
+        };
+        let scope = binding.init_scope;
+        match (iterable.kind(), binding.path.as_ref()) {
+            ("array", []) => {
+                let mut cursor = iterable.walk();
+                let mut items = iterable
+                    .named_children(&mut cursor)
+                    .filter(|i| i.kind() != "comment");
+                items.any(|item| {
+                    item.kind() == "spread_element" || self.may_name_fetch_at(item, scope, steps)
+                })
+            }
+            ("call_expression", path) => {
+                let callee = iterable
+                    .child_by_field_name("function")
+                    .and_then(|f| self.global_callee(f, scope));
+                let keys = matches!(
+                    (callee.as_deref(), path),
+                    (Some("Object.keys" | "Object.getOwnPropertyNames"), [])
+                        | (Some("Object.entries"), [Step::Index(0)])
+                );
+                !keys
+                    || first_argument(iterable)
+                        .is_none_or(|object| self.keys_may_name_fetch(object, scope))
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether `object` may have a key `"fetch"`: anything but an object
+    /// literal of static keys, written where it is used or bound to a name
+    /// that is only read (not exported, passed to nothing but read-only
+    /// builtins), none of whose keys is `fetch`. A literal of more than
+    /// [`MAX_CALLERS_READ`] entries is not read, and may.
+    fn keys_may_name_fetch(&self, object: Node<'t>, scope: usize) -> bool {
+        let mut object = unwrap_expression(object);
+        if object.kind() == "identifier" {
+            let Some(b) = self.lookup(scope, self.text(object)) else {
+                return true;
+            };
+            let uses = &self.bindings[b].uses;
+            let read_only = !uses.escapes
+                && !uses.exported
+                && !uses.mutated
+                && !uses.member_calls
+                && !uses.passed_cut
+                && uses.passed_to.iter().all(|(call, call_scope)| {
+                    call.child_by_field_name("function")
+                        .and_then(|f| self.global_callee(f, *call_scope))
+                        .is_some_and(|callee| READ_ONLY_CALLS.contains(&callee.as_str()))
+                });
+            match self.object_literal_of(b) {
+                Some((literal, _)) if read_only => object = unwrap_expression(literal),
+                _ => return true,
+            }
+        }
+        if object.kind() != "object" || object.named_child_count() > MAX_CALLERS_READ {
+            return true;
+        }
+        let mut cursor = object.walk();
+        let mut entries = object.named_children(&mut cursor);
+        entries.any(|entry| {
+            let key = match entry.kind() {
+                "pair" => entry
+                    .child_by_field_name("key")
+                    .and_then(|k| match k.kind() {
+                        "computed_property_name" => {
+                            k.named_child(0).and_then(|i| static_key(i, self.src))
+                        }
+                        _ => self.member_name(k),
+                    }),
+                "shorthand_property_identifier" => Some(self.text(entry)),
+                "method_definition" => entry
+                    .child_by_field_name("name")
+                    .and_then(|n| self.member_name(n)),
+                "comment" => return false,
+                _ => None,
+            };
+            key.is_none_or(|key| key == "fetch")
+        })
+    }
+
+    /// For a parameter used as a key on the global object
+    /// ([`Ctx::may_name_fetch`]): whether a value its function's calls pass
+    /// (or its default, where one passes none) may be `"fetch"`, when every
+    /// call of the function is in the file (rule 6).
+    fn param_key_may_name_fetch(&self, b: usize, steps: &mut u32) -> bool {
+        let binding = &self.bindings[b];
+        let Some((func, index)) = binding.param else {
+            return true;
+        };
+        if !binding.path.is_empty() {
+            return true;
+        }
+        let callers = self.callers(func);
+        if !callers.complete {
+            return true;
+        }
+        callers.sites.iter().any(|&(call, call_scope)| {
+            match self.argument_at(call, call_scope, index) {
+                Argument::Expr(arg, arg_scope) => self.may_name_fetch_at(arg, arg_scope, steps),
+                Argument::Missing => binding.init.is_some_and(|default| {
+                    self.may_name_fetch_at(default, binding.init_scope, steps)
+                }),
+                Argument::Unknown => true,
+            }
+        })
+    }
+
+    /// Whether `expr` may be the global object
+    /// ([`Ctx::names_global_object`]), through casts and parentheses, one
+    /// of its names read off it (`globalThis.window`), or either side of a
+    /// conditional, `??`, `||` or `&&` (`(typeof window !== "undefined" ?
+    /// window : globalThis)`, `globalThis || window`). Read in at most 16
+    /// steps; past them, it is taken not to be.
+    fn is_global_object(&self, expr: Node<'t>, scope: usize) -> bool {
+        let mut steps = 16;
+        self.global_object_at(expr, scope, 0, &mut steps)
+    }
+
+    fn global_object_at(&self, expr: Node<'t>, scope: usize, depth: u32, steps: &mut u32) -> bool {
+        if *steps == 0 {
+            return false;
+        }
+        *steps -= 1;
+        let expr = unwrap_expression(expr);
+        let sides: &[&str] = match expr.kind() {
+            "identifier" => return self.names_global_object(self.text(expr), scope, depth, steps),
+            _ if depth >= 4 => return false,
+            "member_expression" => {
+                let (Some(object), Some(property)) = (
+                    expr.child_by_field_name("object"),
+                    expr.child_by_field_name("property"),
+                ) else {
+                    return false;
+                };
+                return matches!(
+                    self.text(property),
+                    "globalThis" | "global" | "window" | "self"
+                ) && self.global_object_at(object, scope, depth + 1, steps);
+            }
+            "ternary_expression" => &["consequence", "alternative"],
+            "binary_expression" if matches!(operator(expr), Some("??" | "||" | "&&")) => {
+                &["left", "right"]
+            }
+            _ => return false,
+        };
+        sides.iter().any(|field| {
+            expr.child_by_field_name(field)
+                .is_some_and(|side| self.global_object_at(side, scope, depth + 1, steps))
+        })
     }
 
     /// Calls that write what other lookups read: reflective writes
@@ -4875,6 +5794,7 @@ impl<'t> Ctx<'t> {
                     "identifier" => match self.lookup(*scope, self.text(target)) {
                         Some(b) => {
                             self.bindings[b].uses.mutated = true;
+                            self.bindings[b].uses.hook_mutated = true;
                             if let Some(class) = self.bindings[b].class {
                                 self.classes[class].static_wild.get_or_insert(Feature {
                                     what: "a reflective write of the class",
@@ -5069,62 +5989,132 @@ impl<'t> Ctx<'t> {
             let Some(function) = call.child_by_field_name("function") else {
                 continue;
             };
-            let Some(callee) = self.global_callee(function, *scope) else {
-                continue;
-            };
-            // `vi.stubGlobal("fetch", mock)`, or a name known only at run
-            // time: the global itself replaced.
-            if callee == "vi.stubGlobal" {
-                let name = first_argument(*call).map(unwrap_expression);
-                if name.is_none_or(|n| static_key(n, self.src).is_none_or(|k| k == "fetch")) {
-                    self.global_fetch = true;
-                }
+            let line = self.line(*call);
+            // `require("nock")`, `await import("msw/node")`.
+            if let Some(package) = self.loads_fetch_interceptor(*call, function, *scope) {
+                self.note_interceptor(package, line);
                 continue;
             }
-            let spy = METHOD_MOCKS.contains(&callee.as_str());
-            if !spy && !REFLECTIVE_WRITES.contains(&callee.as_str()) {
+            match callee_name(function, self.src) {
+                // `vi.stubGlobal("fetch", mock)`, or a name known only at run
+                // time: the global itself replaced. Read by the callee's last
+                // name, as the test doubles below are (`const { vi } =
+                // import.meta.vitest`).
+                Some("stubGlobal") if unwrap_expression(function).kind() == "member_expression" => {
+                    let name = first_argument(*call);
+                    if name.is_none_or(|n| self.may_name_fetch(n, *scope)) {
+                        self.global_fetch.get_or_insert(Feature {
+                            what: "a test double of the global `fetch`",
+                            line,
+                        });
+                    }
+                    continue;
+                }
+                // undici's global dispatcher, which the global `fetch` sends
+                // through, replaced by one that may answer requests itself
+                // (`setGlobalDispatcher(new MockAgent())`). An `Agent` or a
+                // proxy agent still reaches the host the request names.
+                Some("setGlobalDispatcher") => {
+                    let mut dispatcher = first_argument(*call).map(unwrap_expression);
+                    // `const agent = new Agent({ ... }); setGlobalDispatcher(agent)`.
+                    if let Some(name) = dispatcher.filter(|a| a.kind() == "identifier") {
+                        dispatcher = self.lookup(*scope, self.text(name)).and_then(|b| {
+                            let binding = &self.bindings[b];
+                            let once = matches!(binding.decl, Decl::Const | Decl::Let | Decl::Var)
+                                && binding.path.is_empty()
+                                && !binding.each
+                                && binding.writes.is_empty()
+                                && !binding.writes_cut;
+                            binding.init.filter(|_| once).map(unwrap_expression)
+                        });
+                    }
+                    let keeps_host = dispatcher
+                        .filter(|a| a.kind() == "new_expression")
+                        .and_then(|a| a.child_by_field_name("constructor"))
+                        .and_then(|c| callee_name(c, self.src))
+                        .is_some_and(|c| matches!(c, "Agent" | "ProxyAgent" | "EnvHttpProxyAgent"));
+                    if !keeps_host {
+                        self.global_fetch.get_or_insert(Feature {
+                            what: "a dispatcher for the global `fetch` that may answer requests itself",
+                            line,
+                        });
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            let callee = self.global_callee(function, *scope);
+            let reflective = callee.as_deref().filter(|c| REFLECTIVE_WRITES.contains(c));
+            let spy = reflective.is_none() && method_double(*call, function, self.src);
+            if !spy && reflective.is_none() {
                 continue;
             }
             let Some(target) = first_argument(*call) else {
                 continue;
             };
             let val = self.eval(target, *scope, 0);
-            let line = self.line(*call);
             let (true, Some(pkg)) = (val.is_tracked(), val.pkg()) else {
+                let known = !matches!(val, Val::Untracked(Origin::Placeholder));
+                let keys = reflective.and_then(|callee| self.reflective_keys(*call, callee));
                 // A `baseURL` written on an object that may be a client.
-                let keys = (!spy)
-                    .then(|| self.reflective_keys(*call, &callee))
-                    .flatten()
-                    .filter(|_| !matches!(val, Val::Untracked(Origin::Placeholder)))
-                    .unwrap_or_default();
-                if keys.iter().any(|k| BASE_URL_PROPS.contains(k)) {
+                let written = keys.as_deref().filter(|_| known).unwrap_or_default();
+                if written.iter().any(|k| BASE_URL_PROPS.contains(k)) {
                     self.rerouted_any.get_or_insert(Feature {
                         what: "a `baseURL` written on an object Arbor cannot identify",
                         line,
                     });
                 }
-                // `Object.assign(globalThis, { fetch })`, and a spy that
-                // replaces it (`jest.spyOn(globalThis, "fetch")`).
+                // `Object.assign(globalThis, { fetch })`, and a test double
+                // that replaces it (`jest.spyOn(globalThis, "fetch")`).
                 let spied = spy
                     .then(|| nth_argument(*call, 1))
                     .flatten()
-                    .and_then(|k| static_key(unwrap_expression(k), self.src))
-                    .filter(|_| !matches!(val, Val::Untracked(Origin::Placeholder)));
-                if keys.contains(&"fetch") || spied == Some("fetch") {
-                    self.global_fetch = true;
+                    .and_then(|k| static_key(unwrap_expression(k), self.src));
+                if known && (written.contains(&"fetch") || spied == Some("fetch")) {
+                    self.global_fetch.get_or_insert(Feature {
+                        what: if spy {
+                            "a test double of the global `fetch`"
+                        } else {
+                            "a reflective write of `fetch`"
+                        },
+                        line,
+                    });
+                }
+                // The global object written under names known only at run
+                // time (`Object.assign(globalThis, polyfills)`,
+                // `jest.spyOn(globalThis, key)`), which may be `fetch`: not
+                // a key the file shows is a symbol or another string.
+                let key = match reflective {
+                    None
+                    | Some(
+                        "Reflect.set"
+                        | "Object.defineProperty"
+                        | "Reflect.defineProperty"
+                        | "Reflect.deleteProperty",
+                    ) => nth_argument(*call, 1),
+                    Some(_) => None,
+                };
+                let unread = self.global_fetch.is_none()
+                    && (if spy { spied.is_none() } else { keys.is_none() })
+                    && key.is_none_or(|key| self.may_name_fetch(key, *scope));
+                if unread && self.is_global_object(target, *scope) {
+                    self.global_fetch.get_or_insert(Feature {
+                        what: "a write of the global object under a name known only at run time",
+                        line,
+                    });
                 }
                 continue;
             };
-            if spy {
+            let Some(callee) = reflective else {
                 self.sdk_patched.entry(pkg).or_insert(Feature {
                     what: "a test spy on an SDK object",
                     line,
                 });
                 continue;
-            }
+            };
             // `Object.assign(client, { baseURL })` re-routes the client;
             // settings change nothing; anything else replaces a member.
-            let keys = self.reflective_keys(*call, &callee);
+            let keys = self.reflective_keys(*call, callee);
             match (&val, &keys) {
                 (Val::Client { path, client }, Some(keys))
                     if path.is_empty()
@@ -5484,10 +6474,18 @@ impl<'t> Ctx<'t> {
             This::Static(class) => self.prop_val(class, true, name),
             This::Other => return Val::Untracked(Origin::Other),
         };
-        if self.this_rebound(scope) {
-            return combine(vec![val, Val::Untracked(Origin::Other)]);
+        let Some(rebound) = self.this_rebound(scope) else {
+            return val;
+        };
+        match val {
+            // Named with its cause where the call reports it.
+            Val::Client { mut client, path } => {
+                client.ambiguous = true;
+                client.rebound.get_or_insert(rebound);
+                Val::Client { client, path }
+            }
+            val => combine(vec![val, Val::Untracked(Origin::Other)]),
         }
-        val
     }
 
     /// Whether the method whose `this` the code in `scope` sees may run with
@@ -5495,16 +6493,22 @@ impl<'t> Ctx<'t> {
     /// (`setTimeout(bot.ask)`, `{ ask: bot.ask }`, `const { ask } = bot`),
     /// it is called through `call`, `apply` or `bind`, or the file does
     /// either under a name known only at run time (`this[m].call(other)`),
-    /// which never reaches a `#name`.
-    fn this_rebound(&self, scope: usize) -> bool {
-        self.scopes[scope]
+    /// which never reaches a `#name`: the first such use in the file, which
+    /// a gap names. Bound to the object it is read off (`x.m.bind(x)`), it
+    /// is not ([`Ctx::method_bound`]).
+    fn this_rebound(&self, scope: usize) -> Option<Feature> {
+        let m = self.scopes[scope]
             .method
             .and_then(|func| self.funcs[func].method)
-            .is_some_and(|m| {
-                !m.ctor
-                    && ((self.method_refs_wild && !m.name.starts_with('#'))
-                        || (!m.name.is_empty() && self.method_refs.contains(m.name)))
-            })
+            .filter(|m| !m.ctor)?;
+        let named = (!m.name.is_empty())
+            .then(|| self.method_refs.get(m.name).copied())
+            .flatten();
+        let wild = self.method_refs_wild.filter(|_| !m.name.starts_with('#'));
+        match (named, wild) {
+            (Some(a), Some(b)) => Some(if b.line < a.line { b } else { a }),
+            (a, b) => a.or(b),
+        }
     }
 
     /// What a class property holds: the one or more writes of it, combined.
@@ -5622,13 +6626,18 @@ impl<'t> Ctx<'t> {
             }
             // A field declared with no value in a subclass resets the
             // property to `undefined` after the base constructor ran.
+            // Only the writes of `name` are read, at most one past the bound
+            // of each kind, so a lookup costs the same however many
+            // properties the class has.
             let subclass = member != class && self.classes[member].base_class == Some(class);
-            for field in fields.iter().filter(|f| f.name == name) {
+            let fields = fields.get(name).into_iter().flatten();
+            for field in fields.take(MAX_WRITES_READ + 1) {
                 if !field.bare || subclass {
                     writes.push(*field);
                 }
             }
-            writes.extend(own.iter().filter(|w| w.name == name).copied());
+            let own = own.get(name).into_iter().flatten();
+            writes.extend(own.take(MAX_WRITES_READ + 1).copied());
             if writes.len() > MAX_WRITES_READ {
                 writes.truncate(MAX_WRITES_READ);
             }
@@ -5703,6 +6712,56 @@ impl<'t> Ctx<'t> {
         })
     }
 
+    /// `require("nock")`, `import("msw/node")`: the package of
+    /// [`FETCH_INTERCEPTORS`] loaded, if one is.
+    fn loads_fetch_interceptor(
+        &self,
+        call: Node<'t>,
+        function: Node<'t>,
+        scope: usize,
+    ) -> Option<&'t str> {
+        let loader = function.kind() == "import"
+            || (function.kind() == "identifier"
+                && self.text(function) == "require"
+                && self.lookup(scope, "require").is_none());
+        if !loader {
+            return None;
+        }
+        first_argument(call)
+            .and_then(|a| string_content(a, self.src))
+            .and_then(fetch_interceptor)
+    }
+
+    /// A package of [`FETCH_INTERCEPTORS`] loaded at `line`, which may also
+    /// intercept Node's `http` module ([`HTTP_INTERCEPTORS`]).
+    fn note_interceptor(&mut self, package: &str, line: u32) {
+        self.global_fetch.get_or_insert(Feature {
+            what: "a module that intercepts or mocks `fetch`",
+            line,
+        });
+        if HTTP_INTERCEPTORS.contains(&package) {
+            self.http_intercept.get_or_insert(Feature {
+                what: "a module that intercepts Node's `http` module",
+                line,
+            });
+        }
+    }
+
+    /// What the file does that may replace or intercept the transport a
+    /// client of a provider's own API sends through: the global `fetch`,
+    /// or for openai v3's `OpenAIApi` (`v3`), which sends through axios,
+    /// Node's `http` module.
+    fn intercepted(&self, routing: Routing, v3: bool) -> Option<ClientCaveat> {
+        if !to_provider(routing) {
+            return None;
+        }
+        if v3 {
+            self.http_intercept.map(ClientCaveat::HttpIntercept)
+        } else {
+            self.global_fetch.map(ClientCaveat::GlobalFetch)
+        }
+    }
+
     fn eval_new(&mut self, node: Node<'t>, scope: usize, depth: u32) -> Val {
         let Some(constructor) = node.child_by_field_name("constructor") else {
             return Val::Untracked(Origin::Other);
@@ -5762,9 +6821,20 @@ impl<'t> Ctx<'t> {
                     fallback: false,
                 });
             }
-            if let Some(option) = self.request_hook(&options, client.family) {
-                client.routing = Routing::Unknown;
-                client.caveat = Some(ClientCaveat::EndpointOption { option });
+            match self.request_hook(call, scope, client.family) {
+                Some(Hook::Set(option)) => {
+                    client.routing = Routing::Unknown;
+                    client.caveat = Some(ClientCaveat::EndpointOption { option });
+                }
+                // A spread or computed key the `baseURL` rule leaves with a
+                // direct route and no gap.
+                Some(Hook::Maybe(option))
+                    if client.caveat.is_none() && is_direct(client.routing) =>
+                {
+                    client.routing = Routing::Unknown;
+                    client.caveat = Some(ClientCaveat::EndpointOption { option });
+                }
+                _ => {}
             }
         }
         Val::Client {
@@ -5774,24 +6844,552 @@ impl<'t> Ctx<'t> {
     }
 
     /// The option of a direct client that sees every request it sends and
-    /// may send it elsewhere: a custom `fetch`, which receives each
+    /// may send it elsewhere, in the options `call` (a constructor or
+    /// `withOptions`) is given: a custom `fetch`, which receives each
     /// request's URL, or Anthropic's `middleware`, which may change a
     /// request before passing it on or answer it itself. A `middleware`
     /// array whose items are all calls of the SDK's own
     /// `betaRefusalFallbackMiddleware` keeps the route: that one only sends
-    /// the request again with a fallback model.
-    fn request_hook(&mut self, options: &Options<'t>, family: Family) -> Option<&'static str> {
-        if let Lookup::Found(..) = options.lookup("fetch") {
-            return Some("a custom `fetch`");
+    /// the request again with a fallback model. Options the file cannot
+    /// read ([`Ctx::hook_scan`]: a spread or computed key of that kind, a
+    /// `__proto__`, a parameter) may hold either.
+    fn request_hook(&mut self, call: Node<'t>, scope: usize, family: Family) -> Option<Hook> {
+        let scan = self.hook_argument(call, scope, 0)?;
+        if scan.sets("fetch").next().is_some() {
+            return Some(Hook::Set("a custom `fetch`"));
         }
-        if family != Family::AnthropicDirect {
+        if family == Family::AnthropicDirect && self.sets_middleware(&scan) {
+            return Some(Hook::Set("`middleware`"));
+        }
+        scan.unread.then_some(Hook::Maybe(match family {
+            Family::AnthropicDirect => {
+                "a spread or computed key that may hold a custom `fetch` or `middleware`"
+            }
+            _ => "a spread or computed key that may hold a custom `fetch`",
+        }))
+    }
+
+    /// Whether options set a `middleware` other than an array of the SDK's
+    /// own refusal fallback, written where nothing else may change it.
+    fn sets_middleware(&mut self, scan: &HookScan<'t>) -> bool {
+        let middleware: Vec<HookEntry<'t>> = scan.sets("middleware").copied().collect();
+        middleware
+            .into_iter()
+            .any(|entry| entry.shared || !self.refusal_fallbacks_only(entry.value, entry.scope))
+    }
+
+    /// The options one request to a direct client is given (its arguments
+    /// after the body or the path parameter, `body`) that may send it
+    /// elsewhere: a `path`, which replaces the client's URL when it is
+    /// absolute, a `defaultBaseURL`, or Anthropic's `middleware`, which runs
+    /// after the client's (the SDK's refusal fallback keeps the route here
+    /// too). Every value the file gives the options is read
+    /// ([`Ctx::hook_scan`]): each side of a conditional, each assignment of
+    /// a name, a class property, an object spread into them. For a request
+    /// that takes a model on a direct route, options right after its body
+    /// that may hold a value the file cannot read count too. Other
+    /// arguments count only for what the file writes in them: without the
+    /// method's signature, one may be a path parameter or a body
+    /// (`runs.retrieve(threadId, runId)`). `fetch` is no request option,
+    /// and is read in case a version takes one.
+    fn request_hook_of(
+        &mut self,
+        call: Node<'t>,
+        scope: usize,
+        client: &Client,
+        member: &str,
+        body: usize,
+    ) -> Option<&'static str> {
+        // OpenAI's `threads.messages.create(threadId, body)` shares its name
+        // with Anthropic's request, and takes no model.
+        let thread_message =
+            client.pkg == Pkg::Openai && member_is(member, "threads.messages.create");
+        let unseen = is_direct(client.routing) && is_model_bearing(member) && !thread_message;
+        let mut maybe = false;
+        // A request takes at most a path parameter or two, its body and its
+        // options.
+        for index in body + 1..=3 {
+            let Some(scan) = self.hook_argument(call, scope, index) else {
+                continue;
+            };
+            for (key, option) in [
+                ("path", "request options with a `path`"),
+                ("defaultBaseURL", "request options with a `defaultBaseURL`"),
+                ("fetch", "request options with a `fetch`"),
+            ] {
+                if scan.sets(key).next().is_some() {
+                    return Some(option);
+                }
+            }
+            if client.family == Family::AnthropicDirect && self.sets_middleware(&scan) {
+                return Some("request options with `middleware`");
+            }
+            maybe |= scan.unread && unseen && index == body + 1;
+        }
+        maybe.then_some(match client.family {
+            Family::AnthropicDirect => {
+                "request options that may hold `middleware`, a `path` or a `defaultBaseURL`"
+            }
+            _ => "request options that may hold a `path` or a `defaultBaseURL`",
+        })
+    }
+
+    /// What the argument of `call` at `index` may hold among [`HOOK_KEYS`],
+    /// when the call passes one: anything, past a spread argument.
+    fn hook_argument(
+        &mut self,
+        call: Node<'t>,
+        scope: usize,
+        index: usize,
+    ) -> Option<Rc<HookScan<'t>>> {
+        let arguments = call.child_by_field_name("arguments")?;
+        let mut cursor = arguments.walk();
+        let args: Vec<Node<'t>> = arguments
+            .named_children(&mut cursor)
+            .filter(|a| a.kind() != "comment")
+            .take(index + 1)
+            .collect();
+        if args.iter().any(|a| a.kind() == "spread_element") {
+            return Some(Rc::new(HookScan::unread()));
+        }
+        let arg = args.get(index).copied()?;
+        Some(self.hook_scan(arg, scope))
+    }
+
+    /// What the options object `expr` may hold among [`HOOK_KEYS`], over
+    /// every value the file gives it: an object literal's entries (a
+    /// spread adds what it may hold), each side of a conditional (`signal ?
+    /// { signal } : undefined`) or of `??` and `||`, the right side of
+    /// `&&`, each value of a `const`, `let` or `var` that is only read
+    /// (`let opts = {...}; if (slow) opts = {...}`), a class property
+    /// (`this.requestOptions`, `Summarizer.OPTIONS`) read as rule 5 reads
+    /// one, and a literal nested in one that is only read
+    /// (`CONFIG.requests`). `undefined`, `null` and other primitives hold
+    /// none. Anything else (a parameter, an import, a call's result, a
+    /// computed key) may hold any of them, and so does an object read past
+    /// [`MAX_HOOK_STEPS`] steps or [`MAX_HOOK_DEPTH`] deep. Each object,
+    /// name and property is read once and kept (as holding anything, when a
+    /// bound cut its read), so the reads of a file stay linear.
+    /// A read that starts inside another (a request's client evaluated
+    /// while [`Ctx::harmless_call`] checks where options are passed) runs
+    /// on its own and gives the outer read its state back, so neither
+    /// takes the other's partial values for complete ones.
+    fn hook_scan(&mut self, expr: Node<'t>, scope: usize) -> Rc<HookScan<'t>> {
+        let stack = std::mem::take(&mut self.hook_stack);
+        let low = std::mem::replace(&mut self.hook_low, usize::MAX);
+        let steps = std::mem::replace(&mut self.hook_steps, MAX_HOOK_STEPS);
+        let scan = self.hook_scan_at(expr, scope, 0);
+        self.hook_stack = stack;
+        self.hook_low = low;
+        self.hook_steps = steps;
+        scan
+    }
+
+    fn hook_scan_at(&mut self, expr: Node<'t>, scope: usize, depth: u32) -> Rc<HookScan<'t>> {
+        if self.hook_steps == 0 || depth > MAX_HOOK_DEPTH {
+            return Rc::new(HookScan::unread());
+        }
+        self.hook_steps -= 1;
+        let expr = unwrap_expression(expr);
+        let sides: &[&str] = match expr.kind() {
+            "object" => return self.hook_object(expr, scope, depth),
+            "identifier" => {
+                let name = self.text(expr);
+                return match self.lookup(scope, name) {
+                    Some(b) => self.hook_binding(b, depth),
+                    None if name == "undefined" => Rc::new(HookScan::default()),
+                    None => Rc::new(HookScan::unread()),
+                };
+            }
+            "member_expression" | "subscript_expression" => {
+                return self.hook_member(expr, scope, depth)
+            }
+            // `Object.freeze(x)` hands back `x`, which nothing can change.
+            "call_expression"
+                if expr
+                    .child_by_field_name("function")
+                    .and_then(|f| self.global_callee(f, scope))
+                    .as_deref()
+                    == Some("Object.freeze") =>
+            {
+                let mut cursor = expr.walk();
+                let first = expr.child_by_field_name("arguments").and_then(|arguments| {
+                    arguments
+                        .named_children(&mut cursor)
+                        .find(|a| a.kind() != "comment")
+                });
+                // `Object.freeze()` gives `undefined`; a spread argument
+                // cannot be read.
+                return match first {
+                    None => Rc::new(HookScan::default()),
+                    Some(argument) => self.hook_scan_at(argument, scope, depth + 1),
+                };
+            }
+            // `requestOptions(req)`: what a same-file function returns.
+            "call_expression" => {
+                return match self.called_function(expr, scope) {
+                    Some(func) => self.hook_returns(func, depth),
+                    None => Rc::new(HookScan::unread()),
+                };
+            }
+            // Values that hold no such property.
+            "undefined"
+            | "null"
+            | "string"
+            | "template_string"
+            | "number"
+            | "true"
+            | "false"
+            | "regex"
+            | "array"
+            | "arrow_function"
+            | "function_expression"
+            | "function"
+            | "unary_expression" => &[],
+            "ternary_expression" => &["consequence", "alternative"],
+            "binary_expression" => match operator(expr) {
+                Some("??" | "||") => &["left", "right"],
+                // The left side is passed only when it is falsy.
+                Some("&&") => &["right"],
+                // Arithmetic and comparisons give a primitive.
+                _ => &[],
+            },
+            _ => return Rc::new(HookScan::unread()),
+        };
+        let mut scan = HookScan::default();
+        for field in sides {
+            match expr.child_by_field_name(field) {
+                Some(side) => {
+                    let side = self.hook_scan_at(side, scope, depth + 1);
+                    scan.add(&side, false);
+                }
+                None => scan.unread = true,
+            }
+        }
+        Rc::new(scan)
+    }
+
+    /// An object literal's entries ([`Ctx::hook_scan`]): a key known only
+    /// at run time, a `__proto__` or methods that write `this` may set any.
+    fn hook_object(&mut self, object: Node<'t>, scope: usize, depth: u32) -> Rc<HookScan<'t>> {
+        let memo = HookKey::Object(object.id());
+        if let Some(scan) = self.hook_memo.get(&memo) {
+            return Rc::clone(scan);
+        }
+        let outer_low = std::mem::replace(&mut self.hook_low, usize::MAX);
+        let mut scan = HookScan {
+            set: Vec::new(),
+            unread: self.this_written_objects.contains(&object.id()),
+        };
+        let mut cursor = object.walk();
+        for entry in object.named_children(&mut cursor) {
+            if self.hook_steps == 0 {
+                scan.unread = true;
+                break;
+            }
+            self.hook_steps -= 1;
+            let (name, value) = match entry.kind() {
+                "pair" => {
+                    let Some(key) = entry.child_by_field_name("key") else {
+                        continue;
+                    };
+                    let name = match key.kind() {
+                        "property_identifier" | "number" => Some(self.text(key)),
+                        "string" => string_content(key, self.src),
+                        "computed_property_name" => {
+                            key.named_child(0).and_then(|k| static_key(k, self.src))
+                        }
+                        _ => None,
+                    };
+                    if name == Some("__proto__") && key.kind() != "computed_property_name" {
+                        scan.unread = true;
+                        continue;
+                    }
+                    (name, entry.child_by_field_name("value").unwrap_or(entry))
+                }
+                "shorthand_property_identifier" => (Some(self.text(entry)), entry),
+                "method_definition" => (
+                    entry
+                        .child_by_field_name("name")
+                        .and_then(|n| self.member_name(n)),
+                    entry,
+                ),
+                "spread_element" => {
+                    match entry.named_child(0) {
+                        Some(inner) => {
+                            let inner = self.hook_scan_at(inner, scope, depth + 1);
+                            scan.add(&inner, false);
+                        }
+                        None => scan.unread = true,
+                    }
+                    continue;
+                }
+                "comment" => continue,
+                _ => (None, entry),
+            };
+            match name {
+                Some(name) => {
+                    if let Some(key) = HOOK_KEYS.iter().find(|k| **k == name) {
+                        scan.push(HookEntry {
+                            key,
+                            value,
+                            scope,
+                            shared: false,
+                        });
+                    }
+                }
+                None => scan.unread = true,
+            }
+        }
+        let scan = Rc::new(scan);
+        // Read inside a name or property still being read, it lacks that
+        // one's other values.
+        if self.hook_low == usize::MAX {
+            self.hook_memo.insert(memo, Rc::clone(&scan));
+        }
+        self.hook_low = self.hook_low.min(outer_low);
+        scan
+    }
+
+    /// Reads a name or property ([`Ctx::hook_binding`],
+    /// [`Ctx::hook_prop`]) once. Met again inside its own values (`opts =
+    /// { ...opts, signal }`), it adds nothing the outer read does not; what
+    /// is read in between lacks its other values, and is kept only once it
+    /// is.
+    fn hook_read(
+        &mut self,
+        memo: HookKey<'t>,
+        read: impl FnOnce(&mut Self) -> HookScan<'t>,
+    ) -> Rc<HookScan<'t>> {
+        if let Some(scan) = self.hook_memo.get(&memo) {
+            return Rc::clone(scan);
+        }
+        if let Some(at) = self.hook_stack.iter().position(|k| *k == memo) {
+            self.hook_low = self.hook_low.min(at);
+            return Rc::new(HookScan::default());
+        }
+        let at = self.hook_stack.len();
+        self.hook_stack.push(memo);
+        let outer_low = std::mem::replace(&mut self.hook_low, usize::MAX);
+        let scan = Rc::new(read(self));
+        self.hook_stack.pop();
+        if self.hook_low >= at {
+            self.hook_memo.insert(memo, Rc::clone(&scan));
+            self.hook_low = outer_low;
+        } else {
+            self.hook_low = self.hook_low.min(outer_low);
+        }
+        scan
+    }
+
+    /// The same-file function `call` calls by name (`requestOptions(req)`):
+    /// a function declaration, or a `const` bound to an arrow function or
+    /// function expression, that the file never assigns again. A call
+    /// through a member or under another name is not one.
+    fn called_function(&self, call: Node<'t>, scope: usize) -> Option<usize> {
+        let function = unwrap_expression(call.child_by_field_name("function")?);
+        if function.kind() != "identifier" {
             return None;
         }
-        match options.lookup("middleware") {
-            Lookup::Found(value, false, scope) if self.refusal_fallbacks_only(value, scope) => None,
-            Lookup::Found(..) => Some("`middleware`"),
-            Lookup::Missing | Lookup::Opaque => None,
+        let b = self.lookup(scope, self.text(function))?;
+        let binding = &self.bindings[b];
+        let func = binding.func?;
+        let fixed = matches!(binding.decl, Decl::Function | Decl::Const)
+            && binding.writes.is_empty()
+            && !binding.writes_cut;
+        fixed.then_some(func)
+    }
+
+    /// Every value a same-file function returns ([`Ctx::hook_scan`]): each
+    /// `return` in its own body (`undefined` for a bare one), or an arrow
+    /// function's expression body. Past [`MAX_WRITES_READ`] returns, it may
+    /// return anything. Read once and kept.
+    fn hook_returns(&mut self, func: usize, depth: u32) -> Rc<HookScan<'t>> {
+        self.hook_read(HookKey::Returns(func), |cx| {
+            if cx.funcs[func].returns_cut {
+                return HookScan::unread();
+            }
+            let returns = cx.funcs[func].returns.clone();
+            let mut scan = HookScan::default();
+            for (value, value_scope) in returns {
+                if let Some(value) = value {
+                    let inner = cx.hook_scan_at(value, value_scope, depth + 1);
+                    scan.add(&inner, false);
+                }
+            }
+            scan
+        })
+    }
+
+    /// Every value a name may hold ([`Ctx::hook_scan`]): a `const`, `let`
+    /// or `var` (not destructured, not a loop variable) whose every use
+    /// reads it or passes it to an SDK request or a read-only builtin.
+    fn hook_binding(&mut self, b: usize, depth: u32) -> Rc<HookScan<'t>> {
+        self.hook_read(HookKey::Binding(b), |cx| cx.hook_binding_inner(b, depth))
+    }
+
+    fn hook_binding_inner(&mut self, b: usize, depth: u32) -> HookScan<'t> {
+        let binding = &self.bindings[b];
+        let uses = &binding.uses;
+        let param = binding.param.filter(|_| binding.decl == Decl::Param);
+        let only_read = (matches!(binding.decl, Decl::Const | Decl::Let | Decl::Var)
+            || param.is_some())
+            && !binding.each
+            && binding.path.is_empty()
+            && !binding.writes_cut
+            && !uses.escapes
+            && !uses.hook_mutated
+            && !uses.member_calls
+            && !uses.passed_cut;
+        // `declare const opts: RequestOptions` is given its value elsewhere.
+        if !only_read || (param.is_none() && binding.init.is_none() && binding.writes.is_empty()) {
+            return HookScan::unread();
         }
+        let mut values: Vec<Option<(Node<'t>, usize)>> = Vec::new();
+        match param {
+            // A parameter holds what each call passes, or its default where
+            // one passes nothing, when every call is in the file (rule 6).
+            Some((func, index)) => {
+                let (default, default_scope) = (binding.init, binding.init_scope);
+                let callers = self.callers(func);
+                if !callers.complete {
+                    return HookScan::unread();
+                }
+                for (call, call_scope) in callers.sites {
+                    match self.argument_at(call, call_scope, index) {
+                        Argument::Expr(arg, arg_scope) => values.push(Some((arg, arg_scope))),
+                        Argument::Missing => {
+                            if let Some(default) = default {
+                                values.push(Some((default, default_scope)));
+                            }
+                        }
+                        Argument::Unknown => values.push(None),
+                    }
+                }
+            }
+            None => {
+                if let Some(init) = binding.init {
+                    values.push(Some((init, binding.init_scope)));
+                }
+            }
+        }
+        let binding = &self.bindings[b];
+        values.extend(binding.writes.iter().map(|w| w.value.map(|v| (v, w.scope))));
+        let passed = uses.passed_to.clone();
+        for (call, call_scope) in passed {
+            if !self.harmless_call(call, call_scope) {
+                return HookScan::unread();
+            }
+        }
+        // A literal that is not only read may have its containers changed.
+        let shared = self.readonly_object(b).is_none();
+        let mut scan = HookScan::default();
+        for value in values {
+            match value {
+                Some((value, value_scope)) => {
+                    let inner = self.hook_scan_at(value, value_scope, depth + 1);
+                    scan.add(&inner, shared);
+                }
+                None => scan.unread = true,
+            }
+        }
+        scan
+    }
+
+    /// A member read ([`Ctx::hook_scan`]): a literal nested in one that is
+    /// only read (`CONFIG.requests`), or a class property read through
+    /// `this` or by class name, whose every assignment is read as rule 5
+    /// reads one. Read through `this` in a method that may run with another
+    /// `this`, it may be another object's. As for a client read through
+    /// `this`, a subclass in another module is taken not to replace it.
+    fn hook_member(&mut self, expr: Node<'t>, scope: usize, depth: u32) -> Rc<HookScan<'t>> {
+        if let Some((object, object_scope, _)) = self.object_node(expr, scope) {
+            return self.hook_scan_at(object, object_scope, depth + 1);
+        }
+        let unread = || Rc::new(HookScan::unread());
+        let name = match expr.kind() {
+            "member_expression" => expr
+                .child_by_field_name("property")
+                .filter(|p| p.kind() == "property_identifier")
+                .map(|p| self.text(p)),
+            _ => expr
+                .child_by_field_name("index")
+                .and_then(|i| static_key(i, self.src)),
+        };
+        let (Some(object), Some(name)) = (
+            expr.child_by_field_name("object").map(unwrap_expression),
+            name,
+        ) else {
+            return unread();
+        };
+        let (class, is_static, through_this) = match object.kind() {
+            "this" => {
+                if self.this_rebound(scope).is_some() {
+                    return unread();
+                }
+                match self.scopes[scope].this {
+                    This::Instance(class) => (class, false, true),
+                    This::Static(class) => (class, true, true),
+                    This::Other => return unread(),
+                }
+            }
+            "identifier" => match self
+                .lookup(scope, self.text(object))
+                .and_then(|b| self.bindings[b].class)
+            {
+                Some(class) => (class, true, false),
+                None => return unread(),
+            },
+            _ => return unread(),
+        };
+        self.hook_prop(class, is_static, through_this, name, depth)
+    }
+
+    /// Every assignment of a class property ([`Ctx::hook_member`]), read as
+    /// rule 5 reads one. The object it holds may be reached through any
+    /// read of a property of that name, on whatever object
+    /// (`svc.opts[k] = v` on an instance), so it is read only when every
+    /// such read in the file only reads it, spreads it, passes it to an SDK
+    /// request or a read-only builtin, or writes on it under a static key
+    /// that is not one of [`HOOK_KEYS`] ([`Ctx::prop_handed`]); a write
+    /// into it of that kind is not a value of the property. Its containers
+    /// count as shared. A property written more times than are read
+    /// ([`MAX_WRITES_READ`]) cannot be read.
+    fn hook_prop(
+        &mut self,
+        class: usize,
+        is_static: bool,
+        through_this: bool,
+        name: &'t str,
+        depth: u32,
+    ) -> Rc<HookScan<'t>> {
+        let memo = HookKey::Prop(class, is_static, through_this, name);
+        self.hook_read(memo, |cx| {
+            if cx.prop_handed.contains(name) {
+                return HookScan::unread();
+            }
+            if !cx.prop_passed_harmless(name) {
+                return HookScan::unread();
+            }
+            let writes = match cx.prop_lookup(class, is_static, through_this, name) {
+                Ok(writes) if writes.len() < MAX_WRITES_READ => writes,
+                _ => return HookScan::unread(),
+            };
+            let mut scan = HookScan::default();
+            let mut assigned = false;
+            for write in writes.iter().filter(|w| !w.nested) {
+                assigned = true;
+                match write.value {
+                    Some(value) => {
+                        let inner = cx.hook_scan_at(value, write.scope, depth + 1);
+                        scan.add(&inner, true);
+                    }
+                    None => scan.unread = true,
+                }
+            }
+            scan.unread |= !assigned;
+            scan
+        })
     }
 
     /// Whether `value` is an array literal whose items are all calls of the
@@ -5921,10 +7519,10 @@ impl<'t> Ctx<'t> {
             }
         };
         let mut routing = class.routing(&kwargs, splat, base_url);
-        let (option, vertexai) = self.endpoint_option(node, class, scope);
-        let mut caveat = match option {
-            Some(option) => Some(ClientCaveat::EndpointOption { option }),
-            None => self.endpoint_env(class, base_url),
+        let (hook, vertexai) = self.endpoint_option(node, class, scope);
+        let mut caveat = match hook {
+            Some(Hook::Set(option)) => Some(ClientCaveat::EndpointOption { option }),
+            _ => self.endpoint_env(class, base_url),
         };
         if caveat.is_some() {
             routing = Routing::Unknown;
@@ -5932,6 +7530,15 @@ impl<'t> Ctx<'t> {
         if direct {
             if let Some(base) = base_url_caveat(base_url, splat) {
                 caveat.get_or_insert(base);
+            }
+        }
+        // `new Anthropic({ ...shared, baseURL: "https://api.anthropic.com" })`:
+        // the `baseURL` rule leaves a direct route with no gap, but the
+        // spread may hold a `middleware`.
+        if let (None, Some(Hook::Maybe(option))) = (&caveat, hook) {
+            if is_direct(routing) {
+                routing = Routing::Unknown;
+                caveat = Some(ClientCaveat::EndpointOption { option });
             }
         }
         let (binding, held) = match self.targets.get(&node.id()) {
@@ -5966,32 +7573,33 @@ impl<'t> Ctx<'t> {
             line: Some(span.line),
             site: Some(node.id()),
             ambiguous: false,
+            rebound: None,
             caveat,
         };
         self.constructions.insert(node.id(), client.clone());
         client
     }
 
-    /// For a Gemini or OpenAI client: the option that may send its requests
-    /// to another endpoint, and for Gemini how `vertexai`/`enterprise`
-    /// reads.
+    /// For a Gemini, OpenAI (v3 too) or Anthropic client: the option that
+    /// may send its requests to another endpoint, and for Gemini how
+    /// `vertexai`/`enterprise` reads.
     fn endpoint_option(
         &mut self,
         node: Node<'t>,
         class: ClientClass,
         scope: usize,
-    ) -> (Option<&'static str>, Option<VertexAi>) {
+    ) -> (Option<Hook>, Option<VertexAi>) {
         match class.family {
             Family::OpenaiDirect | Family::AnthropicDirect => {
                 let options = self.options(node, scope, 0);
                 let residency = class.family == Family::OpenaiDirect
                     && options.keys.iter().any(|k| k == "dataResidency");
-                let option = if residency {
-                    Some("`dataResidency`")
+                let hook = if residency {
+                    Some(Hook::Set("`dataResidency`"))
                 } else {
-                    self.request_hook(&options, class.family)
+                    self.request_hook(node, scope, class.family)
                 };
-                (option, None)
+                (hook, None)
             }
             Family::Genai => {
                 let options = self.options(node, scope, 0);
@@ -6042,7 +7650,16 @@ impl<'t> Ctx<'t> {
                     let _ = feature;
                     option.get_or_insert("`setDefaultBaseUrls`, which this file calls");
                 }
-                (option, vertexai)
+                (option.map(Hook::Set), vertexai)
+            }
+            // `new OpenAIApi(configuration, basePath, axiosInstance)`: v3
+            // sends through the axios instance it is given, which may send
+            // the request anywhere.
+            Family::OpenaiV3 => {
+                let axios = nth_argument(node, 2)
+                    .map(unwrap_expression)
+                    .filter(|a| !matches!(a.kind(), "undefined" | "null"));
+                (axios.map(|_| Hook::Set("a custom axios instance")), None)
             }
             _ => (None, None),
         }
@@ -6129,6 +7746,7 @@ impl<'t> Ctx<'t> {
                         line: None,
                         site: None,
                         ambiguous: false,
+                        rebound: None,
                         caveat: (routing == Routing::Unknown).then(|| ClientCaveat::Annotation {
                             param: name.to_string(),
                         }),
@@ -7132,6 +8750,17 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// For `func`, a `private` method: the call or read under a name known
+    /// only at run time that may reach it (`this[kind](...)`), if the file
+    /// has one. Such a key never reaches a `#name`.
+    fn reached_by_key(&self, func: usize) -> Option<Feature> {
+        let method = self.funcs[func].method?;
+        if !method.private || method.ctor || method.name.starts_with('#') {
+            return None;
+        }
+        self.method_calls_wild.or(self.method_refs_wild)
+    }
+
     /// The calls of `func` this file shows, and whether they are all of
     /// them. A function's calls are all seen when it is not exported and
     /// its name is only ever called directly; a constructor's when its class
@@ -7187,11 +8816,9 @@ impl<'t> Ctx<'t> {
                 .cloned()
                 .unwrap_or_default();
             if method.private {
-                // A key known only at run time never reaches a `#name`.
-                let by_key = !method.name.starts_with('#')
-                    && (self.method_refs_wild || self.method_calls_wild);
-                let complete = !self.method_refs.contains(method.name)
-                    && !by_key
+                let complete = !self.method_refs.contains_key(method.name)
+                    && !self.method_bound.contains(method.name)
+                    && self.reached_by_key(func).is_none()
                     && sites.len() <= MAX_CALLERS_READ
                     && class.decorated.is_none();
                 return Callers {
@@ -7769,10 +9396,15 @@ impl<'t> Ctx<'t> {
                 match found {
                     // Called with another `this`, the method reads another
                     // object's property.
-                    Ok(mut resolved) if self.this_rebound(scope) => {
-                        resolved.caveats.push(Unresolved::new("attribute", shape));
-                        Ok(resolved)
-                    }
+                    Ok(mut resolved) => match self.this_rebound(scope) {
+                        Some(rebound) => {
+                            let mut caveat = Unresolved::new("attribute", shape);
+                            caveat.by_key = Some(rebound);
+                            resolved.caveats.push(caveat);
+                            Ok(resolved)
+                        }
+                        None => Ok(resolved),
+                    },
                     found => found,
                 }
             }
@@ -8195,10 +9827,19 @@ impl<'t> Ctx<'t> {
                             .with_candidates(overrides, false),
                     );
                 } else {
-                    resolved.caveats.push(
-                        Unresolved::new("unseen_callers", name.to_string())
-                            .with_candidates(overrides, false),
-                    );
+                    let mut unseen = Unresolved::new("unseen_callers", name.to_string())
+                        .with_candidates(overrides, false);
+                    // `this[kind](model)`: name the call, which may be in
+                    // code that has nothing to do with this method, unless
+                    // the method is also passed or stored.
+                    let method = self.funcs[func].method;
+                    if method.is_some_and(|m| {
+                        !self.method_refs.contains_key(m.name)
+                            && !self.method_bound.contains(m.name)
+                    }) {
+                        unseen.by_key = self.reached_by_key(func);
+                    }
+                    resolved.caveats.push(unseen);
                 }
                 Ok(resolved)
             }
@@ -8439,17 +10080,23 @@ impl<'t> Ctx<'t> {
                 }
                 if let Some(option) = self.request_endpoint(call, scope, &client, &path) {
                     // The model or chat it is sent through was reported where
-                    // it was built.
+                    // it was built. A direct client's request options apply
+                    // to that request alone.
                     let feature = Feature {
                         what: "request options that may name another endpoint",
                         line: self.line(call),
                     };
                     match client.family {
-                        Family::LegacyModel => self.legacy_request_endpoint.get_or_insert(feature),
-                        _ => self.genai_request_endpoint.get_or_insert(feature),
-                    };
+                        Family::LegacyModel => {
+                            self.legacy_request_endpoint.get_or_insert(feature);
+                        }
+                        Family::Genai => {
+                            self.genai_request_endpoint.get_or_insert(feature);
+                        }
+                        _ => {}
+                    }
                     client.routing = Routing::Unknown;
-                    client.caveat = Some(ClientCaveat::EndpointOption { option });
+                    client.caveat = Some(ClientCaveat::RequestOption { option });
                 }
                 let target = Target {
                     pkg: client.pkg,
@@ -8487,8 +10134,9 @@ impl<'t> Ctx<'t> {
 
     /// An option of one request that may send it to another endpoint: the
     /// legacy Gemini SDK's request options with a `baseUrl`
-    /// (`model.generateContent(request, { baseUrl })`), and
-    /// `@google/genai`'s `config.httpOptions`.
+    /// (`model.generateContent(request, { baseUrl })`), `@google/genai`'s
+    /// `config.httpOptions`, and a direct OpenAI or Anthropic request's
+    /// options ([`Ctx::request_hook_of`]).
     fn request_endpoint(
         &mut self,
         call: Node<'t>,
@@ -8545,6 +10193,16 @@ impl<'t> Ctx<'t> {
                     }
                 }
             }
+            Family::OpenaiDirect | Family::AnthropicDirect if is_request(last) => {
+                // `runs.create(threadId, body, options)`
+                let member = path.join(".");
+                let body = usize::from(
+                    client.pkg == Pkg::Openai
+                        && PATH_PARAM_METHODS.iter().any(|m| member_is(&member, m))
+                        && nth_argument(call, 1).is_some(),
+                );
+                self.request_hook_of(call, scope, client, &member, body)
+            }
             _ => None,
         }
     }
@@ -8574,13 +10232,9 @@ impl<'t> Ctx<'t> {
                 option: "`setDefaultBaseUrls`, which this file calls",
             });
         }
-        if self.global_fetch
-            && through_global_fetch(client.routing, client.family == Family::OpenaiV3)
-        {
+        if let Some(caveat) = self.intercepted(client.routing, client.family == Family::OpenaiV3) {
             client.routing = Routing::Unknown;
-            client.caveat.get_or_insert(ClientCaveat::EndpointOption {
-                option: "the global `fetch`, which this file may replace",
-            });
+            client.caveat.get_or_insert(caveat);
         }
         client
     }
@@ -8781,7 +10435,15 @@ impl<'t> Ctx<'t> {
     /// The `ambiguous_client` gap a call's client leaves, if any.
     fn routing_gap(&mut self, site: &Site<'_, 't>, span: Span, client: &Client) {
         let chain = site.chain;
-        let (reason, detail) = if client.ambiguous {
+        let (reason, detail) = if let (true, Some(rebound)) = (client.ambiguous, client.rebound) {
+            (
+                "multiple_assignments",
+                format!(
+                    "the receiver of `{chain}` is read through `this` in a method that may run with another object as `this` ({}), so it may be another object's",
+                    rebound.describe()
+                ),
+            )
+        } else if client.ambiguous {
             (
                 "multiple_assignments",
                 format!(
@@ -8851,7 +10513,37 @@ impl<'t> Ctx<'t> {
                 ClientCaveat::EndpointOption { option } => (
                     "endpoint_option",
                     format!(
-                        "the client behind `{chain}` is configured with {option}, which may send its requests to Vertex AI or another endpoint"
+                        "the client behind `{chain}` is configured with {option}, which may send its requests to {}",
+                        if site.sdk == Sdk::Google {
+                            "Vertex AI or another endpoint"
+                        } else {
+                            "another endpoint"
+                        }
+                    ),
+                ),
+                ClientCaveat::RequestOption { option } => (
+                    "endpoint_option",
+                    format!(
+                        "`{chain}` is given {option}, which may send it to {}",
+                        if site.sdk == Sdk::Google {
+                            "Vertex AI or another endpoint"
+                        } else {
+                            "another endpoint"
+                        }
+                    ),
+                ),
+                ClientCaveat::GlobalFetch(feature) => (
+                    "global_fetch",
+                    format!(
+                        "this file may replace or intercept the global `fetch` that `{chain}` sends its requests through ({}), so they may go to another endpoint",
+                        feature.describe()
+                    ),
+                ),
+                ClientCaveat::HttpIntercept(feature) => (
+                    "global_fetch",
+                    format!(
+                        "this file may intercept Node's `http` module, which axios sends the requests of `{chain}` through ({}), so they may go to another endpoint",
+                        feature.describe()
                     ),
                 ),
                 ClientCaveat::Dynamic(feature) => (
@@ -9158,6 +10850,16 @@ impl<'t> Ctx<'t> {
             None if unresolved.reason == "dynamic_feature" => {
                 format!("`{key}` for `{chain}` may change at run time: {shape}")
             }
+            None if unresolved.reason == "attribute" && unresolved.by_key.is_some() => format!(
+                "`{key}` for `{chain}` is `{shape}`, read in a method that may run with another object as `this` ({}), so it may be that object's property",
+                unresolved.by_key.map(Feature::describe).unwrap_or_default()
+            ),
+            None if unresolved.reason == "unseen_callers" && unresolved.by_key.is_some() => {
+                format!(
+                    "`{key}` for `{chain}` is `{shape}`, which is a parameter of a method the file may call under a name known only at run time ({}), so callers this file does not show may set it",
+                    unresolved.by_key.map(Feature::describe).unwrap_or_default()
+                )
+            }
             Some(via) if !shape.is_empty() && via != shape => {
                 format!("`{key}` for `{chain}` comes from `{via}`, which is {phrase} (`{shape}`)")
             }
@@ -9209,7 +10911,8 @@ impl<'t> Ctx<'t> {
                 ));
             }
             Some(origin)
-                if matches!(unresolved.reason, "dynamic_feature" | "subclass_override") =>
+                if matches!(unresolved.reason, "dynamic_feature" | "subclass_override")
+                    || (unresolved.reason == "attribute" && unresolved.by_key.is_some()) =>
             {
                 detail.push_str(&format!(
                     "; its value is captured with origin `{}`",
@@ -9542,20 +11245,24 @@ impl<'t> Ctx<'t> {
     fn finish(mut self) -> FileUsages {
         // A client built from a mocked or replaced SDK is not the SDK's,
         // `setDefaultBaseUrls` re-routes every Gemini client, and a replaced
-        // global `fetch` every direct one.
+        // global `fetch` (Node's `http` module for openai v3) every direct
+        // one.
         let v3 = format!("{}.{V3_API}", Pkg::Openai.package());
-        for client in &mut self.out.clients {
+        let mut clients = std::mem::take(&mut self.out.clients);
+        for client in &mut clients {
             if self
                 .sdk_patched
                 .keys()
                 .any(|pkg| pkg.package() == client.package)
                 || (self.genai_base_urls.is_some() && client.package == Pkg::GoogleGenai.package())
-                || (self.global_fetch
-                    && through_global_fetch(client.routing, client.constructor == v3))
+                || self
+                    .intercepted(client.routing, client.constructor == v3)
+                    .is_some()
             {
                 client.routing = Routing::Unknown;
             }
         }
+        self.out.clients = clients;
         // A request that names another endpoint is sent with the model of
         // the model object or chat it goes through: where that model was
         // given is not routed with no gap either.

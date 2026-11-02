@@ -463,15 +463,22 @@ pub enum GapKind {
     /// imported from another module.
     UnknownClientFactory,
     /// A binding assigned more than one kind of client, so routing depends on
-    /// a runtime branch (`multiple_assignments`), or a client known from
+    /// a runtime branch, or a client read through `this` in a method that
+    /// may run with another object as `this` (`multiple_assignments`), or a
+    /// client known from
     /// only some of the places it can come from: the in-file callers of a
     /// function other modules may also call (`in_file_callers`), a client
     /// whose `base_url` is assigned after it is built (`base_url_assigned`),
     /// a file that sets the SDK's endpoint variable (`endpoint_env`), a
     /// `base_url` read from the environment (`base_url_env`) or not resolved
-    /// (`base_url_unresolved`), a Gemini client given an option that may
-    /// send it to Vertex AI or another endpoint (`endpoint_option`), a
-    /// module-level call that passes `engine` or `deployment_id` in a file
+    /// (`base_url_unresolved`), a client or one request given an option
+    /// that may send it to another endpoint (`endpoint_option`: Gemini's
+    /// `vertexai` or `http_options`, a custom `fetch`, Anthropic's
+    /// `middleware`, openai v3's own axios instance, a request's `path` or
+    /// `defaultBaseURL`), a file that may replace or intercept the global
+    /// `fetch` the SDK sends its requests through, or for openai v3 Node's
+    /// `http` module (`global_fetch`: `globalThis.fetch = ...`, a test
+    /// double of `fetch`, nock or msw), a module-level call that passes `engine` or `deployment_id` in a file
     /// that does not configure the module-level API, or any module-level
     /// call in a file that configures it outside its top-of-file setup block
     /// (`module_config`), a module-level API routed by an `openai.api_type`

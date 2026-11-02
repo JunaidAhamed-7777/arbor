@@ -164,7 +164,12 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     (
         GapKind::AmbiguousClient,
         "endpoint_option",
-        "the client has an option that may send it to Vertex AI or another endpoint",
+        "the client or the request has an option that may send it to another endpoint",
+    ),
+    (
+        GapKind::AmbiguousClient,
+        "global_fetch",
+        "this file may replace or intercept the global `fetch` the SDK sends its requests through, or for openai v3 Node's `http` module",
     ),
     (
         GapKind::AmbiguousClient,
@@ -318,6 +323,7 @@ mod tests {
             "dynamic_feature",
             "subclass_override",
             "endpoint_option",
+            "global_fetch",
             "endpoint_env",
             "base_url_env",
             "base_url_unresolved",
