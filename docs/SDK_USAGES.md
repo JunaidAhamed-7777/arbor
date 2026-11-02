@@ -520,7 +520,10 @@ section states the grammar the TypeScript extractor
 
 JavaScript scopes names lexically, and nothing but an assignment written in the
 file rebinds one; `eval` and `with` are the exceptions (see
-[Dynamic features](#dynamic-features-1)). A binding is visible in all of its
+[Dynamic features](#dynamic-features-1)), and so is a function declared
+in a block of a script that is not in strict mode, which also assigns the
+enclosing function's binding of its name (Annex B): that is not seen
+([Outside the file](#outside-the-file-1)). A binding is visible in all of its
 scope (hoisting and the temporal dead zone), so resolution is
 flow-insensitive: a name reads the same everywhere it is in scope, and a name
 written more than once is a `reassigned` gap that lists what it may hold.
@@ -634,13 +637,29 @@ These are reported with no gap (`model`, and the other keys in `VALUE_KEYS`):
    anonymous, or passed or stored), the value keeps a `subclass_override` gap.
    Read in a method that may run with another object as `this` (its name is
    read without being called, as in `setTimeout(bot.ask)`, `{ ask: bot.ask }`
-   or `const { ask } = bot`, or it is called through `call`, `apply` or
-   `bind`), it keeps an `attribute` gap. A method reached under a name known
-   only at run time and called through `call`, `apply` or `bind`
-   (`this[m].call(other)`), or a computed key in an object pattern (`const {
-   [m]: f } = this`), may be any method but a `#name`, which no computed key
-   reaches: then every other method's reads of `this` keep the gap. Reads by
-   class name are confirmed.
+   or `const { ask } = bot`, or it is run through `call`, `apply` or `bind`
+   with another `this`), it keeps an `attribute` gap whose detail names one
+   such use and its line, and the value's own origin (`class_constant`).
+   Run through them with the object it is read off as `this`
+   (`this.ask.bind(this)`, `bot.ask.call(bot)`, `super.ask.call(this)`), a
+   method reads that object, as `bot.ask()` does, though its calls are then
+   not all seen (rule 6). A method reached under a name known only at run
+   time and called through `call`, `apply` or `bind`
+   (`this[m].call(other)`), or read by a computed key of an object pattern
+   (`const { [m]: f } = this`), may be any method but a `#name`, which no
+   computed key reaches: then every other method's reads of `this` keep the
+   gap. Reads by class name are confirmed.
+
+   A computed key counts in every object pattern of the file, whatever the
+   pattern destructures, as Python counts any `getattr` with a run-time
+   name file wide: in a declaration, a parameter, a `for...of` or `catch`
+   binding, or an assignment (`({ [m]: f } = this)`). Only a string, number
+   or substitution-free template literal key (`{ ["ask"]: f }`) reads just
+   the name it spells; a `const` key (`{ [ID_FIELD]: id }`) is not
+   resolved. This over-approximates: the omit idiom `const { [key]: _,
+   ...rest } = record`, which drops a field of a plain record and reaches
+   no method, also keeps every method's reads of `this` a gap and leaves no
+   `private` method's calls all seen (rule 6).
 6. **A parameter default, when every call of the function is in this file**
    and none passes another value. The calls are all seen for:
    - a function declaration, or a `const` bound to an arrow function or
@@ -651,13 +670,16 @@ These are reported with no gap (`model`, and the other keys in `VALUE_KEYS`):
      expression's own name (`function retry() { retry() }`) are its calls
      too;
    - a `private` or `#private` method or class-field function whose name is
-     never read without a call (`bot.ask` passed or stored, or any key of an
-     object pattern, as in `const { ask } = this`): every call of its name in
-     the file is listed. A method called under a name known only at run time
-     (`this[kind](...)`, `r[name](...)`, `this[m].call(...)`) may be any
-     method, as with Python's `getattr(self, kind)(...)`: then no `private`
-     method's calls are all seen. A `#private` method's are, since no
-     computed key reaches a `#name`;
+     never read without a call (`bot.ask` passed or stored, run through
+     `call`, `apply` or `bind`, even with its own object as in
+     `this.ask.bind(this)`, or any key of an object pattern, as in `const {
+     ask } = this`): every call of its name in the file is listed. A method
+     called under a name known only at run time
+     (`this[kind](...)`, `r[name](...)`, `this[m].call(...)`), or read by a
+     computed key of any object pattern (rule 5), may be any method, as
+     with Python's `getattr(self, kind)(...)`: then no `private` method's
+     calls are all seen. A `#private` method's are, since no computed key
+     reaches a `#name`;
    - the constructor of a class that is not exported, is only constructed by
      name (`new Bot(...)`, or a class expression's own name), has no
      same-file subclass, no `new this()` and no `.constructor` used as a
@@ -672,11 +694,13 @@ These are reported with no gap (`model`, and the other keys in `VALUE_KEYS`):
    `parameter_overridden` (an in-file call passes another value, listed),
    `parameter_default` (the function is exported, or is a public method) or
    `unseen_callers` (it is passed, stored, used as a callback or a method of
-   an object literal, or the file calls a method under a run-time name). A parameter written in its function (`model = "x"`, a
-   `var` of its name, `??=`) is `reassigned`, listing the default, what
-   callers pass and each write; in a function with a simple parameter list
-   that writes, passes or stores `arguments`, which aliases the parameters
-   in sloppy mode, no list is complete.
+   an object literal, or the file calls or reads a method under a run-time
+   name; for a method whose name is never read without a call, the gap's
+   detail names that call or read and its line). A parameter written in its
+   function (`model = "x"`, a `var` of its name, `??=`) is `reassigned`,
+   listing the default, what callers pass and each write; in a function with
+   a simple parameter list that writes, passes or stores `arguments`, which
+   aliases the parameters in sloppy mode, no list is complete.
 
 A namespace's export is a property of the namespace (`export let model` in
 `namespace Cfg` compiles to `Cfg.model`): a write of `Cfg.model`, a cast or
@@ -712,13 +736,15 @@ A call's routing is confirmed when its receiver reaches it through the value
 rules above (one kind of client per name; `null` and `undefined` assigned next
 to a client are ignored, so a lazily built client resolves), through `this` (a
 class property under rule 5, without the `subclass_override` gap, as in
-Python), or through a parameter that every in-file caller of a function whose
-calls are all seen passes. For an exported function the routing those callers
-pass keeps an `in_file_callers` gap. A parameter known only by a type
-annotation that names a tracked class (`client: OpenAI`,
-`private azure: AzureOpenAI`) routes by its class: Azure, Bedrock and Vertex
-are confirmed; a direct class is `unknown` with an `annotation` gap, since its
-options are not seen.
+Python; read in a method that may run with another `this`, the route keeps a
+`multiple_assignments` gap whose detail names the use that may rebind it and
+its line), or through a parameter that every in-file caller of a function
+whose calls are all seen passes. For an exported
+function the routing those callers pass keeps an `in_file_callers` gap. A
+parameter known only by a type annotation that names a tracked class
+(`client: OpenAI`, `private azure: AzureOpenAI`) routes by its class:
+Azure, Bedrock and Vertex are confirmed; a direct class is `unknown` with an
+`annotation` gap, since its options are not seen.
 
 The receiver must be one of these:
 
@@ -728,31 +754,51 @@ The receiver must be one of these:
   `new OpenAIApi(new Configuration({ basePath }))` or `new OpenAIApi(config,
   basePath)`. `BedrockOpenAI`, `AnthropicBedrockMantle`, `AnthropicFoundry`,
   `AnthropicAws` and `new OpenAI({ provider })` route `unknown`. `baseURL` (and
-  v3's `basePath`) routes by host with the table above; a spread or an options
-  object built elsewhere that may hold one, or written after it (`{ baseURL,
-  ...overrides }`), is `base_url_unresolved`; `baseURL: ""` is the provider's
-  host. `client.withOptions({ baseURL })` re-routes the copy it returns. A
-  custom `fetch` (in the constructor or `withOptions`) receives every
-  request's URL: an `endpoint_option` gap, like OpenAI's `dataResidency`.
-  So does an Anthropic client's `middleware`, which may change a request
-  before passing it on or answer it itself, unless it is an array literal
-  whose items are all calls of the SDK's own `betaRefusalFallbackMiddleware`
+  v3's `basePath`) routes by host with the table above. A constructor reads
+  only an object literal written at the call: options given any other way
+  (a name, even one bound to a literal, a parameter, a conditional,
+  `Object.freeze(...)`, a function's result), a spread in the literal that
+  may hold one, or a spread written after it (`{ baseURL, ...overrides }`),
+  are `base_url_unresolved`; `baseURL: ""` is the provider's host.
+  `client.withOptions({ baseURL })` re-routes the copy it returns.
+- **An OpenAI or Anthropic client** also needs no custom `fetch`, and an
+  Anthropic client no `middleware`, in the constructor or `withOptions`. A
+  custom `fetch` receives every request's URL: the client routes `unknown`
+  with an `endpoint_option` gap, as with OpenAI's `dataResidency`. So does
+  an Anthropic client's `middleware`, which may change a request before
+  passing it on or answer it itself, unless it is an array literal of at
+  most 16 items, all calls of the SDK's own `betaRefusalFallbackMiddleware`
   (imported from `@anthropic-ai/sdk`, under any name): that one only sends
-  the request again with a fallback model, so the route stays. The SDKs
-  send their requests through the global `fetch`, so a `fetch` the file
-  writes on an object it cannot identify (`globalThis.fetch = ...`,
-  `(window as any).fetch = ...`, `Object.assign(globalThis, { fetch })`, a
-  bare `fetch = ...`), or replaces with a test double
-  (`jest.spyOn(globalThis, "fetch")`, `vi.stubGlobal("fetch", ...)`), gives
-  the same gap to every call whose client would
-  route to a provider's own API, but openai v3's `OpenAIApi`, which sends
-  through axios.
+  the request again with a fallback model, so the route stays. The array
+  must be written where nothing else can change it: in the options at the
+  call (also in either side of a conditional, in a spread or in
+  `Object.freeze(...)` there), in an object literal bound once to a name
+  that is only read, or nested in one, or in a literal a same-file function
+  returns. A constructor reads only the literal at the call (above), so
+  there the array must be in that literal or in a spread of a literal
+  written in it; the other forms keep the route for `withOptions` and for
+  one request's options. Not exempt: an array held in a name, a call of a same-named
+  function of the file or of another module, and an array reached through a
+  class property, a parameter, a name assigned more than once or bound to
+  anything but an object literal (`const OPTS = Object.freeze({ ... })`
+  too), or a literal that is not only read. The options are read through
+  every value the file gives them, as one request's options are (below).
+  Options the file cannot read (an import, a computed key, a `__proto__`,
+  or a parameter or a call's result the reader does not follow, below) may
+  hold either: when a `baseURL` written after it names the provider's own
+  host, which would confirm the route, the client gets the same gap, and
+  another host's `baseURL` routes `custom_base_url` either way.
+  `fetchOptions` is not read
+  ([Outside the file](#outside-the-file-1)). openai v3's `OpenAIApi` sends
+  through axios: given its own axios instance (`new OpenAIApi(config,
+  basePath, http)`, anything but `undefined` or `null`, even the default
+  `axios` import itself), it gets the same gap.
 - **A Gemini client** also needs no `vertexai` or `enterprise` option other
   than `false`, `null` or `undefined`, no `httpOptions` that names a
   `baseUrl` (or is not an object literal), no spread, and no
   `setDefaultBaseUrls(...)` call in the file: each routes `unknown` with an
   `endpoint_option` gap, and `vertexai`/`enterprise` sets the construction's
-  `vertexai` field. OpenAI's `dataResidency` option gets the same gap.
+  `vertexai` field.
 - **A model or chat built by a client**: `genAI.getGenerativeModel({ model },
   requestOptions)` (an `endpoint_option` gap on it and on its calls when the
   request options may name a `baseUrl`), `model.startChat()` and
@@ -763,7 +809,82 @@ The receiver must be one of these:
   may hold `httpOptions` naming one (or is built elsewhere), route `unknown`
   with an `endpoint_option` gap. The model sent with it was given where the
   model or chat was built, so in such a file every `getGenerativeModel`,
-  `startChat` or `chats.create` of that SDK gets the same gap.
+  `startChat` or `chats.create` of that SDK gets the same gap. An OpenAI or
+  Anthropic request gets the same gap when an options object passed after
+  its body (after the path parameter and body of `runs.create(threadId,
+  body)`) may hold a `path`, which replaces the client's URL when it is
+  absolute, a `defaultBaseURL`, a `fetch`, or for Anthropic a `middleware`,
+  which runs after the client's (the refusal fallback above keeps the route
+  here too, written where nothing else can change it). The options are
+  read through every value the file gives them:
+  - an object literal's entries, and what each spread in it may hold;
+  - both sides of a conditional (`signal ? { signal } : undefined`), of
+    `??` and of `||`, and the right side of `&&`;
+  - `Object.freeze(x)`, which is `x`;
+  - what a same-file function called by name returns (`requestOptions(req)`):
+    a function declaration, or a `const` bound to an arrow function or
+    function expression, that the file never assigns again, read through
+    each `return` in its own body (a bare `return` gives `undefined`) or an
+    arrow function's expression body;
+  - every value of a `const`, `let` or `var` (not destructured, not a loop
+    variable) whose every use reads a property of it, tests it (`!opts`, a
+    comparison, the test of `?:`), spreads it, assigns a property of
+    it under a static key other than `fetch`, `middleware`, `path`,
+    `defaultBaseURL` or `__proto__` (`options.signal = req.signal`; a
+    reflective write such as `Object.assign(options, ...)` counts as any
+    key), or passes it to an SDK request or a read-only builtin, directly
+    or as a side of a conditional, `??`, `||` or `&&` there
+    (`create(body, signal ? { ...base, signal } : base)`). So `let opts =
+    { timeout: 30_000 }; if (slow) opts = { timeout: 120_000 }` holds
+    both. A parameter used only these ways, of a function whose calls are
+    all seen (rule 6), holds what each call passes, or its default where a
+    call passes nothing. A use inside parentheses, `as`, `satisfies` or
+    `!` is none of these (`opts as OpenAI.RequestOptions`, `opts!`), and an
+    `if` or `while` condition is written in parentheses, so `if (opts)`
+    makes the name unreadable; so do an alias (`const o = opts`),
+    destructuring it (`const { timeout } = opts`) and an operand of `&&`,
+    `||` or `??` anywhere but at an SDK request or a read-only builtin
+    (`if (opts && opts.timeout > 0)`);
+  - a class or static property read through `this` or by class name
+    (`this.requestOptions`, `Summarizer.OPTIONS`), through every
+    assignment rule 5 reads, when every read of a property of that name in
+    the file, on whatever object (`this.opts`, `svc.opts`, `Svc.OPTS`),
+    reads a property of it, tests it (`!this.opts`, a comparison, a
+    condition), spreads it, passes it to an SDK request or a read-only
+    builtin (also as a side of a conditional, `??`, `||` or `&&` there),
+    or assigns a property of it under a static key other than those five
+    (`this.opts.signal = s`, which is not an assignment of the property).
+    Any other read of the name makes every class property of that name
+    unreadable, even where nothing changes it: an alias (`const o =
+    this.opts`, even one that is only read), returning or storing it, a
+    key of an object pattern (`const { opts } = this`), destructuring it
+    (`const { timeout } = this.opts`), a `for...in` over it, an operand of
+    `&&`, `||` or `??` anywhere but at an SDK request or a read-only
+    builtin (`if (this.opts && this.opts.timeout > 0)`), a call of a method
+    of it (`this.opts.set(k, v)`), passing it to any other function, or a
+    write into it under one of the five keys or a key known only at run
+    time (`(this.opts as any)[k] = v`, `svc.opts[k] = v`). Nor can a
+    property written 64 times or more (its assignments and the writes into
+    it) be read, or one read through `this` in a method that may run with
+    another `this` (rule 5);
+  - a literal nested in a same-file literal that is only read
+    (`CONFIG.requests`).
+
+  `undefined`, `null`, other primitives, arrays and functions hold none.
+  Anything else cannot be read and may hold any of them: a parameter of a
+  function whose calls are not all seen (with its default), an import, the
+  result of any other call (a method, a function held in a `let`, an
+  import), a property of another object, a key known only at run time, a
+  `__proto__`, a literal whose methods write `this`, a name given no value
+  in the file. Returning a name is not one of the uses above, so a
+  function that returns one (`const opts = () => base`) cannot be read
+  either. On a client routed to the provider's own API, the options right
+  after the body of a request that takes a model also count when some
+  value they may hold cannot be read; OpenAI's `threads.messages.create`, which takes no
+  model, is not such a request. Any other argument counts only for what
+  the file shows it holds: without the method's signature, it may be a path
+  parameter or a body (`runs.retrieve(threadId, runId)`). Only that
+  request is re-routed; the client keeps its route for its other calls.
 
 The file must not:
 
@@ -779,14 +900,118 @@ The file must not:
 - assign `baseURL` to the client after it is built (`client.baseURL = ...`,
   `Object.assign(client, { baseURL })`, `Reflect.set(client, "baseURL", ...)`:
   `base_url_assigned`), or to an object it cannot identify
-  (`dynamic_feature`);
+  (`dynamic_feature`; a CommonJS export, `exports.baseURL = ...`, is not
+  one, as for `fetch` below);
+- replace or intercept the global `fetch` the SDKs send their requests
+  through. Every client that would route to a provider's own API (OpenAI,
+  Anthropic or Gemini) then routes `unknown`, and its calls get a
+  `global_fetch` gap (`ambiguous_client`) whose detail names one such
+  write or call in the file and its line. openai v3's `OpenAIApi` sends
+  through axios, which in Node goes through the `http` module, not
+  `fetch`: it gets the gap only when the file loads `nock`, `msw` or
+  `@mswjs/interceptors` (the last item below), which intercept `http` too,
+  and the detail then names Node's `http` module. The rest leave a v3
+  client's route. That is:
+  - a `fetch` written on an object the file cannot identify
+    (`globalThis.fetch = ...`, `(window as any).fetch = ...`, a bare
+    `fetch = ...`), also reflectively (`Object.assign(globalThis, { fetch })`,
+    `Reflect.set(o, "fetch", f)`, `Object.defineProperty(o, "fetch", ...)`).
+    The object may be the global one, so `options.fetch = ...` on a
+    parameter, `this.http.fetch = ...` and `root.fetch = ...` on any name
+    count too. A CommonJS export (`exports.fetch = ...`,
+    `module.exports.fetch = ...`, where the file binds neither name) does
+    not, unless the file sets `module.exports` to something other than an
+    object literal (`module.exports = client`), assigns `exports` or
+    `module` itself, whatever the value (`exports = client`), or uses
+    `module` other than to read or write a member by name (`module.exports`,
+    `module.hot`) or to test it (`typeof module`, `require.main ===
+    module`): an alias (`const m = module; m.exports = client`), passing it
+    (`Object.assign(module, { exports: client })`) or a key known only at
+    run time (`module[k] = v`) may replace `module.exports` where the file
+    does not show it. `Object.assign(module.exports, { fetch })` still
+    counts;
+  - the global object written under a key known only at run time that may
+    be `"fetch"` (`(globalThis as any)[name] = v`,
+    `Object.assign(globalThis, polyfills)`, `Reflect.set(globalThis, k,
+    v)`, `jest.spyOn(globalThis, key)`, a loop variable in `for (const k of
+    keys) g[k] = v`). The global object is `globalThis`, `global`, `window`
+    or `self` where the file does not bind the name; a `const`, `let` or
+    `var` given one in its declaration or in a plain assignment (`const g: any
+    = globalThis`, `let g = {}; g = globalThis`, and `let g = globalThis; g
+    = {}` too); either side of a conditional, `??`, `||` or `&&`, written
+    where the key is or held in such a name (`(typeof window !==
+    "undefined" ? window : globalThis)[k] = v`, `((globalThis || window)
+    as any)[k] = v`, `const root = typeof window !== "undefined" ? window
+    : globalThis`); or one read off another inside parentheses, a cast or
+    a reflective call (`(globalThis.window as any)[k] = v`,
+    `Object.assign(globalThis.window, o)`). A key the file shows is not
+    `"fetch"` does not count: a string or number literal, a template
+    literal whose fixed text rules it out (`` `__${app}_started` ``), a
+    symbol of its own (`Symbol("k")`, `Symbol.iterator`), `Symbol.for`
+    given a string literal that does not start with `undici`
+    (`Symbol.for("app.cache")`), a conditional whose sides are all such
+    keys, a `const`, `let` or `var` whose every value is one (`const KEY
+    = "__cache"`), a parameter of a function whose calls are all seen
+    (rule 6) when each call passes such a key (or, passing none, the
+    default is one), and a `for...of` variable that runs over the items of
+    an array literal written in the loop, all such keys (`for (const k of
+    ["TextEncoder", "URL"])`), or over the keys of an object literal none
+    of whose keys is `fetch` (`Object.keys(o)`, the first item of each
+    entry of `Object.entries(o)`, as in `for (const [k, v] of
+    Object.entries(o))`, or `Object.getOwnPropertyNames({ ... })`). That
+    literal is written in the loop or, except for
+    `Object.getOwnPropertyNames`, bound once to a name that is not
+    exported and that the file only reads or passes to read-only builtins
+    (not even to an SDK request, and a cast such as `(o as any)[k]` is no
+    read), and has at most 256 entries, each a static key. A loop over
+    anything else counts (`for (const k in o)`, a loop over a name bound to
+    an array). Any other `Symbol.for` key counts, since undici keeps the
+    global `fetch`'s dispatcher under `Symbol.for("undici.globalDispatcher.1")`.
+    The key is read this way for a write (`g[k] = v`), `Reflect.set`,
+    `Object.defineProperty`, `Reflect.defineProperty`,
+    `Reflect.deleteProperty`, a test double's key and `stubGlobal`'s name;
+    `Object.assign` and `Object.defineProperties` with a source that is not
+    an object literal of static keys count whatever the source holds;
+  - a test double of `fetch` on an object the file cannot identify, read by
+    the call's last name, whatever import form reaches the runner
+    (CommonJS, a sinon sandbox, a named import, `import.meta.vitest`):
+    `spyOn` or `stub` given the object and the key (`jest.spyOn`,
+    `vi.spyOn`, `sinon.stub`, `sandbox.stub`, `stub` from sinon or Deno's
+    std, Bun's and Jasmine's `spyOn`); `replace`, `replaceGetter`,
+    `replaceSetter` or `replaceProperty` given a replacement too
+    (`jest.replaceProperty(globalThis, "fetch", f)`; testdouble.js's
+    two-argument `td.replace(globalThis, "fetch")` is not one, see
+    [Outside the file](#outside-the-file-1)); node:test's `method`,
+    `getter`, `setter` or `property` on a `mock` (`mock.method`,
+    `t.mock.method`, `test.mock.method`); and a `stubGlobal` method
+    (`vi.stubGlobal`) given a name that may be `"fetch"`, read as above;
+  - undici's `setGlobalDispatcher` given anything but a new `Agent`,
+    `ProxyAgent` or `EnvHttpProxyAgent`, at the call or in a name given one
+    in its declaration and never written again (`const agent = new
+    Agent(...)`): those are taken to send each request to the host it
+    names, while a `MockAgent` may answer it itself. A conditional counts,
+    even of two such agents (`proxy ? new ProxyAgent(proxy) : new
+    Agent()`); an `Agent` given a `factory` does not (see
+    [Outside the file](#outside-the-file-1));
+  - a package that intercepts or mocks `fetch`, loaded with `import` (not
+    `import type`, though an `import` whose specifiers are each marked
+    `type`, as in `import { type RequestHandler } from "msw"`, counts),
+    `require(...)` or `import(...)`: `nock`, `msw`, `@mswjs/interceptors`,
+    `fetch-mock`, `fetch-mock-jest`, `@fetch-mock/jest`,
+    `@fetch-mock/vitest`, `jest-fetch-mock` or `vitest-fetch-mock`, or a
+    subpath of one (`msw/node`). TypeScript's `import nock =
+    require("nock")` is not read. `nock`, `msw` and `@mswjs/interceptors`
+    (any subpath, `msw/browser` too) give an openai v3 client the gap as
+    well;
 - replace an SDK member (`client.chat.completions.create = fn`,
   `OpenAI.prototype.x = ...`, `Object.assign(client.chat.completions, ...)`,
   `Object.setPrototypeOf(client, ...)`) or mock the SDK in a test
-  (`jest.mock("openai")`, `vi.mock`, `vi.mock(import("openai"))`,
-  `vi.spyOn(client.chat.completions, "create")`): every route of that package
-  is a `dynamic_feature` gap. Settings such as `client.apiKey`, `maxRetries`
-  or `timeout` change nothing;
+  (`jest.mock("openai")`, `vi.mock`, `vi.mock(import("openai"))`, or one of
+  the test doubles above given an SDK object, as in
+  `vi.spyOn(client.chat.completions, "create")` or
+  `sinon.stub(client.chat.completions, "create")`): every route of that
+  package is a `dynamic_feature` gap. Settings such as `client.apiKey`,
+  `maxRetries` or `timeout` change nothing;
 - call `setDefaultBaseUrls` from `@google/genai`, under any name or through
   `require`: every Gemini client routes `unknown`.
 
@@ -839,19 +1064,78 @@ a gap at the call. The report assumes the rest, in particular:
   set a class property, and an SDK request does not modify the options object
   it is passed.
 - A member read under a computed key without being called (`const f =
-  this[kind]`, `Reflect.apply(this[kind], ...)`), or looked up by a run-time
-  name (`Reflect.get(this, kind)(...)`), is a value, not a method: only a
+  this[kind]`, `Reflect.apply(this[kind], ...)`, `[text].map(this[kind])`,
+  `(this[kind] ?? fallback)(...)`), or looked up by a run-time name
+  (`Reflect.get(this, kind)(...)`), is a value, not a method: only a
   computed member that is called, or followed by `call`, `apply` or `bind`,
-  counts as calling a method under a run-time name. Parentheses and type
+  counts as calling a method under a run-time name, and a computed key of
+  any object pattern (rule 5) as reading one, so `const f = this[kind]` is
+  a value where `const { [kind]: f } = this` is not. Parentheses and type
   assertions around it change nothing (`(this[kind] as any)(...)` is a
-  call).
+  call). Python's rule is wider: any `getattr` with a run-time name counts,
+  called or not.
 - A client a class reads through `this` is confirmed although a subclass in
-  another module may replace it, as in Python.
+  another module may replace it, as in Python, and so are request options
+  it reads through `this` (`this.requestOptions`).
+- Request options a class property holds are read by the property's name
+  ([Routes](#routes-1)). Code that reaches the object without that name is
+  not seen: a member of `this` or of an instance under a key known only at
+  run time (`(this as any)[section].path = url`), `Object.values(this)`, a
+  `for...in` over `this`, or a function given `this` or an instance
+  (`deepMerge(this, src)`). A `path`, `defaultBaseURL`, `fetch` or
+  `middleware` it writes there is missed.
+- A same-file class's method run on an object that borrows its prototype
+  (`{ __proto__: Bot.prototype, model }`, `Object.create(Bot.prototype, {
+  model: { value } })`, `Object.setPrototypeOf(o, Bot.prototype)`) is not
+  seen: `this.model` there keeps the class's value.
+- In a script that is not in strict mode, a function declared inside a
+  block also assigns the enclosing function's binding of its name when the
+  block runs (Annex B of the language standard). That assignment is not
+  seen, so the outer declaration's returns and default parameters are read
+  as if it were the only one.
 - The process environment, a `.env` file loaded at start-up and an Anthropic
   profile file are not known: a direct client built without a `baseURL` is
   reported direct.
-- A `fetch` replaced or intercepted outside the file (nock, msw, a polyfill
-  installed at start-up) is not seen.
+- A `fetch` replaced or intercepted outside the file is not seen: nock, msw
+  or a test double set up in another module (a Jest or Vitest setup file),
+  or a polyfill installed at start-up. In the file, these are not seen
+  either:
+  - a package that [Routes](#routes-1) does not list (Polly.js,
+    `cross-fetch/polyfill`), or one loaded through TypeScript's `import
+    nock = require("nock")`;
+  - testdouble.js's two-argument `td.replace(globalThis, "fetch")`, which
+    makes its own fake: a `replace` counts only when it is given a
+    replacement, so that `String#replace` is not taken for one;
+  - the global object written under a run-time key (a `fetch` written under
+    its own name counts wherever it is written) when the file reaches it
+    through a parameter (`function set(target, k, v) { target[k] = v }`,
+    even when a call passes `globalThis`), through `this` in a plain
+    function, which is the global object in sloppy mode, through a call's
+    result or a property of another object (`getGlobal()[k] = v`,
+    `env.root[k] = v`), through a name given it by a destructuring
+    assignment (`[root] = [globalThis]`), past the bounds on names and
+    conditionals ([Bounds](#bounds-1)), or as a global name read off another with no
+    parentheses, cast or reflective call around it (`globalThis.window[k] =
+    v`, `window.self[k] = v`). A `const`, `let` or `var`, or a conditional,
+    that may hold it counts ([Routes](#routes-1));
+  - a `dispatcher` given in `fetchOptions`, which both SDKs pass on to
+    `fetch` (`new OpenAI({ fetchOptions: { dispatcher: new MockAgent() }
+    })`, or in one request's options): `fetchOptions` is not read. Nor is an
+    undici `Agent` given a `factory`, which builds the dispatcher for each
+    origin and may send its requests elsewhere (`setGlobalDispatcher(new
+    Agent({ factory }))`).
+- openai v3's `OpenAIApi` without an axios instance of its own sends through
+  axios's default instance, taken as axios ships it: interceptors or an
+  adapter set on it (`axios.interceptors.request.use(...)`,
+  `axios.defaults.adapter = ...`) or `axios-mock-adapter`, in this file or
+  another, are not seen, and neither is nock or msw set up in another
+  module.
+- A file with a syntax error is read as far as tree-sitter parses it, and is
+  listed under `skipped.syntax_errors`: a write in a region it cannot parse
+  is not seen. Its grammar rejects a destructuring target in parentheses or
+  a type assertion, which JavaScript and TypeScript accept
+  (`({ m: (this.model) } = o)`, `[(this.model as string)] = o`), so such a
+  write is missed.
 - TypeScript's `private` is checked by the compiler, not at run time: a
   `private` method's callers are taken to be the calls of its name in the
   file.
@@ -874,14 +1158,36 @@ returns a client (`factory_call`).
 The TypeScript extractor's lookups are bounded the same way: expression depth
 64, nested name and property resolutions 64, scope nesting 64 (deeper scopes
 are a `truncated` gap and a whole-file dynamic feature), 64 writes read per
-name or property, 16 direct subclasses, 256 callers read per function, 64 expanded spreads per object literal, object literals read
-inside one another 64 deep (through spreads and member chains; past either
-bound a spread is opaque), 4,096 distinct paths read off one name (past that
-every read of the name is an `attribute` gap), member chains of 32 links (a
-longer one is not read), model keys nested at most 4 literals below an
-option's value, as in Python (deeper ones are not read), and 256 nested
-entries read per call (past that a `truncated` gap). Each object
-literal is read once, into an index of its keys, however many calls spread it.
+name or property, 16 direct subclasses, 256 callers read per function, 16
+items of a `middleware` array checked for the SDK's refusal fallback (a
+longer array keeps its `endpoint_option` gap), 64 expanded spreads per
+object literal, object literals read inside one another 64 deep (through
+spreads and member chains; past either bound a spread is opaque), 4,096
+distinct paths read off one name (past that every read of the name is an
+`attribute` gap), member chains of 32 links (a longer one is not read),
+model keys nested at most 4 literals below an option's value, as in Python
+(deeper ones are not read), and 256 nested entries read per call (past that
+a `truncated` gap). A client's or a request's options are read for a
+`fetch`, `middleware`, `path` or `defaultBaseURL` ([Routes](#routes-1)) in at
+most 1,024 steps (each expression, entry and name followed), 32 values
+deep, keeping at most 16 entries that set one: past any of these, they
+are options the file cannot read. Nor can options be read from a class
+property written 64 times or more (its assignments and the writes into
+it), from any class property of a name whose reads are passed to more
+than 64 calls in all (SDK requests included), or from a function with
+more than 64 `return`s. Each object literal, name, class property and
+function's set of returns read this way is read once and kept, and a
+class's property writes are kept by name, so a file's reads stay linear.
+Whether a key written on the global object may be `"fetch"` is read in
+at most 16 steps; past them, it may be, and so may a key of an object
+literal of more than 256 entries that a loop runs over. Whether an
+object written under a run-time key is the global object is followed at
+most 4 levels deep (each name, name read off it, or side of a
+conditional, `??`, `||` or `&&` is a level) and in at most 16 steps; past
+either, it is taken not to be, so the write gives no `global_fetch` gap:
+this bound fails open, and a route it leaves direct is reported
+confirmed. Each object literal is read once, into an index of its keys,
+however many calls spread it.
 The output limits are the same as Python's: nested values (32 per call, 4,096
 per file), listed candidates (32 per gap, 4,096 per file), names (200 bytes),
 records including imports (20,000 per file, then a `truncated` gap) and
