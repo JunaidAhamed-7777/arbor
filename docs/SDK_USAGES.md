@@ -252,16 +252,51 @@ When the name or attribute is given other values too:
 - A construction the file shows decides the route over a **declaration**
   (`client: OpenAI` in a class body with no value, or with `None` or
   another literal as in `client: Optional[OpenAI] = None`, and
-  `self.client = OpenAI()` in `__init__`). A declaration with `None` that
-  nothing else assigns holds `None`, so it yields to a construction where
-  another binding reads it too (`client = self.client or OpenAI()`), as an
-  unannotated `client = None` does; a bare one is set somewhere else, to any
-  client, and counts as a typed value there.
+  `self.client = OpenAI()` in `__init__`). A declaration with `None` or
+  another literal that nothing else assigns holds that value, not a client.
+  Read on its own (`self.client.chat.completions.create(...)`), it routes
+  by its annotation, as above. Where another binding reads it next to any
+  other value (a construction, a factory's client, a parameter, a name
+  from another module), it is dropped, as an unannotated `client = None`
+  is, and types none of them: `client = self.client or OpenAI()` routes as
+  `OpenAI()` does, and `self.client or make_client()` gets the factory's
+  gap, whatever the annotation. Several such declarations, read together
+  (`self._a or self._b`) or made for one attribute (in the class body and
+  in `__init__`), combine as typed values do (below), and are dropped
+  together next to any other value. A member of one
+  (`self.client.chat.completions`) is combined as members are (below): it
+  is dropped next to the same member of a client, and next to anything
+  else (`self.client.chat.completions if flag else
+  make_client().chat.completions`) the call gets a `multiple_assignments`
+  gap. Next to a value that a dynamic feature affects and that is not
+  known to be a client, though, the declaration is kept, with that
+  feature's gap. A bare declaration is set somewhere else, to any client,
+  and counts as a typed value there.
+- A class attribute that one of the class-attribute dynamic features may
+  set (see "Class attributes" under [Dynamic features](#dynamic-features):
+  a field of a dataclass, attrs class, `NamedTuple` or pydantic model, an
+  attribute of a class with a base from another module, of a decorated
+  class or of one used as a value, one written on another object...) is
+  not one that nothing else assigns. A declaration with `None` there is a
+  typed value (below) with a gap. Read on its own, it routes by its
+  annotation with a `dynamic_feature` gap (a direct class keeps its
+  `annotation` gap). Next to a construction its class decides the route of
+  (`self.client or AzureOpenAI(...)` under `client:
+  Optional[AzureOpenAI] = None`), the call takes that route and keeps the
+  `dynamic_feature` gap. Next to any other construction (`self.client or
+  OpenAI()`, also under `client: Optional[OpenAI] = None`) or a value that
+  is not a client (`self.client or make_client()`), it gets a
+  `multiple_assignments` gap. A dynamic feature of the whole file (`exec`)
+  does not make a declaration one of these: it is dropped as above, and
+  the route the call takes gets that feature's gap (`self.client or
+  OpenAI()` is `openai_direct` with a `dynamic_feature` gap).
 - A **typed value** (a parameter, or an annotated assignment with any other
   value, `self.client: OpenAI = make()`) is one more value. It agrees with a
   construction only when its class decides that construction's route
-  (`AzureOpenAI` next to `AzureOpenAI(...)`); a direct class never does.
-  Otherwise the call gets a `multiple_assignments` gap, as with an untyped
+  (`AzureOpenAI` next to `AzureOpenAI(...)`), and then the call keeps any
+  gap the typed value carries for another reason (a field's
+  `dynamic_feature`); a direct class never does. Otherwise the call gets a
+  `multiple_assignments` gap, as with an untyped
   parameter (`def ask(client: OpenAI | None = None): client = client or
   OpenAI()`). So does a typed value next to a value that is not a client,
   unless a declaration types the binding: `self.client = client or
@@ -270,19 +305,27 @@ When the name or attribute is given other values too:
   AzureOpenAI`, whether the two values are combined in that expression, in a
   local default (`if client is None: client = make_client()`) or in two
   assignments.
-- With no construction, the declarations and typed values decide the route
-  only when every one of them does, and all the same way, as in one
-  annotation; a declaration says more than the values next to it that are
-  not clients (`self.client = make_client()`). Otherwise the call gets the
-  `annotation` gap (`client = azure if flag else direct`, with
-  `azure: AzureOpenAI` and `direct: OpenAI`, in either order), or the gap
-  one of them already carries when they route alike.
+- With no construction, the typed values and the binding's own
+  declarations (not a `= None` declaration read next to another value,
+  which is dropped, above) decide the route only when every one of them
+  does, and all the same way, as in one annotation; a declaration says
+  more than the values next to it that are not clients (`self.client =
+  make_client()`). Otherwise the call gets the `annotation` gap (`client =
+  azure if flag else direct`, with `azure: AzureOpenAI` and `direct:
+  OpenAI`, in either order), or the gap one of them already carries when
+  they route alike.
 - A **member of a client** (`azure.chat.completions`,
   `client.embeddings.create`) follows the same rules when every value is
   that same member of a client: `chat = azure.chat.completions if flag else
   direct.chat.completions` gets the `annotation` gap in either order, and
   the member is kept. Different members, or a member next to a value that is
-  not one, get a `multiple_assignments` gap.
+  not one, get a `multiple_assignments` gap. A call through a name bound to
+  a member of a client the file does not resolve (`chat =
+  make_client().chat.completions`, then `chat.create(...)`; the same with a
+  parameter or an imported name, or `(self.client or
+  make_client()).chat.completions` under a `= None` declaration) is not
+  reported, not even as a gap: only a call that names the member
+  (`make_client().chat.completions.create(...)`) is, with the client's gap.
 
 An OpenAI or Anthropic client's `base_url` routes by its host (a Gemini
 client's endpoint options are a gap, above). The URL itself is never

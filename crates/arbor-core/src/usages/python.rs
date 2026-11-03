@@ -613,13 +613,18 @@ struct Client {
     typed: bool,
     /// Typed by a declaration, which gives the binding a type but no client:
     /// bare (`client: OpenAI` in a class body) or with a placeholder
-    /// (`client: Optional[OpenAI] = None`). Only [`combine`] reads it, and
-    /// what it returns has it only for a placeholder declaration read on
-    /// its own (see `placeholder`).
+    /// (`client: Optional[OpenAI] = None`). Only [`combine`] reads it, among
+    /// the values of the declared binding; what it returns never has it.
     declared: bool,
     /// A declaration with a placeholder value (`client: Optional[OpenAI] =
-    /// None`): read on its own it still yields to a construction next to
-    /// it (`self.client or OpenAI()`), as `None` does unannotated.
+    /// None`). Read where nothing else assigns the binding (or several such
+    /// reads or declarations combined), it is the annotation's typed client
+    /// on its own; next to any other value it holds `None` and is dropped,
+    /// as `None` is unannotated, so it yields to a construction
+    /// (`self.client or OpenAI()`) and types neither a factory's client nor
+    /// a parameter (`self.client or make()`). A member of it is combined as
+    /// members are. Next to a dynamic feature (a field the constructor
+    /// sets) it is a typed value like any other.
     placeholder: bool,
     /// The route typed clients agree on when they are combined with values
     /// that are not clients (`client or make()`, with `client:
@@ -9975,6 +9980,11 @@ fn combine(vals: Vec<Val>) -> Val {
         }
         return match combine(rest) {
             Val::Client { mut client, path } => {
+                // The feature may set the binding to any client (the
+                // constructor of a dataclass or a pydantic model sets its
+                // fields), so a `= None` declaration next to it does not
+                // hold only `None`: it is a typed value like any other.
+                client.placeholder = false;
                 if client.caveat.is_none() {
                     client.caveat = Some(ClientCaveat::Dynamic(feature));
                 }
@@ -9999,6 +10009,21 @@ fn combine(vals: Vec<Val>) -> Val {
             .next()
             .unwrap_or(Val::untracked(Origin::Unbound));
     }
+    // A read of a `= None` declaration (see `Client::placeholder`) holds
+    // `None` next to any other value, as `client = None` does: dropped, it
+    // yields to a construction and types nothing else (`self._client or
+    // make()` is the factory's value). A member of one is a member like
+    // any other (below): next to the same member of another value it is
+    // dropped there, and next to anything else it keeps the call's gap.
+    let none_read = |v: &Val| {
+        matches!(v, Val::Client { client, path }
+            if path.is_empty() && client.placeholder && !client.declared)
+    };
+    let real: Vec<Val> = if real.iter().all(none_read) {
+        real
+    } else {
+        real.into_iter().filter(|v| !none_read(v)).collect()
+    };
     // A declaration types every value of the binding, so a value that was
     // ambiguous only because typed clients sat next to values that are not
     // clients (`self.client = client or make()` under `client:
@@ -10031,13 +10056,13 @@ fn combine(vals: Vec<Val>) -> Val {
     };
     if real.len() == 1 {
         return match real.into_iter().next() {
-            // Read as the binding's value, a bare declaration is a typed
-            // value like any other. One with a placeholder (`client:
-            // Optional[OpenAI] = None`, nothing else assigned) still yields
-            // to a construction it is read next to (`self.client or
-            // OpenAI()`), as `None` does unannotated.
+            // Read as the binding's value, a declaration is a typed value
+            // like any other. One with a placeholder (`client:
+            // Optional[OpenAI] = None`, nothing else assigned) keeps that
+            // mark, so that where it is read next to another value
+            // (`self.client or OpenAI()`) it is `None`.
             Some(Val::Client { mut client, path }) => {
-                client.declared = client.placeholder;
+                client.declared = false;
                 Val::Client { client, path }
             }
             Some(val) => val,
@@ -10112,16 +10137,24 @@ fn combine(vals: Vec<Val>) -> Val {
     // the class body, `self.client = OpenAI()` in `__init__`). A typed value
     // (a parameter, an annotated assignment from a factory) is one more
     // value: it agrees with the constructions only when its class decides
-    // their route (`AzureOpenAI` next to `AzureOpenAI(...)`).
+    // their route (`AzureOpenAI` next to `AzureOpenAI(...)`). A gap it
+    // carries for another reason (a field the constructor sets) stays on
+    // the call.
     let constructed: Vec<&Client> = clients.iter().copied().filter(|c| !c.typed).collect();
     if let Some(first) = constructed.first() {
         let first = (*first).clone();
-        let disagree = clients
+        let typed_values: Vec<&Client> = clients
+            .iter()
+            .copied()
+            .filter(|c| c.typed && !c.declared)
+            .collect();
+        let disagree = typed_values
             .iter()
             .filter(|c| {
-                c.typed
-                    && !c.declared
-                    && !(decides(c) && c.pkg == first.pkg && c.routing == first.routing)
+                c.ambiguous
+                    || matches!(c.caveat, Some(ClientCaveat::Annotation))
+                    || c.pkg != first.pkg
+                    || c.routing != first.routing
             })
             .count();
         let others = real.len() - clients.len() + disagree;
@@ -10146,7 +10179,10 @@ fn combine(vals: Vec<Val>) -> Val {
                 declared: false,
                 placeholder: false,
                 typed_route: None,
-                caveat: constructed.iter().find_map(|c| c.caveat.clone()),
+                caveat: constructed
+                    .iter()
+                    .chain(&typed_values)
+                    .find_map(|c| c.caveat.clone()),
             },
             path: Vec::new(),
         };
@@ -10181,7 +10217,11 @@ fn combine(vals: Vec<Val>) -> Val {
                 ambiguous,
                 typed: !ambiguous,
                 declared: false,
-                placeholder: false,
+                // `None` declarations read or assigned together (in the
+                // class body and in `__init__`) are `None` too.
+                placeholder: real
+                    .iter()
+                    .all(|v| matches!(v, Val::Client { client, .. } if client.placeholder)),
                 typed_route,
                 // Clients that route alike keep the reason one of them
                 // carries (a field, say); ones that do not, the annotation's.
