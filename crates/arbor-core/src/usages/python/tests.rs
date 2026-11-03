@@ -550,6 +550,10 @@ def factory(client: Optional[AzureOpenAI] = None):
 def same(client: Optional[AzureOpenAI] = None):
     client = client or AzureOpenAI()
     return client.chat.completions.create(model="gpt-4o", messages=[])
+
+def unresolved(client: Optional[OpenAI] = None):
+    client = client or OpenAI(base_url=make())
+    return client.chat.completions.create(model="gpt-4o", messages=[])
 "#,
     );
     assert_eq!(
@@ -563,6 +567,9 @@ def same(client: Optional[AzureOpenAI] = None):
             (22, Routing::Unknown, ambiguous()),
             // A class that decides the construction's route agrees with it.
             (26, Routing::AzureOpenai, vec![]),
+            // A direct class never does, even next to a construction whose
+            // route is unknown.
+            (30, Routing::Unknown, ambiguous()),
         ]
     );
 }
@@ -896,6 +903,434 @@ class Direct:
             ),
             // Read on its own, the declaration still types the call.
             (28, Routing::AzureOpenai, vec![]),
+        ]
+    );
+}
+
+/// `source` with each annotated `= None` declaration unannotated
+/// (`_client: Optional[AzureOpenAI] = None` becomes `_client = None`), on
+/// the same lines. Parameters (`def f(c: Optional[X] = None)`) are kept.
+fn unannotated(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| match line.split_once(": Optional[") {
+            Some((target, rest))
+                if !line.trim_start().starts_with("def ") && rest.ends_with("] = None") =>
+            {
+                format!("{target} = None\n")
+            }
+            _ => format!("{line}\n"),
+        })
+        .collect()
+}
+
+/// A call's line, routing and client gaps, or (routing `None`) the line and
+/// client gap of a call whose client is not resolved, which is reported as
+/// a gap only.
+type ClientRow = (u32, Option<Routing>, Vec<String>);
+
+fn client_rows(found: &FileUsages) -> Vec<ClientRow> {
+    let mut rows: Vec<ClientRow> = routes_and_gaps(found)
+        .into_iter()
+        .map(|(line, routing, gaps)| (line, Some(routing), gaps))
+        .collect();
+    let calls: Vec<u32> = found.calls.iter().map(|c| c.span.start_byte).collect();
+    for gap in &found.gaps {
+        match gap.span {
+            Some(span) if gap.key.is_none() && !calls.contains(&span.start_byte) => {
+                let reason = format!("{}/{}", gap.kind, gap.reason);
+                rows.push((span.line, None, vec![reason]));
+            }
+            _ => {}
+        }
+    }
+    rows.sort_by_key(|row| row.0);
+    rows
+}
+
+#[test]
+fn a_declaration_set_to_none_is_none_next_to_any_other_value() {
+    // A `= None` declaration that nothing assigns typed the values it was
+    // read next to: under `_client: Optional[AzureOpenAI] = None`,
+    // `self._client or make_client()` was `azure_openai` with no gap, and
+    // `c or make_client() or _shared` confirmed the route of the typed
+    // parameter `c`. The annotation types `None`, not what `make_client()`
+    // returns or a caller passes. Next to any other value the declaration
+    // now holds `None`, so each shape gives what its unannotated twin
+    // (`_client = None`) gives.
+    let source = r#"from typing import Optional
+from anthropic import AnthropicBedrock
+from openai import AzureOpenAI, OpenAI
+from myapp.llm import make_client, shared_client
+
+class Svc:
+    _client: Optional[AzureOpenAI] = None
+
+    def factory(self):
+        client = self._client or make_client()
+        return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+    def factory_first(self):
+        client = make_client() or self._client
+        return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+    def ternary(self):
+        client = self._client if self._client is not None else make_client()
+        return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+    def parameter(self, client=None):
+        client = client or self._client
+        return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+    def imported(self):
+        client = self._client or shared_client
+        return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+    def member(self):
+        return (self._client or make_client()).chat.completions.create(model="gpt-4-0314", messages=[])
+
+    def private(self):
+        return _ask(self._client)
+
+def _ask(client):
+    client = client or make_client()
+    return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+class Init:
+    def __init__(self):
+        self._client: Optional[AzureOpenAI] = None
+
+    def ask(self):
+        client = self._client or make_client()
+        return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+class Bedrock:
+    _client: Optional[AnthropicBedrock] = None
+
+    def ask(self):
+        client = self._client or make_client()
+        return client.messages.create(model="claude-2.1", max_tokens=1, messages=[])
+
+class Two:
+    _a: Optional[AzureOpenAI] = None
+    _b: Optional[AzureOpenAI] = None
+
+    def ask(self):
+        client = self._a or self._b or make_client()
+        return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+    def guarded(self):
+        chat = self._a.chat.completions if self._a is not None else OpenAI().chat.completions
+        return chat.create(model="gpt-4-0314", messages=[])
+
+_default: Optional[AzureOpenAI] = None
+
+def module_factory():
+    client = _default or make_client()
+    return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+def module_parameter(client=None):
+    client = client or _default
+    return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+_shared: Optional[AzureOpenAI] = None
+
+def typed_or(c: Optional[AzureOpenAI] = None):
+    client = c or make_client() or _shared
+    return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+def typed_if_none(c: Optional[AzureOpenAI] = None):
+    client = _shared
+    if client is None:
+        client = c or make_client()
+    return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+class Twice:
+    client: Optional[OpenAI] = None
+
+    def __init__(self):
+        self.client: Optional[OpenAI] = None
+
+    def construction(self):
+        client = self.client or OpenAI()
+        return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+    def factory(self):
+        client = self.client or make_client()
+        return client.chat.completions.create(model="gpt-4-0314", messages=[])
+"#;
+    // The call's client is not resolved: the factory's, the parameter's or
+    // the imported name's gap.
+    let unknown =
+        |line, reason: &str| (line, None, vec![format!("unknown_client_factory/{reason}")]);
+    let ambiguous = |line| {
+        let gap = "ambiguous_client/multiple_assignments".to_string();
+        (line, Some(Routing::Unknown), vec![gap])
+    };
+    let expected: Vec<ClientRow> = vec![
+        unknown(11, "factory_call"),
+        unknown(15, "factory_call"),
+        unknown(19, "factory_call"),
+        unknown(23, "parameter"),
+        unknown(27, "imported_name"),
+        unknown(30, "factory_call"),
+        // Passed to a private function, as its in-file callers' value.
+        unknown(37, "factory_call"),
+        // Declared in `__init__`.
+        unknown(45, "factory_call"),
+        // A platform class.
+        unknown(52, "factory_call"),
+        // Two declarations read together are `None` too.
+        unknown(60, "factory_call"),
+        // A member of the declaration, as `None.chat.completions` is.
+        (64, Some(Routing::OpenaiDirect), vec![]),
+        // At module level.
+        unknown(70, "factory_call"),
+        unknown(74, "parameter"),
+        // A typed parameter next to a factory's client: no declaration of
+        // `client` types the factory's value, so it stays a gap, as it is
+        // without `_shared`.
+        ambiguous(80),
+        ambiguous(86),
+        // Declared twice, in the class body and in `__init__`, both `None`.
+        (96, Some(Routing::OpenaiDirect), vec![]),
+        unknown(100, "factory_call"),
+    ];
+    assert_eq!(client_rows(&usages(source)), expected);
+    let twin = unannotated(source);
+    assert!(twin.contains("    _client = None\n") && twin.contains("\n_shared = None\n"));
+    assert_eq!(client_rows(&usages(&twin)), expected);
+
+    // Read on its own, each declaration still types the call, and two read
+    // together that route alike type it too.
+    let alone = usages(
+        r#"from typing import Optional
+from openai import AzureOpenAI
+
+_default: Optional[AzureOpenAI] = None
+
+def ask():
+    return _default.chat.completions.create(model="gpt-4-0314", messages=[])
+
+class Init:
+    def __init__(self):
+        self._client: Optional[AzureOpenAI] = None
+
+    def ask(self):
+        return self._client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+class Two:
+    _a: Optional[AzureOpenAI] = None
+    _b: Optional[AzureOpenAI] = None
+
+    def ask(self):
+        client = self._a or self._b
+        return client.chat.completions.create(model="gpt-4-0314", messages=[])
+"#,
+    );
+    assert_eq!(
+        routes_and_gaps(&alone),
+        vec![
+            (7, Routing::AzureOpenai, vec![]),
+            (14, Routing::AzureOpenai, vec![]),
+            (22, Routing::AzureOpenai, vec![]),
+        ]
+    );
+}
+
+#[test]
+fn a_field_set_to_none_does_not_yield_to_a_construction_where_it_is_read() {
+    // The constructor of a dataclass, an attrs class, a `NamedTuple` or a
+    // pydantic model (or of a class with a base from another module) sets
+    // its fields, so a `= None` client field does not hold only `None`.
+    // Read next to a construction it yielded to it, and the field's
+    // `dynamic_feature` gap was lost: `self.azure or OpenAI()` was
+    // `openai_direct` with no gap although the file builds `Svc` with an
+    // Azure client, and `self.direct or AzureOpenAI(...)` was
+    // `azure_openai`. The field is now one more value: next to a
+    // construction that routes otherwise the call gets `multiple_assignments`,
+    // and next to one its class routes as (`self.azure or AzureOpenAI(...)`)
+    // it takes that route and keeps the field's gap, as `azure = None` with
+    // no annotation does. A direct class never decides the route, so
+    // `self.direct or OpenAI()` stays a gap too.
+    let forms = [
+        (
+            "from pydantic import BaseModel",
+            "# a pydantic model",
+            "(BaseModel)",
+        ),
+        ("from dataclasses import dataclass", "@dataclass", ""),
+        ("import attrs", "@attrs.define", ""),
+        (
+            "from typing import NamedTuple",
+            "# a NamedTuple",
+            "(NamedTuple)",
+        ),
+        (
+            "from myapp.base import Base",
+            "# a base from another module",
+            "(Base)",
+        ),
+        // Any class decorator may set the attribute.
+        ("from myapp.registry import register", "@register", ""),
+    ];
+    for (import, decorator, base) in forms {
+        let source = format!(
+            r#"{import}
+from typing import Optional
+from openai import AzureOpenAI, OpenAI
+
+{decorator}
+class Svc{base}:
+    azure: Optional[AzureOpenAI] = None
+    direct: Optional[OpenAI] = None
+
+    def one(self):
+        client = self.azure or OpenAI()
+        return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+    def two(self):
+        client = self.direct or AzureOpenAI(azure_endpoint="https://x.openai.azure.com", api_version="2024-02-01")
+        return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+    def three(self):
+        if self.azure is not None:
+            client = self.azure
+        else:
+            client = OpenAI()
+        return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+    def four(self):
+        client = self.direct
+        if client is None:
+            client = AzureOpenAI(azure_endpoint="https://x.openai.azure.com", api_version="2024-02-01")
+        return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+    def five(self):
+        return self.azure.chat.completions.create(model="gpt-4-0314", messages=[])
+
+    def six(self):
+        client = self.azure or AzureOpenAI(azure_endpoint="https://x.openai.azure.com", api_version="2024-02-01")
+        return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+    def seven(self):
+        if self.azure is not None:
+            client = self.azure
+        else:
+            client = AzureOpenAI(azure_endpoint="https://x.openai.azure.com", api_version="2024-02-01")
+        return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+    def eight(self):
+        client = self.direct or OpenAI()
+        return client.chat.completions.create(model="gpt-4-0314", messages=[])
+
+Svc(azure=AzureOpenAI(azure_endpoint="https://x.openai.azure.com", api_version="2024-02-01"), direct=OpenAI(base_url="https://gateway.example.com/v1"))
+"#
+        );
+        let ambiguous = |line| {
+            (
+                line,
+                Routing::Unknown,
+                vec!["ambiguous_client/multiple_assignments".to_string()],
+            )
+        };
+        // The field's typed route, with its gap.
+        let field = |line| {
+            (
+                line,
+                Routing::AzureOpenai,
+                vec!["ambiguous_client/dynamic_feature".to_string()],
+            )
+        };
+        assert_eq!(
+            routes_and_gaps(&usages(&source)),
+            vec![
+                ambiguous(12),
+                ambiguous(16),
+                ambiguous(23),
+                ambiguous(29),
+                // Read on its own.
+                field(32),
+                // Next to a construction its class routes as.
+                field(36),
+                field(43),
+                ambiguous(47),
+            ],
+            "{decorator}"
+        );
+    }
+
+    // The same with a platform class of another provider.
+    let bedrock = usages(
+        r#"from typing import Optional
+from pydantic import BaseModel
+from anthropic import AnthropicBedrock
+
+class Svc(BaseModel):
+    client: Optional[AnthropicBedrock] = None
+
+    def ask(self):
+        client = self.client or AnthropicBedrock(aws_region="us-east-1")
+        return client.messages.create(model="claude-2.1", max_tokens=1, messages=[])
+"#,
+    );
+    assert_eq!(
+        routes_and_gaps(&bedrock),
+        vec![(
+            10,
+            Routing::AnthropicBedrock,
+            vec!["ambiguous_client/dynamic_feature".to_string()]
+        )]
+    );
+}
+
+#[test]
+fn a_member_of_a_declaration_set_to_none_is_a_member_like_any_other() {
+    // A member of a `= None` declaration was dropped where it was read next
+    // to another value, as the declaration is. Next to a factory's member
+    // nothing was left to report the call by, so
+    // `self._client.chat.completions if flag else
+    // make_client().chat.completions` vanished from the report, and next
+    // to another member of a typed client the call took that client's
+    // route. A member is combined as members are: next to the same member
+    // of another client the declaration is dropped there, and next to
+    // anything else the call gets `multiple_assignments`.
+    let found = usages(
+        r#"from typing import Optional
+from openai import AzureOpenAI, OpenAI
+from myapp.llm import make_client
+
+class Svc:
+    _client: Optional[AzureOpenAI] = None
+
+    def factory_member(self, flag):
+        chat = self._client.chat.completions if flag else make_client().chat.completions
+        return chat.create(model="gpt-4-0314", messages=[])
+
+    def other_member(self, flag, c: AzureOpenAI):
+        chat = self._client.chat.completions if flag else c.embeddings
+        return chat.create(model="text-embedding-ada-002", input="x")
+
+    def same_member(self, flag):
+        chat = self._client.chat.completions if flag else OpenAI().chat.completions
+        return chat.create(model="gpt-4-0314", messages=[])
+
+    def alone(self):
+        chat = self._client.chat.completions
+        return chat.create(model="gpt-4-0314", messages=[])
+"#,
+    );
+    let ambiguous = |line| {
+        let gap = "ambiguous_client/multiple_assignments".to_string();
+        (line, Routing::Unknown, vec![gap])
+    };
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            ambiguous(10),
+            ambiguous(14),
+            (18, Routing::OpenaiDirect, vec![]),
+            (22, Routing::AzureOpenai, vec![]),
         ]
     );
 }
